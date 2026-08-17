@@ -76,9 +76,10 @@ php -S 127.0.0.1:8080 -t public
 5. Entra en la web y configura comunidades, proveedores y correos.
 6. Programa el worker.
 
-Si el subdominio permite definir el *document root*, oriéntalo a `public/`. Si no, el
-`.htaccess` de la raíz redirige a `public/` y bloquea `config`, `src`, `bin`, `database`,
-`tests` y `storage`.
+Si el subdominio permite definir el *document root*, oriéntalo a `public/`. En planes
+IONOS donde `mod_rewrite` no esté disponible, copia también `public/index.php`,
+`public/install.php`, `public/cron.php` y `public/assets/` a la raíz. La navegación por
+`?route=` funciona sin reglas Apache.
 
 ## Cron
 

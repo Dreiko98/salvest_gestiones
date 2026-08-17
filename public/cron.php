@@ -1,7 +1,8 @@
 <?php
 declare(strict_types=1);
 
-$config = require dirname(__DIR__) . '/bootstrap.php';
+$root = is_file(__DIR__ . '/bootstrap.php') ? __DIR__ : dirname(__DIR__);
+$config = require $root . '/bootstrap.php';
 header('Content-Type: application/json; charset=utf-8');
 $token = (string)($_GET['token'] ?? '');
 if ($token === '' || !hash_equals((string)$config['app']['cron_token'], $token)) {

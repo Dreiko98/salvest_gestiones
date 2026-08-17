@@ -1,8 +1,9 @@
 <?php
 declare(strict_types=1);
 
-$config = require dirname(__DIR__) . '/bootstrap.php';
-$lock = dirname(__DIR__) . '/storage/install.lock';
+$root = is_file(__DIR__ . '/bootstrap.php') ? __DIR__ : dirname(__DIR__);
+$config = require $root . '/bootstrap.php';
+$lock = $root . '/storage/install.lock';
 $token = (string)($_GET['token'] ?? $_POST['token'] ?? '');
 if ($token === '' || !hash_equals((string)$config['app']['cron_token'],$token)) { http_response_code(404); exit('No encontrado'); }
 $message=''; $error='';
@@ -11,7 +12,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
         if (is_file($lock)) throw new RuntimeException('La instalación ya está bloqueada.');
         $username=mb_strtolower(trim((string)($_POST['username']??''))); $password=(string)($_POST['password']??'');
         if($username===''||strlen($password)<12)throw new RuntimeException('Usuario obligatorio y contraseña de al menos 12 caracteres.');
-        $db=new Salvest\Database($config['database']); Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+        $db=new Salvest\Database($config['database']); Salvest\Schema::migrate($db,$root.'/database/schema.sql');
         $db->execute("INSERT INTO users(username,password_hash,display_name) VALUES (?,?,?) ON DUPLICATE KEY UPDATE password_hash=VALUES(password_hash),active=1",
             [$username,password_hash($password,PASSWORD_DEFAULT),'Administrador']);
         if(file_put_contents($lock,date(DATE_ATOM),LOCK_EX)===false)throw new RuntimeException('No se pudo crear el bloqueo de instalación.');

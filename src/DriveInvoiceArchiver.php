@@ -15,13 +15,15 @@ final class DriveInvoiceArchiver
         $communityFolder=self::communityFolderName($community);$category=self::category($category);
         $parent=$this->drive->ensureFolder($this->rootFolderId,$communityFolder);
         $parent=$this->drive->ensureFolder($parent,'Doc año en Vigor');
-        $parent=$this->drive->ensureFolder($parent,$match[1]);
-        $parent=$this->drive->ensureFolder($parent,$category);
+        $invoiceYear=(int)$match[1];$currentYear=(int)date('Y');
+        if($invoiceYear>$currentYear)throw new \RuntimeException('La fecha de factura pertenece a un año futuro');
+        $parts=self::storageParts($invoiceYear,$currentYear,$category);
+        foreach($parts as$part)$parent=$this->drive->ensureFolder($parent,$part);
         $base=$date.'_'.self::token((string)$supplier['official_name']);
         $number=self::token((string)($invoice['numero_factura']??''));if($number!=='')$base.='_'.$number;
         $names=array_map(static fn(array$file):string=>(string)$file['name'],$this->drive->children($parent));
         $filename=self::availableFilename($names,$base.'.pdf');$uploaded=$this->drive->upload($parent,$filename,$localPath);
-        return['id'=>(string)$uploaded['id'],'name'=>$filename,'path'=>$communityFolder.'/Doc año en Vigor/'.$match[1].'/'.$category.'/'.$filename,'webViewLink'=>$uploaded['webViewLink']??null];
+        return['id'=>(string)$uploaded['id'],'name'=>$filename,'path'=>$communityFolder.'/Doc año en Vigor/'.implode('/',$parts).'/'.$filename,'webViewLink'=>$uploaded['webViewLink']??null];
     }
 
     /** @param array<string,mixed> $community */
@@ -41,6 +43,14 @@ final class DriveInvoiceArchiver
     public static function token(string $value):string
     {
         $value=Text::normalize($value);$value=strtoupper((string)preg_replace('/[^a-z0-9]+/','-',$value));return trim($value,'-');
+    }
+
+    /** @return list<string> */
+    public static function storageParts(int $invoiceYear,int $currentYear,string $category):array
+    {
+        if($invoiceYear>$currentYear)throw new \RuntimeException('No se archivan facturas con fecha futura');
+        $category=self::category($category);
+        return$invoiceYear===$currentYear?[$category]:[(string)$invoiceYear,$category];
     }
 
     /** @param list<string> $names */

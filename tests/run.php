@@ -76,6 +76,9 @@ $test('ruta Drive y categorías canónicas',static function()use($assert):void{
     $assert(Salvest\DriveInvoiceArchiver::category('EXTINCAS')==='EXTINTORES');
     $assert(Salvest\DriveInvoiceArchiver::category('otro proveedor 1')==='MANTENIMIENTO');
     $assert(Salvest\DriveInvoiceArchiver::token('Adrián Turcu S.L.')==='ADRIAN-TURCU-S-L');
+    $assert(Salvest\DriveInvoiceArchiver::storageParts(2026,2026,'LUZ')===['ELECTRICIDAD']);
+    $assert(Salvest\DriveInvoiceArchiver::storageParts(2025,2026,'AGUA')===['2025','AGUA']);
+    try{Salvest\DriveInvoiceArchiver::storageParts(2027,2026,'AGUA');$assert(false,'debería rechazar años futuros');}catch(RuntimeException){}
 });
 $test('colisión Drive nunca sobrescribe',static function()use($assert):void{
     $base='2026-08-17_IBERDROLA_F-001.pdf';

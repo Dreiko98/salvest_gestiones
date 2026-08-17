@@ -15,7 +15,7 @@ bin/worker.php o public/cron.php
         ├── IMAP SSL de cada buzón
         ├── OpenAI Responses API
         ├── MySQL: configuración, auditoría e idempotencia
-        ├── Google Drive: {código} - {comunidad}/Doc año en Vigor/{año}/{categoría}/
+        ├── Google Drive: {código} - {comunidad}/Doc año en Vigor/{categoría}/ (año actual)
         ├── copia privada local en storage/invoices/
         └── carpetas IMAP Facturas/{comunidad|revisión|errores}
 
@@ -168,12 +168,19 @@ relación, nunca de una conjetura sobre el PDF:
 Los documentos clasificados se añaden sin modificar nada existente:
 
 ```text
-COMUNIDADES/{código} - {comunidad}/Doc año en Vigor/{AAAA}/{CATEGORÍA}/
+COMUNIDADES/{código} - {comunidad}/Doc año en Vigor/{CATEGORÍA}/
 AAAA-MM-DD_PROVEEDOR[_NUMFACTURA].pdf
 ```
 
 Si el nombre existe, se usa `(2)`, `(3)`, etc. Las carpetas se buscan por nombre exacto
 antes de crearlas; nunca se renombran ni reorganizan elementos existentes.
+
+Las facturas del año en curso se guardan directamente en la categoría. Las facturas
+atrasadas se guardan en `Doc año en Vigor/{AAAA}/{CATEGORÍA}/`. Al comenzar un año
+nuevo, el primer ciclo normal del cron mueve automáticamente los PDF de las categorías
+del año anterior a `Doc año en Vigor/{AAAA}/{CATEGORÍA}/`. El cierre queda registrado
+en MySQL (`drive_year_state` y `drive_year_rollovers`), se puede reanudar si se
+interrumpe y nunca sobrescribe un archivo existente.
 
 ## OpenAI
 

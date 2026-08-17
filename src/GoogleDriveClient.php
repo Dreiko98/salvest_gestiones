@@ -34,6 +34,20 @@ final class GoogleDriveClient
     }
 
     /** @return array<string,mixed> */
+    public function move(string $fileId,string $sourceParentId,string $destinationParentId,?string $newName=null):array
+    {
+        $query=http_build_query(['addParents'=>$destinationParentId,'removeParents'=>$sourceParentId,'supportsAllDrives'=>'true','fields'=>'id,name,parents,mimeType,size,webViewLink']);
+        $body=$newName===null?'{}':json_encode(['name'=>$newName],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+        return$this->request('PATCH','https://www.googleapis.com/drive/v3/files/'.rawurlencode($fileId).'?'.$query,$body,'application/json');
+    }
+
+    public function trash(string $fileId):void
+    {
+        $query=http_build_query(['supportsAllDrives'=>'true','fields'=>'id,trashed']);
+        $this->request('PATCH','https://www.googleapis.com/drive/v3/files/'.rawurlencode($fileId).'?'.$query,'{"trashed":true}','application/json');
+    }
+
+    /** @return array<string,mixed> */
     private function request(string $method,string $url,?string $body=null,?string $contentType=null):array
     {
         $headers=['Authorization: Bearer '.$this->tokens->accessToken()];if($contentType)$headers[]='Content-Type: '.$contentType;

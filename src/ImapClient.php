@@ -12,9 +12,23 @@ final class ImapClient
     /** @var list<string> */ private array $capabilities = [];
 
     public function __construct(private string $host, private int $port, private string $username,
-        private string $password, private string $folder = 'INBOX', private int $timeout = 30) {}
+        private string $password, private string $folder = 'INBOX', private int $timeout = 30,
+        private int $maxRetries = 3, private int $retryDelay = 2) {}
 
     public function connect(): void
+    {
+        $lastError = null;
+        for ($attempt=1; $attempt <= max(1,$this->maxRetries); $attempt++) {
+            try { $this->open(); return; }
+            catch (\Throwable $error) {
+                $lastError=$error; $this->close();
+                if($attempt<$this->maxRetries)sleep($this->retryDelay*$attempt);
+            }
+        }
+        throw $lastError ?? new \RuntimeException('No se pudo conectar por IMAP');
+    }
+
+    private function open(): void
     {
         $context = stream_context_create(['ssl'=>['verify_peer'=>true,'verify_peer_name'=>true,'SNI_enabled'=>true]]);
         $socket = @stream_socket_client("ssl://{$this->host}:{$this->port}", $errno, $error, $this->timeout, STREAM_CLIENT_CONNECT, $context);

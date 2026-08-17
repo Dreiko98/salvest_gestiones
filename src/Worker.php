@@ -19,12 +19,15 @@ final class Worker
     }
 
     /** @return array<string,int> */
-    public function run(bool $dryRun = false, ?int $limit = null): array
+    public function run(bool $dryRun = false, ?int $limit = null, ?string $mailboxEmail = null): array
     {
         $locked = $this->db->one("SELECT GET_LOCK('salvest-invoice-worker',0) acquired");
         if (!(int)($locked['acquired'] ?? 0)) throw new \RuntimeException('Ya hay otro worker ejecutándose');
         $runUuid = $this->uuid();
-        $mailboxes = $this->db->all('SELECT * FROM mailboxes WHERE active=1 ORDER BY id');
+        $mailboxes = $mailboxEmail
+            ? $this->db->all('SELECT * FROM mailboxes WHERE active=1 AND email=? ORDER BY id',[$mailboxEmail])
+            : $this->db->all('SELECT * FROM mailboxes WHERE active=1 ORDER BY id');
+        if($mailboxEmail!==null&&!$mailboxes)throw new \RuntimeException('No existe un buzón activo con ese correo');
         $this->db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,status,mailboxes_count) VALUES (?,? ,NOW(),'running',?)",
             [$runUuid,$dryRun?'dry_run':'cron',count($mailboxes)]);
         $runId = (int)$this->db->pdo()->lastInsertId();
@@ -76,7 +79,11 @@ final class Worker
                     foreach ($message['attachments'] as $attachment) {
                         if ((int)$attachment['size'] > (int)$this->config['processing']['max_attachment_bytes']) throw new \RuntimeException('Adjunto demasiado grande');
                         $counts['documents']++;
-                        $outcomes[] = $this->processAttachment($mailbox,$client,$uid,$message,$attachment,$counts);
+                        try { $outcomes[] = $this->processAttachment($mailbox,$client,$uid,$message,$attachment,$counts); }
+                        catch (\Throwable $attachmentError) {
+                            $this->insertAttachment($mailbox,$client,$uid,$attachment,'error',['error_message'=>$attachmentError->getMessage()]);
+                            throw $attachmentError;
+                        }
                     }
                     $communityIds = array_values(array_unique(array_filter(array_column($outcomes,'community_id'))));
                     $allClassified = !array_filter($outcomes,static fn(array $item): bool => !in_array($item['status'],['classified','duplicate'],true));
@@ -123,6 +130,8 @@ final class Worker
         if (!is_dir($incoming) && !mkdir($incoming,0770,true) && !is_dir($incoming)) throw new \RuntimeException('No se pudo crear incoming');
         $path = $incoming.'/'.$uid.'-'.bin2hex(random_bytes(4)).'-'.$attachment['safe_filename'];
         if (file_put_contents($path,$attachment['payload'],LOCK_EX) === false) throw new \RuntimeException('No se pudo guardar el adjunto temporal');
+        $this->insertAttachment($mailbox,$client,$uid,$attachment,'downloaded',[]);
+        $this->insertAttachment($mailbox,$client,$uid,$attachment,'processing',[]);
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
         $decision = $this->classifier->classify($invoice,$context);
@@ -142,13 +151,18 @@ final class Worker
     {
         $this->db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,
             provider,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,confidence,final_filename,output_path,status,
-            extraction_json,decision_json,extractor_version,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
-            ON DUPLICATE KEY UPDATE status=VALUES(status),processed_at=NOW()", [
+            extraction_json,decision_json,error_message,extractor_version,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+            ON DUPLICATE KEY UPDATE provider=VALUES(provider),provider_cif=VALUES(provider_cif),service_type=VALUES(service_type),
+            supply_address=VALUES(supply_address),amount=VALUES(amount),currency=VALUES(currency),invoice_date=VALUES(invoice_date),
+            invoice_number=VALUES(invoice_number),community_id=VALUES(community_id),confidence=VALUES(confidence),final_filename=VALUES(final_filename),
+            output_path=VALUES(output_path),status=VALUES(status),extraction_json=VALUES(extraction_json),decision_json=VALUES(decision_json),
+            error_message=VALUES(error_message),extractor_version=VALUES(extractor_version),processed_at=NOW()", [
             $mailbox['id'],$client->uidValidity(),$uid,$attachment['original_filename'],$attachment['sha256'],$attachment['mime_type'],$attachment['size'],
             $data['proveedor']??$data['provider']??null,$data['proveedor_cif']??$data['provider_cif']??null,$data['tipo_servicio']??$data['service_type']??null,
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
-            $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,OpenAIExtractor::VERSION,
+            $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,
+            $data['error_message']??null,OpenAIExtractor::VERSION,
         ]);
     }
 

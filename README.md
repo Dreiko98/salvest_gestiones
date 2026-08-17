@@ -89,6 +89,13 @@ Opción preferida, si IONOS permite ejecutar PHP CLI:
 */5 * * * * /usr/bin/php /ruta/absoluta/bin/worker.php >> /ruta/privada/worker.log 2>&1
 ```
 
+Comprobaciones puntuales por CLI:
+
+```bash
+php bin/worker.php --dry-run --max-emails 10
+php bin/worker.php --mailbox facturas@empresa.com
+```
+
 Opción URL:
 
 ```text

@@ -7,6 +7,7 @@ final class Worker
 {
     private MimeParser $parser;
     private Classifier $classifier;
+    private InvoiceRouter $router;
     private Archiver $archiver;
     private ?DriveInvoiceArchiver $driveArchiver=null;
 
@@ -16,6 +17,7 @@ final class Worker
     {
         $this->parser = new MimeParser();
         $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
+        $this->router = new InvoiceRouter($this->classifier);
         $this->archiver = new Archiver((string)$config['processing']['storage_root']);
         if((bool)($config['google_drive']['enabled']??false)){
             $tokens=new GoogleUserOAuthProvider((string)$config['google_drive']['oauth_client_file'],(string)$config['google_drive']['oauth_token_file']);
@@ -139,9 +141,7 @@ final class Worker
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'processing',[]);
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
-        $decision = $this->classifier->classify($invoice,$context);
-        $supplier = $decision['community']?$this->classifier->resolveCommunitySupplier((int)$decision['community']['id'],$invoice,(string)$message['sender']):null;
-        $status = $decision['community'] && $supplier ? 'classified' : ($decision['community'] ? 'needs_review' : 'unclassified');
+        $route=$this->router->route($invoice,(string)$message['sender'],$context);$decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
         if($supplier){$invoice['proveedor']=$supplier['official_name'];$invoice['tipo_servicio']=mb_strtolower((string)$supplier['category']);}
         $target = $this->archiver->archive($path,(string)$attachment['original_filename'],$invoice,$decision['community'],$status);
         $drive=null;

@@ -86,10 +86,6 @@ $test('colisión Drive nunca sobrescribe',static function()use($assert):void{
     $assert(Salvest\DriveInvoiceArchiver::availableFilename([$base],$base)==='2026-08-17_IBERDROLA_F-001 (2).pdf');
     $assert(Salvest\DriveInvoiceArchiver::availableFilename([$base,'2026-08-17_IBERDROLA_F-001 (2).pdf'],$base)==='2026-08-17_IBERDROLA_F-001 (3).pdf');
 });
-$test('Claude conserva el contrato de extracción',static function()use($assert):void{
-    $assert(Salvest\AnthropicExtractor::VERSION==='anthropic-messages-v1');
-    $assert(Salvest\AnthropicExtractor::FIELDS===['proveedor','tipo_servicio','direccion','importe','fecha_factura','proveedor_cif','nombre_comunidad','comunidad_cif','codigo_postal','cups','numero_contrato','referencia_cliente','numero_factura','periodo_facturacion','moneda','codigo_comunidad']);
-});
 
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}

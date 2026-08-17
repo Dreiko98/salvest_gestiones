@@ -11,7 +11,7 @@ Salvest Gestiones automatiza estas tareas:
 1. Revisa varios buzones de correo mediante IMAP.
 2. Detecta los PDF adjuntos.
 3. Evita procesar dos veces el mismo correo o el mismo documento.
-4. Extrae los datos de la factura mediante la API de Claude (Anthropic).
+4. Extrae los datos de la factura mediante la API de OpenAI.
 5. Identifica la comunidad usando el maestro de comunidades.
 6. Comprueba que el proveedor está asignado a esa comunidad.
 7. Determina la categoría a partir de esa relación configurada.
@@ -35,7 +35,7 @@ Buzón IMAP
 Worker de Salvest
    ├── parser de correo y adjuntos
    ├── control de duplicados en MySQL
-   ├── extracción con Claude
+   ├── extracción con OpenAI
    ├── clasificación contra los maestros
    ├── copia privada local
    ├── archivo definitivo en Google Drive
@@ -169,10 +169,10 @@ Cada adjunto recibe un hash SHA-256 calculado sobre sus bytes. Si el mismo PDF v
 llegar reenviado, en otro mensaje o con otro nombre, se registra como duplicado y no se
 extrae ni se sube otra vez.
 
-## 7. Extracción con Claude
+## 7. Extracción con OpenAI
 
-El adjunto se guarda primero en una zona privada temporal. Después se envía como PDF
-nativo a la API de Anthropic junto con contexto útil del correo: remitente, asunto, nombre del adjunto y
+El adjunto se guarda primero en una zona privada temporal. Después se envía a la API de
+OpenAI junto con contexto útil del correo: remitente, asunto, nombre del adjunto y
 cuerpo del mensaje.
 
 La respuesta se exige mediante un esquema JSON estricto. Entre otros datos se extraen:
@@ -184,7 +184,7 @@ La respuesta se exige mediante un esquema JSON estricto. Entre otros datos se ex
 - Tipo de servicio.
 - Identificadores auxiliares como CUPS, contrato o referencia de cliente.
 
-Claude propone datos; no decide por sí solo el ID interno de la comunidad. La decisión
+OpenAI propone datos; no decide por sí solo el ID interno de la comunidad. La decisión
 definitiva se hace localmente contra MySQL.
 
 ## 8. Clasificación de la comunidad
@@ -300,7 +300,7 @@ MySQL conserva:
 - Buzón, UIDVALIDITY y UID.
 - Remitente, asunto, fecha y nombre original.
 - Hash SHA-256 y tamaño.
-- Datos extraídos por Claude.
+- Datos extraídos por OpenAI.
 - Comunidad, proveedor, servicio y confianza.
 - Nombre y ruta final local.
 - ID y ruta del archivo de Drive.
@@ -347,7 +347,7 @@ el cierre anual.
 ## 16. Comportamiento ante fallos
 
 - **Un buzón no autentica:** se registra el error y continúa el siguiente buzón.
-- **Anthropic falla:** el adjunto queda en error y el correo se deriva a errores.
+- **OpenAI falla:** el adjunto queda en error y el correo se deriva a errores.
 - **Drive falla:** no se afirma que la factura esté archivada; se registra el error.
 - **Movimiento IMAP falla tras archivar:** se conserva como incidencia, sin duplicar el
   PDF en Drive.

@@ -69,7 +69,7 @@ conserva mensajes, adjuntos y auditoría histórica.
 
 ## Recuperación
 
-- Si Anthropic o un buzón falla, los demás buzones continúan y la incidencia queda en
+- Si OpenAI o un buzón falla, los demás buzones continúan y la incidencia queda en
   MySQL; no se deben borrar filas para “reintentar”.
 - Si se pierde `app.encryption_key`, las contraseñas IMAP existentes no se pueden
   descifrar y deben volver a introducirse desde la interfaz.

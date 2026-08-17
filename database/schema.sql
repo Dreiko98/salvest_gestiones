@@ -243,8 +243,6 @@ CREATE TABLE IF NOT EXISTS processing_runs (
   error_count INT UNSIGNED NOT NULL DEFAULT 0,
   openai_input_tokens INT UNSIGNED NOT NULL DEFAULT 0,
   openai_output_tokens INT UNSIGNED NOT NULL DEFAULT 0,
-  anthropic_input_tokens INT UNSIGNED NOT NULL DEFAULT 0,
-  anthropic_output_tokens INT UNSIGNED NOT NULL DEFAULT 0,
   error_message TEXT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

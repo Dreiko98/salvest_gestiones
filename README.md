@@ -1,7 +1,7 @@
 # Salvest Gestiones — PHP/MySQL
 
 Aplicación web para recibir facturas desde varios buzones IMAP, extraer sus datos con
-Claude, clasificarlas por comunidad y archivarlas. Esta edición está diseñada para un
+OpenAI, clasificarlas por comunidad y archivarlas. Esta edición está diseñada para un
 hosting compartido PHP 8.2+ con MySQL 8 y tareas programadas; no requiere Docker ni un
 proceso residente.
 
@@ -16,7 +16,7 @@ cron de IONOS (cada 5 minutos)
         ▼
 bin/worker.php o public/cron.php
         ├── IMAP SSL de cada buzón
-        ├── Anthropic Messages API (Claude Sonnet)
+        ├── OpenAI Responses API
         ├── MySQL: configuración, auditoría e idempotencia
         ├── Google Drive: {código} - {comunidad}/Doc año en Vigor/{categoría}/ (año actual)
         ├── copia privada local en storage/invoices/
@@ -185,18 +185,16 @@ del año anterior a `Doc año en Vigor/{AAAA}/{CATEGORÍA}/`. El cierre queda re
 en MySQL (`drive_year_state` y `drive_year_rollovers`), se puede reanudar si se
 interrumpe y nunca sobrescribe un archivo existente.
 
-## Claude (Anthropic)
+## OpenAI
 
-Los PDF se envían como bloques nativos `document` en base64 mediante Messages API; no
-se extrae texto localmente antes de llamar al modelo. La salida se limita con JSON
-Schema estricto y no se aceptan IDs internos de comunidad propuestos por el modelo. La
-clasificación contra los maestros se hace localmente. El modelo configurado es
-`claude-sonnet-4-6`.
+Los PDF se envían como `input_file` y las imágenes como `input_image` mediante Responses
+API. La salida se limita con JSON Schema estricto y no se aceptan IDs de comunidad
+propuestos por el modelo. La clasificación contra los maestros se hace localmente.
 
 Documentación oficial:
 
-- [PDF support](https://platform.claude.com/docs/en/build-with-claude/pdf-support)
-- [Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+- [File inputs](https://developers.openai.com/api/docs/guides/file-inputs)
+- [Structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
 
 ## Pruebas
 
@@ -205,12 +203,7 @@ composer test
 find . -name '*.php' -print0 | xargs -0 -n1 php -l
 ```
 
-Las pruebas unitarias no contactan IONOS, Anthropic ni la base remota. Para comprobar
-una extracción real, sin tocar ningún buzón ni archivar el resultado:
-
-```bash
-php bin/test-anthropic-extraction.php /ruta/factura-sintetica.pdf
-```
+Las pruebas no contactan IONOS, OpenAI ni la base remota.
 
 ## Copias de seguridad
 

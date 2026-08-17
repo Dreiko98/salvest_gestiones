@@ -169,8 +169,19 @@ final class WebApp
 
     private function storage(): void
     {
-        $root=(string)$this->config['processing']['storage_root'];
-        $this->page('Almacenamiento','<h1>Almacenamiento</h1><section class="card"><p>Las facturas se guardan en la carpeta privada configurada por el administrador del hosting.</p><code>'.$this->e($root).'</code><p>Estado: <strong>'.(is_dir($root)&&is_writable($root)?'Disponible':'No escribible').'</strong></p></section>');
+        $drive=$this->config['google_drive']??[];$enabled=(bool)($drive['enabled']??false);
+        try{
+            if(!$enabled)throw new \RuntimeException('Google Drive no está activado');
+            $tokens=new GoogleUserOAuthProvider((string)$drive['oauth_client_file'],(string)$drive['oauth_token_file']);
+            $items=(new GoogleDriveClient($tokens))->children((string)$drive['root_folder_id']);
+            $folders=count(array_filter($items,static fn(array$item):bool=>($item['mimeType']??'')==='application/vnd.google-apps.folder'));
+            $body='<h1>Almacenamiento</h1><section class="status ok"><b>✓</b><span><strong>Google Drive correctamente configurado</strong><small>Las facturas se archivan automáticamente en la carpeta COMUNIDADES.</small></span></section>'.
+                '<section class="card"><h2>Carpeta de destino</h2><p><strong>COMUNIDADES</strong></p><p>Comunidades preparadas: <strong>'.$folders.'</strong></p></section>';
+        }catch(\Throwable$error){
+            $body='<h1>Almacenamiento</h1><section class="status warning"><div><b>!</b><span><strong>No se puede conectar con Google Drive</strong><small>La configuración necesita atención del administrador.</small></span></div></section>';
+            error_log('storage_drive_check status=error '.$error->getMessage());
+        }
+        $this->page('Almacenamiento',$body);
     }
 
     private function download(int $id): void

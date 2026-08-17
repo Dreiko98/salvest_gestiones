@@ -63,6 +63,26 @@ $test('archivado y colisión determinista',static function()use($assert):void{
     $assert(basename($a)==='2026-07_agua_hidralux-servicios.pdf');
     $assert(basename($b)==='2026-07_agua_hidralux-servicios_02.pdf');
 });
+$test('códigos y proveedores del CSV real',static function()use($assert):void{
+    $assert(Salvest\CommunityCsvImporter::code('1')==='01');
+    $assert(Salvest\CommunityCsvImporter::code('109')==='109');
+    $assert(Salvest\CommunityCsvImporter::providerName('IBERDROLA (4)')==='IBERDROLA');
+    $assert(Salvest\CommunityCsvImporter::providerName('EXTINCAS')==='EXTINCAS');
+});
+$test('ruta Drive y categorías canónicas',static function()use($assert):void{
+    $assert(Salvest\DriveInvoiceArchiver::communityFolderName(['external_code'=>'01','official_name'=>'LES ERES 3'])==='01 - LES ERES 3');
+    $assert(Salvest\DriveInvoiceArchiver::category('LUZ')==='ELECTRICIDAD');
+    $assert(Salvest\DriveInvoiceArchiver::category('FACSA')==='AGUA');
+    $assert(Salvest\DriveInvoiceArchiver::category('EXTINCAS')==='EXTINTORES');
+    $assert(Salvest\DriveInvoiceArchiver::category('otro proveedor 1')==='MANTENIMIENTO');
+    $assert(Salvest\DriveInvoiceArchiver::token('Adrián Turcu S.L.')==='ADRIAN-TURCU-S-L');
+});
+$test('colisión Drive nunca sobrescribe',static function()use($assert):void{
+    $base='2026-08-17_IBERDROLA_F-001.pdf';
+    $assert(Salvest\DriveInvoiceArchiver::availableFilename([],$base)===$base);
+    $assert(Salvest\DriveInvoiceArchiver::availableFilename([$base],$base)==='2026-08-17_IBERDROLA_F-001 (2).pdf');
+    $assert(Salvest\DriveInvoiceArchiver::availableFilename([$base,'2026-08-17_IBERDROLA_F-001 (2).pdf'],$base)==='2026-08-17_IBERDROLA_F-001 (3).pdf');
+});
 
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}

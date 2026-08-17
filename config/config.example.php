@@ -25,4 +25,10 @@ return [
         'storage_root' => dirname(__DIR__) . '/storage/invoices',
         'incoming_root' => dirname(__DIR__) . '/storage/incoming',
     ],
+    'google_drive' => [
+        'enabled' => false,
+        'root_folder_id' => 'ID_DE_LA_CARPETA_COMUNIDADES',
+        'oauth_client_file' => dirname(__DIR__) . '/config/google_oauth_client.json',
+        'oauth_token_file' => dirname(__DIR__) . '/config/google_oauth_token.json',
+    ],
 ];

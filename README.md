@@ -15,7 +15,8 @@ bin/worker.php o public/cron.php
         ├── IMAP SSL de cada buzón
         ├── OpenAI Responses API
         ├── MySQL: configuración, auditoría e idempotencia
-        ├── storage/invoices/comunidades/{comunidad}/{año}/{mes}/
+        ├── Google Drive: {código} - {comunidad}/Doc año en Vigor/{año}/{categoría}/
+        ├── copia privada local en storage/invoices/
         └── carpetas IMAP Facturas/{comunidad|revisión|errores}
 
 navegador ──► public/index.php ──► panel administrativo
@@ -49,6 +50,13 @@ php -r 'echo bin2hex(random_bytes(32)), PHP_EOL;'
 Completa `config/config.php`. Este archivo contiene secretos y está excluido de Git.
 Nunca cambies `app.encryption_key` después de guardar buzones: se usa para cifrar sus
 contraseñas.
+
+Para Google Drive, copia `config/google_drive.example.php` como
+`config/google_drive.php` y guarda junto a él `google_oauth_client.json` y
+`google_oauth_token.json`. Los tres archivos privados están excluidos de Git. El token
+OAuth se obtiene una sola vez con la cuenta propietaria y después se renueva
+automáticamente. El cliente Drive depende de `AccessTokenProvider`, por lo que una
+futura implementación con domain-wide delegation no cambia la lógica de carpetas.
 
 Inicialización por CLI:
 

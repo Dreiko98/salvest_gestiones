@@ -8,6 +8,7 @@ final class Worker
     private MimeParser $parser;
     private Classifier $classifier;
     private Archiver $archiver;
+    private ?DriveInvoiceArchiver $driveArchiver=null;
 
     /** @param array<string,mixed> $config */
     public function __construct(private Database $db, private Crypto $crypto,
@@ -16,6 +17,10 @@ final class Worker
         $this->parser = new MimeParser();
         $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
         $this->archiver = new Archiver((string)$config['processing']['storage_root']);
+        if((bool)($config['google_drive']['enabled']??false)){
+            $tokens=new GoogleUserOAuthProvider((string)$config['google_drive']['oauth_client_file'],(string)$config['google_drive']['oauth_token_file']);
+            $this->driveArchiver=new DriveInvoiceArchiver(new GoogleDriveClient($tokens),(string)$config['google_drive']['root_folder_id']);
+        }
     }
 
     /** @return array<string,int> */
@@ -135,13 +140,16 @@ final class Worker
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
         $decision = $this->classifier->classify($invoice,$context);
-        $supplier = $this->classifier->resolveSupplier($invoice,(string)$message['sender']);
-        $supplierOk = $supplier && $this->classifier->supplierAcceptsService($supplier,(string)$invoice['tipo_servicio']);
-        $status = $decision['community'] && $supplierOk ? 'classified' : ($decision['community'] ? 'needs_review' : 'unclassified');
+        $supplier = $decision['community']?$this->classifier->resolveCommunitySupplier((int)$decision['community']['id'],$invoice,(string)$message['sender']):null;
+        $status = $decision['community'] && $supplier ? 'classified' : ($decision['community'] ? 'needs_review' : 'unclassified');
+        if($supplier){$invoice['proveedor']=$supplier['official_name'];$invoice['tipo_servicio']=mb_strtolower((string)$supplier['category']);}
         $target = $this->archiver->archive($path,(string)$attachment['original_filename'],$invoice,$decision['community'],$status);
+        $drive=null;
+        if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$supplier['category'],$invoice);
         $data = array_merge($invoice,['community_id'=>$decision['community']['id'] ?? null,'confidence'=>$decision['confidence'],
             'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),
-            'decision_json'=>json_encode($decision,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR)]);
+            'decision_json'=>json_encode($decision,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
+            'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
         $counts[$status === 'classified' ? 'classified' : 'unclassified']++;
         return ['status'=>$status,'community_id'=>$data['community_id'] ? (int)$data['community_id'] : null];
@@ -151,18 +159,18 @@ final class Worker
     {
         $this->db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,
             provider,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,confidence,final_filename,output_path,status,
-            extraction_json,decision_json,error_message,extractor_version,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+            extraction_json,decision_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
             ON DUPLICATE KEY UPDATE provider=VALUES(provider),provider_cif=VALUES(provider_cif),service_type=VALUES(service_type),
             supply_address=VALUES(supply_address),amount=VALUES(amount),currency=VALUES(currency),invoice_date=VALUES(invoice_date),
             invoice_number=VALUES(invoice_number),community_id=VALUES(community_id),confidence=VALUES(confidence),final_filename=VALUES(final_filename),
             output_path=VALUES(output_path),status=VALUES(status),extraction_json=VALUES(extraction_json),decision_json=VALUES(decision_json),
-            error_message=VALUES(error_message),extractor_version=VALUES(extractor_version),processed_at=NOW()", [
+            error_message=VALUES(error_message),extractor_version=VALUES(extractor_version),drive_file_id=VALUES(drive_file_id),drive_path=VALUES(drive_path),drive_status=VALUES(drive_status),processed_at=NOW()", [
             $mailbox['id'],$client->uidValidity(),$uid,$attachment['original_filename'],$attachment['sha256'],$attachment['mime_type'],$attachment['size'],
             $data['proveedor']??$data['provider']??null,$data['proveedor_cif']??$data['provider_cif']??null,$data['tipo_servicio']??$data['service_type']??null,
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
             $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,
-            $data['error_message']??null,OpenAIExtractor::VERSION,
+            $data['error_message']??null,OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
         ]);
     }
 

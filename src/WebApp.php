@@ -69,9 +69,9 @@ final class WebApp
             if(($_POST['action']??'')==='archive'){
                 $id=(int)$_POST['id'];$this->db->execute('UPDATE communities SET active=0 WHERE id=?',[$id]);$this->audit('archive','community',$id);$this->redirect('/?route=communities');
             }
-            $id=(int)($_POST['id']??0); $updating=$id>0; $values=[trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),trim((string)$_POST['main_address']),trim((string)($_POST['postal_code']??'')),trim((string)($_POST['city']??'')),1];
-            if ($id) $this->db->execute('UPDATE communities SET official_name=?,normalized_name=?,cif=?,main_address=?,postal_code=?,city=?,active=? WHERE id=?',[...$values,$id]);
-            else {$this->db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,postal_code,city,active) VALUES (?,?,?,?,?,?,?)',$values);$id=(int)$this->db->pdo()->lastInsertId();}
+            $id=(int)($_POST['id']??0); $updating=$id>0; $code=CommunityCsvImporter::code((string)($_POST['external_code']??''));$values=[$code,trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),trim((string)$_POST['main_address']),trim((string)($_POST['postal_code']??'')),trim((string)($_POST['city']??'')),$code.' - '.trim((string)$_POST['official_name']),1];
+            if ($id) $this->db->execute('UPDATE communities SET external_code=?,official_name=?,normalized_name=?,cif=?,main_address=?,postal_code=?,city=?,imap_folder_name=?,active=? WHERE id=?',[...$values,$id]);
+            else {$this->db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,?)',$values);$id=(int)$this->db->pdo()->lastInsertId();}
             $this->replaceRelated('community_aliases','community_id',$id,'address',(string)($_POST['address_aliases']??''));
             $this->replaceIdentifiers($id,(string)($_POST['identifiers']??''));
             $this->audit($updating ? 'update' : 'create','community',$id);
@@ -79,11 +79,11 @@ final class WebApp
         }
         $edit=isset($_GET['edit'])?$this->db->one('SELECT * FROM communities WHERE id=?',[(int)$_GET['edit']]):null;
         $rows=$this->db->all('SELECT * FROM communities ORDER BY active DESC,official_name'); $table='';
-        foreach($rows as $row)$table.='<tr><td>'.$this->e($row['official_name']).'</td><td>'.$this->e($row['main_address']).'</td><td>'.($row['active']?'Activa':'Archivada').'</td><td><a href="/?route=communities&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=communities"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button>Archivar</button></form>':'').'</td></tr>';
+        foreach($rows as $row)$table.='<tr><td>'.$this->e($row['external_code']?:'—').'</td><td>'.$this->e($row['official_name']).'</td><td>'.$this->e($row['main_address']).'</td><td>'.($row['active']?'Activa':'Archivada').'</td><td><a href="/?route=communities&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=communities"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button>Archivar</button></form>':'').'</td></tr>';
         $addressAliases=$edit?$this->relatedText('community_aliases','community_id',(int)$edit['id']):'';
         $identifiers=$edit?$this->identifierText((int)$edit['id']):'';
-        $form='<form method="post" action="/?route=communities" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><h2>'.($edit?'Editar':'Añadir').' comunidad</h2><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input name="cif" value="'.$this->e($edit['cif']??'').'"></label><label class="wide">Dirección principal<input name="main_address" value="'.$this->e($edit['main_address']??'').'" required></label><label>Código postal<input name="postal_code" value="'.$this->e($edit['postal_code']??'').'"></label><label>Ciudad<input name="city" value="'.$this->e($edit['city']??'').'"></label><label class="wide">Otras direcciones conocidas<textarea name="address_aliases" rows="3" placeholder="Una dirección por línea">'.$this->e($addressAliases).'</textarea><small>Opcional. Ayuda a reconocer formatos distintos de la misma dirección.</small></label><label class="wide">Identificadores de contrato<textarea name="identifiers" rows="3" placeholder="cups: ES...&#10;contract: 12345">'.$this->e($identifiers).'</textarea><small>Opcional. Formato tipo: valor. Tipos permitidos: cups, contract, customer_reference.</small></label><button>Guardar</button></form>';
-        $this->page('Comunidades','<h1>Comunidades</h1>'.$form.'<section class="card"><table><tr><th>Nombre</th><th>Dirección</th><th>Estado</th><th></th></tr>'.$table.'</table></section>');
+        $form='<form method="post" action="/?route=communities" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><h2>'.($edit?'Editar':'Añadir').' comunidad</h2><label>Código<input name="external_code" value="'.$this->e($edit['external_code']??'').'" required></label><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input name="cif" value="'.$this->e($edit['cif']??'').'"></label><label class="wide">Dirección principal<input name="main_address" value="'.$this->e($edit['main_address']??'').'" required></label><label>Código postal<input name="postal_code" value="'.$this->e($edit['postal_code']??'').'"></label><label>Ciudad<input name="city" value="'.$this->e($edit['city']??'').'"></label><label class="wide">Otras direcciones conocidas<textarea name="address_aliases" rows="3" placeholder="Una dirección por línea">'.$this->e($addressAliases).'</textarea><small>Opcional. Ayuda a reconocer formatos distintos de la misma dirección.</small></label><label class="wide">Identificadores de contrato<textarea name="identifiers" rows="3" placeholder="cups: ES...&#10;contract: 12345">'.$this->e($identifiers).'</textarea><small>Opcional. Formato tipo: valor. Tipos permitidos: cups, contract, customer_reference.</small></label><button>Guardar</button></form>';
+        $this->page('Comunidades','<h1>Comunidades</h1>'.$form.'<section class="card"><table><tr><th>Código</th><th>Nombre</th><th>Dirección</th><th>Estado</th><th></th></tr>'.$table.'</table></section>');
     }
 
     private function suppliers(): void
@@ -147,12 +147,13 @@ final class WebApp
         if($_SERVER['REQUEST_METHOD']==='POST'){
             $attachment=$this->db->one('SELECT * FROM processed_attachments WHERE id=?',[(int)$_POST['id']]);
             $community=$this->db->one('SELECT * FROM communities WHERE id=? AND active=1',[(int)$_POST['community_id']]);
-            $supplier=$this->db->one('SELECT * FROM suppliers WHERE id=? AND active=1',[(int)$_POST['supplier_id']]);
-            if(!$attachment||!$community||!$supplier||!$attachment['output_path']||!is_file($attachment['output_path']))throw new \RuntimeException('No se puede confirmar esta factura');
-            $invoice=['fecha_factura'=>(string)$_POST['invoice_date'],'tipo_servicio'=>(string)$_POST['service_type'],'proveedor'=>(string)$supplier['official_name']];
+            $supplier=$this->db->one('SELECT s.*,cs.category FROM community_suppliers cs JOIN suppliers s ON s.id=cs.supplier_id WHERE cs.community_id=? AND s.id=? AND s.active=1',[$community['id'],(int)$_POST['supplier_id']]);
+            if(!$attachment||!$community||!$supplier||!$attachment['output_path']||!is_file($attachment['output_path']))throw new \RuntimeException('El proveedor seleccionado no está configurado para esa comunidad');
+            $invoice=['fecha_factura'=>(string)$_POST['invoice_date'],'tipo_servicio'=>mb_strtolower((string)$supplier['category']),'proveedor'=>(string)$supplier['official_name'],'numero_factura'=>(string)($_POST['invoice_number']??'')];
             $target=(new Archiver((string)$this->config['processing']['storage_root']))->archive((string)$attachment['output_path'],(string)$attachment['original_filename'],$invoice,$community,'classified');
+            $drive=null;if((bool)($this->config['google_drive']['enabled']??false))$drive=$this->driveArchiver()->archive($target,$community,$supplier,(string)$supplier['category'],$invoice);
             $this->db->execute("UPDATE processed_attachments SET community_id=?,provider=?,service_type=?,invoice_date=?,amount=?,invoice_number=?,confidence=100,
-                final_filename=?,output_path=?,status='classified',error_message=NULL,processed_at=NOW() WHERE id=?",[$community['id'],$supplier['official_name'],$_POST['service_type'],$_POST['invoice_date'],$_POST['amount']?:null,$_POST['invoice_number']?:null,basename($target),$target,$attachment['id']]);
+                final_filename=?,output_path=?,drive_file_id=?,drive_path=?,drive_status=?,status='classified',error_message=NULL,processed_at=NOW() WHERE id=?",[$community['id'],$supplier['official_name'],mb_strtolower((string)$supplier['category']),$_POST['invoice_date'],$_POST['amount']?:null,$_POST['invoice_number']?:null,basename($target),$target,$drive['id']??null,$drive['path']??null,$drive?'uploaded':null,$attachment['id']]);
             $this->audit('confirm_classification','attachment',$attachment['id'],['community_id'=>$community['id'],'supplier_id'=>$supplier['id']]);
             $this->redirect('/?route=reviews');
         }
@@ -192,6 +193,12 @@ final class WebApp
     {
         $this->db->execute('INSERT INTO audit_log(user_id,action,entity_type,entity_id,new_values_json,ip_address) VALUES (?,?,?,?,?,?)',[
             $this->auth->userId(),$action,$entity,(string)$id,$values?json_encode($values,JSON_UNESCAPED_UNICODE):null,$_SERVER['REMOTE_ADDR']??null]);
+    }
+    private function driveArchiver():DriveInvoiceArchiver
+    {
+        $drive=$this->config['google_drive']??[];
+        $tokens=new GoogleUserOAuthProvider((string)$drive['oauth_client_file'],(string)$drive['oauth_token_file']);
+        return new DriveInvoiceArchiver(new GoogleDriveClient($tokens),(string)$drive['root_folder_id']);
     }
     private function relatedText(string $table,string $owner,int $id):string
     {

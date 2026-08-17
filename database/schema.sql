@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 
 CREATE TABLE IF NOT EXISTS communities (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  external_code VARCHAR(20) NULL,
   official_name VARCHAR(255) NOT NULL,
   normalized_name VARCHAR(255) NOT NULL,
   cif VARCHAR(50) NULL,
@@ -35,10 +36,12 @@ CREATE TABLE IF NOT EXISTS communities (
   country VARCHAR(100) NOT NULL DEFAULT 'España',
   notes TEXT NULL,
   imap_folder_name VARCHAR(190) NULL,
+  drive_folder_id VARCHAR(190) NULL,
   active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_communities_active (active)
+  INDEX idx_communities_active (active),
+  UNIQUE KEY uq_communities_external_code (external_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS community_aliases (
@@ -109,6 +112,32 @@ CREATE TABLE IF NOT EXISTS supplier_aliases (
   CONSTRAINT fk_alias_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS community_suppliers (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  community_id BIGINT UNSIGNED NOT NULL,
+  supplier_id BIGINT UNSIGNED NOT NULL,
+  category VARCHAR(50) NOT NULL,
+  contract_reference VARCHAR(255) NULL,
+  source_column VARCHAR(100) NOT NULL,
+  raw_provider_name VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_community_supplier_category (community_id,supplier_id,category),
+  INDEX idx_cs_community (community_id),
+  CONSTRAINT fk_cs_community FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE,
+  CONSTRAINT fk_cs_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS drive_folders (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  parent_drive_id VARCHAR(190) NOT NULL,
+  folder_name VARCHAR(255) NOT NULL,
+  drive_id VARCHAR(190) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_drive_parent_name (parent_drive_id,folder_name),
+  UNIQUE KEY uq_drive_id (drive_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS mailboxes (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   descriptive_name VARCHAR(190) NOT NULL,
@@ -172,6 +201,9 @@ CREATE TABLE IF NOT EXISTS processed_attachments (
   decision_json JSON NULL,
   error_message TEXT NULL,
   extractor_version VARCHAR(100) NULL,
+  drive_file_id VARCHAR(190) NULL,
+  drive_path VARCHAR(1000) NULL,
+  drive_status VARCHAR(50) NULL,
   processed_at DATETIME NOT NULL,
   UNIQUE KEY uq_processed_attachment (mailbox_id, uidvalidity, message_uid, attachment_sha256),
   INDEX idx_attachment_hash (attachment_sha256),
@@ -223,3 +255,7 @@ INSERT IGNORE INTO service_types (name, normalized_name) VALUES
 ('Agua','agua'),('Luz','luz'),('Gas','gas'),('Telecomunicaciones','telecomunicaciones'),
 ('Seguros','seguros'),('Mantenimiento','mantenimiento'),('Ascensores','ascensores'),
 ('Limpieza','limpieza'),('Automoción','automocion'),('Otros','otros');
+
+INSERT IGNORE INTO service_types (name, normalized_name) VALUES
+('Ascensor','ascensor'),('Electricidad','electricidad'),('Agua','agua'),('Extintores','extintores'),
+('Jardinería','jardineria'),('Piscina','piscina'),('Descalcificador','descalcificador');

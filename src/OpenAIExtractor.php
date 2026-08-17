@@ -24,7 +24,7 @@ final class OpenAIExtractor
         $fields = [
             'proveedor','tipo_servicio','direccion','importe','fecha_factura','proveedor_cif',
             'nombre_comunidad','comunidad_cif','codigo_postal','cups','numero_contrato',
-            'referencia_cliente','numero_factura','periodo_facturacion','moneda',
+            'referencia_cliente','numero_factura','periodo_facturacion','moneda','codigo_comunidad',
         ];
         $properties = [];
         foreach ($fields as $field) {

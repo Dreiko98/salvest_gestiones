@@ -1,4 +1,7 @@
 /config/config.php
+/config/google_oauth_client.json
+/config/google_oauth_token.json
+/config/google_drive.php
 /storage/incoming/*
 /storage/invoices/*
 !/storage/incoming/.gitkeep

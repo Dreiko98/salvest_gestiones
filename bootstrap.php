@@ -14,5 +14,11 @@ if (!is_file($configFile)) {
 }
 /** @var array<string,mixed> $config */
 $config = require $configFile;
+$driveConfigFile=__DIR__.'/config/google_drive.php';
+if(is_file($driveConfigFile)){
+    $driveConfig=require $driveConfigFile;
+    if(!is_array($driveConfig))throw new RuntimeException('config/google_drive.php no devuelve una configuración válida');
+    $config['google_drive']=array_replace($config['google_drive']??[],$driveConfig);
+}
 date_default_timezone_set((string)($config['app']['timezone'] ?? 'Europe/Madrid'));
 return $config;

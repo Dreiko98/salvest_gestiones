@@ -105,6 +105,20 @@ Seguridad: SSL/TLS
 Usuario: dirección de correo completa
 ```
 
+Para Gmail personal se utiliza:
+
+```text
+Servidor: imap.gmail.com
+Puerto: 993
+Seguridad: SSL/TLS
+Usuario: dirección de Gmail completa
+Contraseña: contraseña de aplicación de Google, no la contraseña normal
+```
+
+Las cuentas nuevas se guardan desactivadas por defecto. El botón **Probar conexión**
+comprueba las credenciales aunque la cuenta esté desactivada; solo al marcar **Activar
+procesamiento automático** podrá leerla el worker.
+
 ### 3.4 Google Drive
 
 La autenticación actual es OAuth2 con un usuario de Google autorizado. El token se

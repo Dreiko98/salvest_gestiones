@@ -20,6 +20,12 @@ $test('cifrado autenticado',static function()use($assert):void{
 $test('imap modified utf7',static function()use($assert):void{
     $assert(Salvest\ImapClient::modifiedUtf7('Pendientes de revisión')==='Pendientes de revisi&APM-n');
 });
+$test('proveedores IMAP seguros',static function()use($assert):void{
+    $assert(Salvest\MailboxProvider::connection('gmail')===['host'=>'imap.gmail.com','port'=>993,'use_ssl'=>1]);
+    $assert(Salvest\MailboxProvider::connection('ionos')===['host'=>'imap.ionos.es','port'=>993,'use_ssl'=>1]);
+    $assert(Salvest\MailboxProvider::fromHost('imap.gmail.com')==='gmail');
+    try{Salvest\MailboxProvider::connection('personalizado');$assert(false,'debería rechazar servidores arbitrarios');}catch(InvalidArgumentException){}
+});
 $test('mime con un pdf',static function()use($assert):void{
     $raw="From: demo@example.com\r\nSubject: Factura\r\nContent-Type: application/pdf; name=invoice.pdf\r\nContent-Disposition: attachment; filename=invoice.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\n".base64_encode('%PDF-demo');
     $message=(new Salvest\MimeParser())->parse($raw);

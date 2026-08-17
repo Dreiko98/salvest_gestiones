@@ -41,6 +41,10 @@ Esto permite reconocer formatos distintos sin reducir el umbral general de confi
 - Permiso de escritura en `storage/incoming` y `storage/invoices`.
 
 El cliente IMAP está implementado con sockets TLS de PHP y no requiere `ext-imap`.
+La interfaz ofrece perfiles seguros para IONOS (`imap.ionos.es`) y Gmail personal
+(`imap.gmail.com`), ambos por SSL/TLS en el puerto 993. En Gmail debe utilizarse una
+contraseña de aplicación. Las cuentas nuevas se guardan desactivadas para poder probar
+la conexión antes de permitir que el worker las procese.
 
 ## Configuración local
 

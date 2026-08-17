@@ -20,6 +20,19 @@ $test('cifrado autenticado',static function()use($assert):void{
 $test('imap modified utf7',static function()use($assert):void{
     $assert(Salvest\ImapClient::modifiedUtf7('Pendientes de revisión')==='Pendientes de revisi&APM-n');
 });
+$test('mime con un pdf',static function()use($assert):void{
+    $raw="From: demo@example.com\r\nSubject: Factura\r\nContent-Type: application/pdf; name=invoice.pdf\r\nContent-Disposition: attachment; filename=invoice.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\n".base64_encode('%PDF-demo');
+    $message=(new Salvest\MimeParser())->parse($raw);
+    $assert(count($message['attachments'])===1);
+    $assert($message['attachments'][0]['original_filename']==='invoice.pdf');
+    $assert($message['attachments'][0]['sha256']===hash('sha256','%PDF-demo'));
+});
+$test('mime sin documentos',static function()use($assert):void{
+    $raw="From: demo@example.com\r\nSubject: Consulta\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nNo contiene facturas.";
+    $message=(new Salvest\MimeParser())->parse($raw);
+    $assert(count($message['attachments'])===0);
+    $assert($message['body']==='No contiene facturas.');
+});
 $test('mime con varios pdf y nombre especial',static function()use($assert):void{
     $boundary='demo-boundary';
     $raw="From: Demo <demo@example.com>\r\nSubject: Facturas\r\nContent-Type: multipart/mixed; boundary=\"$boundary\"\r\n\r\n".

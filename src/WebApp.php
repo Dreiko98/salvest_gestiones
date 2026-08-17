@@ -41,7 +41,9 @@ final class WebApp
         if ($_SERVER['REQUEST_METHOD']==='POST') {
             try { $this->auth->verifyCsrf((string)($_POST['csrf']??'')); }
             catch (\Throwable $exception) { $error=$exception->getMessage(); }
-            if ($error==='' && $this->auth->login((string)($_POST['username']??''),(string)($_POST['password']??''))) $this->redirect('/');
+            try {
+                if ($error==='' && $this->auth->login((string)($_POST['username']??''),(string)($_POST['password']??''))) $this->redirect('/');
+            } catch (\Throwable $exception) { $error=$exception->getMessage(); }
             if ($error==='') $error='Usuario o contraseña incorrectos.';
         }
         $body='<section class="card login"><h1>Gestión de facturas</h1>'.($error?'<p class="error">'.$this->e($error).'</p>':'').
@@ -64,35 +66,50 @@ final class WebApp
     private function communities(): void
     {
         if ($_SERVER['REQUEST_METHOD']==='POST') {
-            $id=(int)($_POST['id']??0); $values=[trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),trim((string)$_POST['main_address']),trim((string)($_POST['postal_code']??'')),trim((string)($_POST['city']??'')),1];
+            if(($_POST['action']??'')==='archive'){
+                $id=(int)$_POST['id'];$this->db->execute('UPDATE communities SET active=0 WHERE id=?',[$id]);$this->audit('archive','community',$id);$this->redirect('/?route=communities');
+            }
+            $id=(int)($_POST['id']??0); $updating=$id>0; $values=[trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),trim((string)$_POST['main_address']),trim((string)($_POST['postal_code']??'')),trim((string)($_POST['city']??'')),1];
             if ($id) $this->db->execute('UPDATE communities SET official_name=?,normalized_name=?,cif=?,main_address=?,postal_code=?,city=?,active=? WHERE id=?',[...$values,$id]);
-            else $this->db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,postal_code,city,active) VALUES (?,?,?,?,?,?,?)',$values);
-            $this->audit($id ? 'update' : 'create','community',$id ?: $this->db->pdo()->lastInsertId());
+            else {$this->db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,postal_code,city,active) VALUES (?,?,?,?,?,?,?)',$values);$id=(int)$this->db->pdo()->lastInsertId();}
+            $this->replaceRelated('community_aliases','community_id',$id,'address',(string)($_POST['address_aliases']??''));
+            $this->replaceIdentifiers($id,(string)($_POST['identifiers']??''));
+            $this->audit($updating ? 'update' : 'create','community',$id);
             $this->redirect('/?route=communities');
         }
+        $edit=isset($_GET['edit'])?$this->db->one('SELECT * FROM communities WHERE id=?',[(int)$_GET['edit']]):null;
         $rows=$this->db->all('SELECT * FROM communities ORDER BY active DESC,official_name'); $table='';
-        foreach($rows as $row)$table.='<tr><td>'.$this->e($row['official_name']).'</td><td>'.$this->e($row['main_address']).'</td><td>'.($row['active']?'Activa':'Archivada').'</td></tr>';
-        $form='<form method="post" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><h2>Añadir comunidad</h2><label>Nombre oficial<input name="official_name" required></label><label>CIF<input name="cif"></label><label class="wide">Dirección principal<input name="main_address" required></label><label>Código postal<input name="postal_code"></label><label>Ciudad<input name="city"></label><button>Guardar</button></form>';
-        $this->page('Comunidades','<h1>Comunidades</h1>'.$form.'<section class="card"><table><tr><th>Nombre</th><th>Dirección</th><th>Estado</th></tr>'.$table.'</table></section>');
+        foreach($rows as $row)$table.='<tr><td>'.$this->e($row['official_name']).'</td><td>'.$this->e($row['main_address']).'</td><td>'.($row['active']?'Activa':'Archivada').'</td><td><a href="/?route=communities&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=communities"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button>Archivar</button></form>':'').'</td></tr>';
+        $addressAliases=$edit?$this->relatedText('community_aliases','community_id',(int)$edit['id']):'';
+        $identifiers=$edit?$this->identifierText((int)$edit['id']):'';
+        $form='<form method="post" action="/?route=communities" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><h2>'.($edit?'Editar':'Añadir').' comunidad</h2><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input name="cif" value="'.$this->e($edit['cif']??'').'"></label><label class="wide">Dirección principal<input name="main_address" value="'.$this->e($edit['main_address']??'').'" required></label><label>Código postal<input name="postal_code" value="'.$this->e($edit['postal_code']??'').'"></label><label>Ciudad<input name="city" value="'.$this->e($edit['city']??'').'"></label><label class="wide">Otras direcciones conocidas<textarea name="address_aliases" rows="3" placeholder="Una dirección por línea">'.$this->e($addressAliases).'</textarea><small>Opcional. Ayuda a reconocer formatos distintos de la misma dirección.</small></label><label class="wide">Identificadores de contrato<textarea name="identifiers" rows="3" placeholder="cups: ES...&#10;contract: 12345">'.$this->e($identifiers).'</textarea><small>Opcional. Formato tipo: valor. Tipos permitidos: cups, contract, customer_reference.</small></label><button>Guardar</button></form>';
+        $this->page('Comunidades','<h1>Comunidades</h1>'.$form.'<section class="card"><table><tr><th>Nombre</th><th>Dirección</th><th>Estado</th><th></th></tr>'.$table.'</table></section>');
     }
 
     private function suppliers(): void
     {
         if ($_SERVER['REQUEST_METHOD']==='POST') {
-            $this->db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',[trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),(int)$_POST['service_id']?:null]);
-            $id=(int)$this->db->pdo()->lastInsertId(); if((int)$_POST['service_id'])$this->db->execute('INSERT INTO supplier_service_types(supplier_id,service_type_id) VALUES (?,?)',[$id,(int)$_POST['service_id']]);
-            $this->audit('create','supplier',$id);
+            if(($_POST['action']??'')==='archive'){$id=(int)$_POST['id'];$this->db->execute('UPDATE suppliers SET active=0 WHERE id=?',[$id]);$this->audit('archive','supplier',$id);$this->redirect('/?route=suppliers');}
+            $id=(int)($_POST['id']??0);$values=[trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),(int)$_POST['service_id']?:null];
+            if($id)$this->db->execute('UPDATE suppliers SET official_name=?,normalized_name=?,cif=?,main_service_type_id=?,active=1 WHERE id=?',[...$values,$id]);
+            else{$this->db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',$values);$id=(int)$this->db->pdo()->lastInsertId();}
+            $this->db->execute('DELETE FROM supplier_service_types WHERE supplier_id=?',[$id]);if((int)$_POST['service_id'])$this->db->execute('INSERT INTO supplier_service_types(supplier_id,service_type_id) VALUES (?,?)',[$id,(int)$_POST['service_id']]);
+            $this->replaceRelated('supplier_aliases','supplier_id',$id,'name',(string)($_POST['aliases']??''));
+            $this->audit(isset($_POST['id'])&&$_POST['id']?'update':'create','supplier',$id);
             $this->redirect('/?route=suppliers');
         }
-        $services=$this->db->all('SELECT * FROM service_types WHERE active=1 ORDER BY name'); $options=''; foreach($services as $service)$options.='<option value="'.$service['id'].'">'.$this->e($service['name']).'</option>';
-        $rows=$this->db->all('SELECT s.*,st.name service FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id ORDER BY s.official_name'); $table=''; foreach($rows as $row)$table.='<tr><td>'.$this->e($row['official_name']).'</td><td>'.$this->e($row['cif']?:'—').'</td><td>'.$this->e($row['service']?:'—').'</td></tr>';
-        $form='<form method="post" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><h2>Añadir proveedor</h2><label>Nombre oficial<input name="official_name" required></label><label>CIF<input name="cif"></label><label>Servicio<select name="service_id" required><option value="">Seleccionar</option>'.$options.'</select></label><button>Guardar</button></form>';
-        $this->page('Proveedores','<h1>Proveedores</h1>'.$form.'<section class="card"><table><tr><th>Nombre</th><th>CIF</th><th>Servicio</th></tr>'.$table.'</table></section>');
+        $edit=isset($_GET['edit'])?$this->db->one('SELECT * FROM suppliers WHERE id=?',[(int)$_GET['edit']]):null;
+        $services=$this->db->all('SELECT * FROM service_types WHERE active=1 ORDER BY name'); $options=''; foreach($services as $service)$options.='<option value="'.$service['id'].'"'.((int)($edit['main_service_type_id']??0)===(int)$service['id']?' selected':'').'>'.$this->e($service['name']).'</option>';
+        $rows=$this->db->all('SELECT s.*,st.name service FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id ORDER BY s.active DESC,s.official_name'); $table=''; foreach($rows as $row)$table.='<tr><td>'.$this->e($row['official_name']).'</td><td>'.$this->e($row['cif']?:'—').'</td><td>'.$this->e($row['service']?:'—').'</td><td><a href="/?route=suppliers&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=suppliers"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button>Archivar</button></form>':'').'</td></tr>';
+        $aliases=$edit?$this->relatedText('supplier_aliases','supplier_id',(int)$edit['id']):'';
+        $form='<form method="post" action="/?route=suppliers" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><h2>'.($edit?'Editar':'Añadir').' proveedor</h2><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input name="cif" value="'.$this->e($edit['cif']??'').'"></label><label>Servicio<select name="service_id" required><option value="">Seleccionar</option>'.$options.'</select></label><label class="wide">Otros nombres o dominios conocidos<textarea name="aliases" rows="3" placeholder="Un nombre o dominio por línea">'.$this->e($aliases).'</textarea><small>Opcional. Por ejemplo: comercial@proveedor.es o proveedor.es.</small></label><button>Guardar</button></form>';
+        $this->page('Proveedores','<h1>Proveedores</h1>'.$form.'<section class="card"><table><tr><th>Nombre</th><th>CIF</th><th>Servicio</th><th></th></tr>'.$table.'</table></section>');
     }
 
     private function mailboxes(): void
     {
         if ($_SERVER['REQUEST_METHOD']==='POST') {
+            if(($_POST['action']??'')==='archive'){$id=(int)$_POST['id'];$this->db->execute('UPDATE mailboxes SET active=0 WHERE id=?',[$id]);$this->audit('archive','mailbox',$id);$this->redirect('/?route=mailboxes');}
             if (($_POST['action'] ?? '') === 'test') {
                 $row=$this->db->one('SELECT * FROM mailboxes WHERE id=?',[(int)$_POST['id']]);
                 if(!$row)throw new \RuntimeException('Correo no encontrado');
@@ -106,13 +123,22 @@ final class WebApp
                 $this->redirect('/?route=mailboxes');
             }
             $email=mb_strtolower(trim((string)$_POST['email']));
-            $this->db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,993,1,?,?,\'INBOX\',1)',[trim((string)$_POST['name']),$email,'imap.ionos.es',$email,$this->crypto->encrypt((string)$_POST['password'])]);
-            $this->audit('create','mailbox',$this->db->pdo()->lastInsertId(),['email'=>$email]);
+            $id=(int)($_POST['id']??0);$password=(string)($_POST['password']??'');
+            if($id){
+                $existing=$this->db->one('SELECT encrypted_password FROM mailboxes WHERE id=?',[$id]);if(!$existing)throw new \RuntimeException('Correo no encontrado');
+                $encrypted=$password!==''?$this->crypto->encrypt($password):$existing['encrypted_password'];
+                $this->db->execute("UPDATE mailboxes SET descriptive_name=?,email=?,username=?,encrypted_password=?,active=1 WHERE id=?",[trim((string)$_POST['name']),$email,$email,$encrypted,$id]);
+            }else{
+                if($password==='')throw new \RuntimeException('La contraseña es obligatoria');
+                $this->db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,993,1,?,?,\'INBOX\',1)',[trim((string)$_POST['name']),$email,'imap.ionos.es',$email,$this->crypto->encrypt($password)]);$id=(int)$this->db->pdo()->lastInsertId();
+            }
+            $this->audit(isset($_POST['id'])&&$_POST['id']?'update':'create','mailbox',$id,['email'=>$email]);
             $this->redirect('/?route=mailboxes');
         }
+        $edit=isset($_GET['edit'])?$this->db->one('SELECT id,descriptive_name,email FROM mailboxes WHERE id=?',[(int)$_GET['edit']]):null;
         $rows=$this->db->all('SELECT id,descriptive_name,email,active,last_connection_at,last_connection_ok,last_error FROM mailboxes ORDER BY descriptive_name'); $table='';
-        foreach($rows as $row)$table.='<tr><td>'.$this->e($row['descriptive_name']).'</td><td>'.$this->e($row['email']).'</td><td>'.(!$row['active']?'Desactivado':($row['last_connection_ok']?'Conectado':'Sin comprobar/Error')).'</td><td><form method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="test"><input type="hidden" name="id" value="'.$row['id'].'"><button>Probar conexión</button></form></td></tr>';
-        $form='<form method="post" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><h2>Añadir correo IONOS</h2><label>Nombre<input name="name" required></label><label>Dirección<input type="email" name="email" required></label><label>Contraseña<input type="password" name="password" required autocomplete="new-password"></label><button>Guardar cifrado</button></form>';
+        foreach($rows as $row)$table.='<tr><td>'.$this->e($row['descriptive_name']).'</td><td>'.$this->e($row['email']).'</td><td>'.(!$row['active']?'Desactivado':($row['last_connection_ok']?'Conectado':'Sin comprobar/Error')).'</td><td><a href="/?route=mailboxes&edit='.$row['id'].'">Editar</a><form class="inline" method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="test"><input type="hidden" name="id" value="'.$row['id'].'"><button>Probar</button></form>'.($row['active']?'<form class="inline" method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button>Desactivar</button></form>':'').'</td></tr>';
+        $form='<form method="post" action="/?route=mailboxes" class="card grid"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><h2>'.($edit?'Editar':'Añadir').' correo IONOS</h2><label>Nombre<input name="name" value="'.$this->e($edit['descriptive_name']??'').'" required></label><label>Dirección<input type="email" name="email" value="'.$this->e($edit['email']??'').'" required></label><label>Contraseña<input type="password" name="password" '.($edit?'':'required').' autocomplete="new-password"><small>'.($edit?'Déjala vacía para conservarla.':'Se guardará cifrada.').'</small></label><button>Guardar cifrado</button></form>';
         $this->page('Correos','<h1>Correos</h1><p>El worker revisará estas cuentas en cada ejecución programada.</p>'.$form.'<section class="card"><table><tr><th>Nombre</th><th>Dirección</th><th>Estado</th><th></th></tr>'.$table.'</table></section>');
     }
 
@@ -166,6 +192,38 @@ final class WebApp
     {
         $this->db->execute('INSERT INTO audit_log(user_id,action,entity_type,entity_id,new_values_json,ip_address) VALUES (?,?,?,?,?,?)',[
             $this->auth->userId(),$action,$entity,(string)$id,$values?json_encode($values,JSON_UNESCAPED_UNICODE):null,$_SERVER['REMOTE_ADDR']??null]);
+    }
+    private function relatedText(string $table,string $owner,int $id):string
+    {
+        $allowed=['community_aliases'=>'community_id','supplier_aliases'=>'supplier_id'];
+        if(($allowed[$table]??null)!==$owner)throw new \InvalidArgumentException('Relación no permitida');
+        return implode("\n",array_column($this->db->all("SELECT value FROM $table WHERE $owner=? AND active=1 ORDER BY id",[$id]),'value'));
+    }
+    private function replaceRelated(string $table,string $owner,int $id,string $type,string $input):void
+    {
+        $allowed=['community_aliases'=>'community_id','supplier_aliases'=>'supplier_id'];
+        if(($allowed[$table]??null)!==$owner)throw new \InvalidArgumentException('Relación no permitida');
+        $this->db->execute("DELETE FROM $table WHERE $owner=?",[$id]);
+        foreach(array_unique(array_filter(array_map('trim',preg_split('/\R/u',$input)?:[])))as$value){
+            $this->db->execute("INSERT INTO $table($owner,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)",[$id,$type,$value,Text::normalize($value)]);
+        }
+    }
+    private function identifierText(int $id):string
+    {
+        $rows=$this->db->all('SELECT identifier_type,value FROM community_identifiers WHERE community_id=? AND active=1 ORDER BY id',[$id]);
+        return implode("\n",array_map(static fn(array$row):string=>$row['identifier_type'].': '.$row['value'],$rows));
+    }
+    private function replaceIdentifiers(int $id,string $input):void
+    {
+        $values=[];
+        foreach(array_filter(array_map('trim',preg_split('/\R/u',$input)?:[]))as$line){
+            if(!str_contains($line,':'))throw new \InvalidArgumentException('Cada identificador debe tener formato tipo: valor');
+            [$type,$value]=array_map('trim',explode(':',$line,2));
+            if(!in_array($type,['cups','contract','customer_reference'],true)||$value==='')throw new \InvalidArgumentException('Tipo de identificador no válido');
+            $values[]=[$type,$value,Text::normalize($value)];
+        }
+        $this->db->execute('DELETE FROM community_identifiers WHERE community_id=?',[$id]);
+        foreach($values as[$type,$value,$normalized])$this->db->execute('INSERT INTO community_identifiers(community_id,identifier_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$id,$type,$value,$normalized]);
     }
     private function redirect(string $path): never{header('Location: '.$path, true, 302);exit;}
     private function notFound(): never{http_response_code(404);echo 'No encontrado';exit;}

@@ -23,6 +23,9 @@ navegador ──► public/index.php ──► panel administrativo
 
 La aplicación usa `UIDVALIDITY + UID + buzón` para identificar mensajes y SHA-256 para
 no procesar dos veces el mismo documento, aunque llegue reenviado o con otro nombre.
+En cada comunidad se pueden guardar direcciones alternativas y referencias como CUPS
+o número de contrato; en cada proveedor se pueden añadir nombres o dominios alternativos.
+Esto permite reconocer formatos distintos sin reducir el umbral general de confianza.
 
 ## Requisitos
 
@@ -110,6 +113,10 @@ intervalos garantizados debe usarse el cron nativo del hosting.
 
 El bloqueo MySQL `GET_LOCK` evita ejecuciones solapadas. Un buzón que falle no detiene
 los demás. La contraseña y el token nunca deben aparecer en repositorios o capturas.
+
+El panel limita a cinco los accesos fallidos por usuario e IP durante quince minutos.
+Las claves IMAP se guardan cifradas y las contraseñas de usuarios solo como hashes
+generados por `password_hash`.
 
 ## Flujo IMAP
 

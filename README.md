@@ -95,6 +95,12 @@ Opción URL:
 https://salvest.germanmallo.com/cron.php?token=TOKEN_CRON
 ```
 
+El repositorio incluye también `.github/workflows/process-invoices.yml`, que llama a
+esa URL cada cinco minutos. Requiere crear el secreto de GitHub `CRON_TOKEN` con el
+mismo valor de `app.cron_token`. `workflow_dispatch` permite lanzar un ciclo manual.
+Las ejecuciones programadas de GitHub pueden sufrir algunos minutos de retraso; para
+intervalos garantizados debe usarse el cron nativo del hosting.
+
 El bloqueo MySQL `GET_LOCK` evita ejecuciones solapadas. Un buzón que falle no detiene
 los demás. La contraseña y el token nunca deben aparecer en repositorios o capturas.
 

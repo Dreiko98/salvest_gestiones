@@ -1,0 +1,24 @@
+name: Procesar facturas
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: salvest-invoice-worker
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ejecutar un ciclo remoto
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          test -n "$CRON_TOKEN"
+          curl --fail --silent --show-error --max-time 240 \
+            --get --data-urlencode "token=$CRON_TOKEN" \
+            https://salvest.germanmallo.com/cron.php

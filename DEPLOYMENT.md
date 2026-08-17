@@ -45,9 +45,16 @@ Respaldar como una unidad coherente:
 - Base de datos MySQL.
 - `storage/invoices/`.
 - `config/config.php`, especialmente `app.encryption_key`.
+- `config/google_drive.php`, `config/google_oauth_client.json` y
+  `config/google_oauth_token.json`.
 
 No basta con guardar solo los PDF: MySQL contiene la idempotencia de mensajes y hashes,
 las relaciones con comunidades, los buzones cifrados y el historial de decisiones.
+
+El CSV real de comunidades contiene datos del cliente y no se publica. Para reimportar,
+usar `bin/import-communities.php` desde un entorno privado y comprobar que devuelve
+exactamente 65 comunidades. La operación sustituye maestros en una transacción, pero
+conserva mensajes, adjuntos y auditoría histórica.
 
 ## Comprobación funcional
 

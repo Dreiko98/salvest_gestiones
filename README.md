@@ -140,6 +140,41 @@ generados por `password_hash`.
 
 Las carpetas con espacios y acentos usan modified UTF-7 para compatibilidad con IONOS.
 
+## Maestros reales y Google Drive
+
+El importador definitivo sustituye de forma transaccional los maestros de comunidades,
+proveedores y sus relaciones:
+
+```bash
+php bin/import-communities.php /ruta/Comunidades_Salvest_CORREGIDO.csv
+```
+
+El CSV no debe versionarse. La importación exige 65 códigos únicos, incluye 75, 115 y
+118, rechaza 100 y 200, omite valores de proveedor `NO` y elimina anotaciones de
+cantidad como `(2)` o `(4)` del nombre canónico. El código de una cifra se completa a
+dos (`1` → `01`).
+
+La comunidad se identifica prioritariamente por código exacto cuando está disponible;
+después por CIF y finalmente por dirección/nombre. Una vez identificada, el proveedor
+solo puede resolverse entre los asignados a esa comunidad. La categoría procede de esa
+relación, nunca de una conjetura sobre el PDF:
+
+- `LUZ`/`ELECTRICIDAD` → `ELECTRICIDAD`
+- `FACSA`/`AGUA` → `AGUA`
+- `EXTINCAS`/`EXTINTORES` → `EXTINTORES`
+- proveedor libre o categoría desconocida → `MANTENIMIENTO`
+- `ASCENSOR`, `LIMPIEZA`, `JARDINERIA`, `PISCINA` y `DESCALCIFICADOR` se conservan.
+
+Los documentos clasificados se añaden sin modificar nada existente:
+
+```text
+COMUNIDADES/{código} - {comunidad}/Doc año en Vigor/{AAAA}/{CATEGORÍA}/
+AAAA-MM-DD_PROVEEDOR[_NUMFACTURA].pdf
+```
+
+Si el nombre existe, se usa `(2)`, `(3)`, etc. Las carpetas se buscan por nombre exacto
+antes de crearlas; nunca se renombran ni reorganizan elementos existentes.
+
 ## OpenAI
 
 Los PDF se envían como `input_file` y las imágenes como `input_image` mediante Responses
@@ -167,5 +202,6 @@ Respaldar conjuntamente:
 - La base MySQL.
 - `storage/invoices/`.
 - `config/config.php`, especialmente `app.encryption_key`.
+- `config/google_oauth_client.json` y `config/google_oauth_token.json`.
 
 No publicar ninguno de estos elementos en GitHub.

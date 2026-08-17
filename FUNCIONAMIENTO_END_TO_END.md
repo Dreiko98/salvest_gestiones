@@ -382,6 +382,13 @@ No necesita iniciar ciclos manualmente, organizar la bandeja de entrada ni crear
 carpetas de Drive. Si todo está correcto, el panel muestra que no hay nada que requiera
 atención.
 
+Comunidades, proveedores y correos ofrecen dos niveles de retirada. **Archivar** o
+**Desactivar** es reversible y debe ser la opción habitual. **Eliminar** pide una
+confirmación y borra permanentemente el registro de MySQL. Al eliminar un correo se
+elimina también su historial de mensajes y adjuntos; al eliminar una comunidad o un
+proveedor se eliminan sus relaciones configuradas. Esta operación nunca borra PDF o
+carpetas de Google Drive ni mensajes del servidor IMAP.
+
 ## 18. Lista de comprobación antes de usar el entorno real
 
 ### Datos

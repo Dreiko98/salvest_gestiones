@@ -11,6 +11,7 @@ if ($token === '' || !hash_equals((string)$config['app']['cron_token'], $token))
 ignore_user_abort(true); set_time_limit(0);
 try {
     $db = new Salvest\Database($config['database']);
+    Salvest\Schema::migrate($db,$root.'/database/schema.sql');
     $worker = new Salvest\Worker($db,new Salvest\Crypto($config['app']['encryption_key']),new Salvest\OpenAIExtractor($config['openai']),$config);
     echo json_encode(['status'=>'ok','counts'=>$worker->run(false,(int)$config['imap']['max_messages_per_mailbox'])],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
 } catch (Throwable $error) {

@@ -9,6 +9,7 @@ $mailbox = null;
 foreach ($argv as $index=>$value) if ($value === '--max-emails' && isset($argv[$index+1])) $limit=(int)$argv[$index+1];
 foreach ($argv as $index=>$value) if ($value === '--mailbox' && isset($argv[$index+1])) $mailbox=$argv[$index+1];
 $db = new Salvest\Database($config['database']);
+Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
 $worker = new Salvest\Worker($db,new Salvest\Crypto($config['app']['encryption_key']),new Salvest\OpenAIExtractor($config['openai']),$config);
 $counts = $worker->run($dryRun,$limit,$mailbox);
 fwrite(STDOUT,json_encode($counts,JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT).PHP_EOL);

@@ -113,6 +113,8 @@ intervalos garantizados debe usarse el cron nativo del hosting.
 
 El bloqueo MySQL `GET_LOCK` evita ejecuciones solapadas. Un buzón que falle no detiene
 los demás. La contraseña y el token nunca deben aparecer en repositorios o capturas.
+Antes de cada ciclo, el worker aplica el esquema idempotente; las actualizaciones de
+base de datos se despliegan sin borrar ni recrear información existente.
 
 El panel limita a cinco los accesos fallidos por usuario e IP durante quince minutos.
 Las claves IMAP se guardan cifradas y las contraseñas de usuarios solo como hashes

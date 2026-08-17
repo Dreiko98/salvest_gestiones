@@ -77,7 +77,7 @@ final class Worker
                 $outcomes = [];
                 try {
                     foreach ($message['attachments'] as $attachment) {
-                        if ((int)$attachment['size'] > (int)$this->config['processing']['max_attachment_bytes']) throw new \RuntimeException('Adjunto demasiado grande');
+                        DocumentValidator::validate($attachment,(int)$this->config['processing']['max_attachment_bytes']);
                         $counts['documents']++;
                         try { $outcomes[] = $this->processAttachment($mailbox,$client,$uid,$message,$attachment,$counts); }
                         catch (\Throwable $attachmentError) {

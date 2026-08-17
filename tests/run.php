@@ -33,6 +33,16 @@ $test('mime sin documentos',static function()use($assert):void{
     $assert(count($message['attachments'])===0);
     $assert($message['body']==='No contiene facturas.');
 });
+$test('validación rechaza un falso pdf',static function()use($assert):void{
+    try{
+        Salvest\DocumentValidator::validate(['payload'=>'esto no es un PDF','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);
+        $assert(false,'debería rechazar el documento');
+    }catch(RuntimeException $error){$assert(str_contains($error->getMessage(),'firma PDF'));}
+});
+$test('validación acepta un pdf',static function()use($assert):void{
+    Salvest\DocumentValidator::validate(['payload'=>'%PDF-1.4 demo','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);
+    $assert(true);
+});
 $test('mime con varios pdf y nombre especial',static function()use($assert):void{
     $boundary='demo-boundary';
     $raw="From: Demo <demo@example.com>\r\nSubject: Facturas\r\nContent-Type: multipart/mixed; boundary=\"$boundary\"\r\n\r\n".

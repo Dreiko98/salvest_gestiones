@@ -13,7 +13,7 @@ final class Worker
 
     /** @param array<string,mixed> $config */
     public function __construct(private Database $db, private Crypto $crypto,
-        private OpenAIExtractor $extractor, private array $config)
+        private AnthropicExtractor $extractor, private array $config)
     {
         $this->parser = new MimeParser();
         $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
@@ -49,7 +49,7 @@ final class Worker
                     error_log('mailbox_id='.$mailbox['id'].' status=failed error='.$error->getMessage());
                 }
             }
-            $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,duplicate_count=?,error_count=?,openai_input_tokens=?,openai_output_tokens=? WHERE id=?",
+            $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,duplicate_count=?,error_count=?,anthropic_input_tokens=?,anthropic_output_tokens=? WHERE id=?",
                 [$counts['errors']?'partial':'completed',$counts['messages'],$counts['documents'],$counts['classified'],$counts['unclassified'],$counts['duplicate'],$counts['errors'],$this->extractor->inputTokens,$this->extractor->outputTokens,$runId]);
             return $counts;
         } catch (\Throwable $error) {
@@ -170,7 +170,7 @@ final class Worker
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
             $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,
-            $data['error_message']??null,OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
+            $data['error_message']??null,AnthropicExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
         ]);
     }
 

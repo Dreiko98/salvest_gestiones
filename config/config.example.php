@@ -15,7 +15,7 @@ return [
         'host' => 'MYSQL_HOST', 'port' => 3306, 'name' => 'MYSQL_DATABASE',
         'user' => 'MYSQL_USER', 'password' => 'MYSQL_PASSWORD', 'charset' => 'utf8mb4',
     ],
-    'openai' => ['api_key' => 'OPENAI_API_KEY', 'model' => 'gpt-5.6-luna', 'timeout_seconds' => 120],
+    'anthropic' => ['api_key' => 'ANTHROPIC_API_KEY', 'model' => 'claude-sonnet-4-6', 'max_tokens' => 2048, 'timeout_seconds' => 120],
     'imap' => [
         'default_host' => 'imap.ionos.es', 'default_port' => 993,
         'timeout_seconds' => 30, 'max_messages_per_mailbox' => 25,

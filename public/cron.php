@@ -17,7 +17,7 @@ try {
         $tokens=new Salvest\GoogleUserOAuthProvider((string)$config['google_drive']['oauth_client_file'],(string)$config['google_drive']['oauth_token_file']);
         $rollover=(new Salvest\DriveYearRollover($db,new Salvest\GoogleDriveClient($tokens),(string)$config['google_drive']['root_folder_id']))->runIfNeeded();
     }
-    $worker = new Salvest\Worker($db,new Salvest\Crypto($config['app']['encryption_key']),new Salvest\OpenAIExtractor($config['openai']),$config);
+    $worker = new Salvest\Worker($db,new Salvest\Crypto($config['app']['encryption_key']),new Salvest\AnthropicExtractor($config['anthropic']),$config);
     echo json_encode(['status'=>'ok','year_rollover'=>$rollover,'counts'=>$worker->run(false,(int)$config['imap']['max_messages_per_mailbox'])],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
 } catch (Throwable $error) {
     error_log('cron status=error '.$error->getMessage());

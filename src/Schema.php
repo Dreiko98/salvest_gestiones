@@ -15,10 +15,13 @@ final class Schema
         self::column($database,'processed_attachments','drive_file_id','VARCHAR(190) NULL AFTER extractor_version');
         self::column($database,'processed_attachments','drive_path','VARCHAR(1000) NULL AFTER drive_file_id');
         self::column($database,'processed_attachments','drive_status','VARCHAR(50) NULL AFTER drive_path');
+        self::column($database,'processing_runs','anthropic_input_tokens','INT UNSIGNED NOT NULL DEFAULT 0 AFTER openai_output_tokens');
+        self::column($database,'processing_runs','anthropic_output_tokens','INT UNSIGNED NOT NULL DEFAULT 0 AFTER anthropic_input_tokens');
         $index=$database->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='communities' AND index_name='uq_communities_external_code'");
         if(!$index)$database->execute('ALTER TABLE communities ADD UNIQUE KEY uq_communities_external_code(external_code)');
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0002_real_drive_structure')");
+        $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0003_anthropic_extractor')");
     }
 
     private static function column(Database $database,string $table,string $column,string $definition):void

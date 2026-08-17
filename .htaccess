@@ -1,5 +1,5 @@
-Options -Indexes
 RewriteEngine On
 RewriteRule ^(?:config|src|bin|database|tests|storage)/ - [F,L]
+RewriteRule ^public/ - [L]
 RewriteRule ^$ public/ [L]
 RewriteRule ^(.*)$ public/$1 [L]

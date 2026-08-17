@@ -5,6 +5,9 @@ OpenAI, clasificarlas por comunidad y archivarlas. Esta edición está diseñada
 hosting compartido PHP 8.2+ con MySQL 8 y tareas programadas; no requiere Docker ni un
 proceso residente.
 
+Para revisar el recorrido completo de una factura y la lista de comprobación previa a
+producción, consulta [FUNCIONAMIENTO_END_TO_END.md](FUNCIONAMIENTO_END_TO_END.md).
+
 ## Arquitectura
 
 ```text

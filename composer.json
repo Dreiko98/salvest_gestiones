@@ -1,0 +1,18 @@
+{
+  "name": "salvest/gestiones",
+  "description": "Clasificador de facturas multibuzón para hosting PHP/MySQL",
+  "license": "proprietary",
+  "type": "project",
+  "require": {
+    "php": ">=8.2",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*",
+    "ext-openssl": "*",
+    "ext-pdo": "*",
+    "ext-pdo_mysql": "*",
+    "ext-sodium": "*"
+  },
+  "autoload": {"psr-4": {"Salvest\\": "src/"}},
+  "scripts": {"test": "php tests/run.php"}
+}

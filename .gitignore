@@ -1,0 +1,7 @@
+/config/config.php
+/storage/incoming/*
+/storage/invoices/*
+!/storage/incoming/.gitkeep
+!/storage/invoices/.gitkeep
+/.phpunit.cache/
+/.DS_Store

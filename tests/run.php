@@ -40,7 +40,8 @@ $workerSchema=<<<SQL
 CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,process_existing_on_activate INTEGER DEFAULT 0,baseline_uidvalidity TEXT,baseline_uid INTEGER,baseline_captured_at TEXT,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
 CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
 CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,old_values_json TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
-CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT);
+CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,requeued_at TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT,UNIQUE(mailbox_id,uidvalidity,message_uid,attachment_sha256));
+CREATE TABLE processed_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,message_id_header TEXT,sender TEXT,subject TEXT,received_at TEXT,status TEXT,document_count INTEGER DEFAULT 0,imap_destination TEXT,imap_move_status TEXT,error_message TEXT,processed_at TEXT);
 CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
@@ -82,6 +83,36 @@ $applyBaseline=static function(Salvest\Database $db,array $config,array $mailbox
     $worker=Salvest\Worker::create($db,$config);
     $method=new ReflectionMethod(Salvest\Worker::class,'applyBaseline');$method->setAccessible(true);
     return$method->invoke($worker,$mailbox,$client,$uids);
+};
+/** Seeds one mailbox + one processed_messages row + N processed_attachments rows sharing the
+ * same (mailbox_id,uidvalidity='1001',message_uid='500') for InboxRequeue tests.
+ * @param list<string> $attachmentStatuses @return array{mailboxId:int,messageId:int,attachmentIds:list<int>} */
+$seedRequeueFixture=static function(Salvest\Database $db,array $attachmentStatuses,string $imapMoveStatus='moved',?string $messageIdHeader='<msg-1@example.com>'):array{
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','ignored-in-these-tests','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,message_id_header,sender,subject,received_at,status,document_count,imap_destination,imap_move_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        [$mailboxId,'1001','500',$messageIdHeader,'facturas@proveedor.example','Factura',date('Y-m-d H:i:s'),'needs_review',count($attachmentStatuses),'Facturas/Pendientes de revisión',$imapMoveStatus,date('Y-m-d H:i:s')]);
+    $messageId=(int)$db->pdo()->lastInsertId();
+    $attachmentIds=[];
+    foreach($attachmentStatuses as $index=>$status){
+        $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,status,processed_at,debug_trace_json) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            [$mailboxId,'1001','500','adjunto-'.$index.'.pdf','sha-'.$index,'application/pdf',1000,$status,date('Y-m-d H:i:s'),$status==='needs_review'?'[{"step":"document","data":{"filename":"adjunto-'.$index.'.pdf"}}]':null]);
+        $attachmentIds[]=(int)$db->pdo()->lastInsertId();
+    }
+    return ['mailboxId'=>$mailboxId,'messageId'=>$messageId,'attachmentIds'=>$attachmentIds];
+};
+/** A stub satisfying the four methods InboxRequeue actually calls on whatever its IMAP client
+ * factory returns — no real socket, no real ImapClient (final, can't be subclassed to fake). */
+$fakeRequeueImapClient=static function(array $findResult,?\Throwable $throwOnConnect=null):object{
+    return new class($findResult,$throwOnConnect){
+        public array $moved=[];
+        public function __construct(private array $findResult,private ?\Throwable $throwOnConnect){}
+        public function connect():void{if($this->throwOnConnect)throw $this->throwOnConnect;}
+        public function findUidsByMessageId(string $messageId):array{return $this->findResult;}
+        public function move(string $uid,string $destination):void{$this->moved=['uid'=>$uid,'destination'=>$destination];}
+        public function close():void{}
+    };
 };
 /** Calls the private, redirect-free WebApp::saveMailboxFromPost() directly — mailboxes() itself
  * calls exit() on a successful save, which would kill the whole test runner process if we went
@@ -1033,6 +1064,153 @@ $test('/Revisar: una factura unclassified (comunidad no resuelta) también muest
     $assert(str_contains($html,'community_unresolved'),'debe verse el motivo que impidió clasificar en el JSON completo');
     $assert(!str_contains($html,'No hay detalle técnico disponible'),'no debe caer en el mensaje de "sin traza" cuando sí la hay');
 });
+$test('/Revisar: el botón "Volver a procesar" solo aparece en facturas needs_review, con el texto de confirmación de un único adjunto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','needs_review',date('Y-m-d H:i:s'),'sola.pdf']);
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'2002','900','unclassified',date('Y-m-d H:i:s'),'otra-sin-clasificar.pdf']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(substr_count($html,'Volver a procesar')===1,'el botón debe aparecer una sola vez, solo en la tarjeta needs_review: '.substr_count($html,'Volver a procesar'));
+    $assert(str_contains($html,'Esta factura volverá a la bandeja de entrada y Salvest intentará procesarla de nuevo en la próxima ejecución. Se conservará el historial técnico del intento anterior. ¿Continuar?'),'con un único adjunto pendiente debe usarse el texto de confirmación singular');
+});
+$test('/Revisar: con varios adjuntos pendientes en el mismo correo, la confirmación usa el texto plural',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','needs_review',date('Y-m-d H:i:s'),'adjunto-a.pdf']);
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','error',date('Y-m-d H:i:s'),'adjunto-b.pdf']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'Este correo contiene varios adjuntos. Los pendientes se volverán a procesar; los ya clasificados se conservarán y no volverán a clasificarse. Se conservará el historial técnico de los intentos anteriores. ¿Continuar?'),'con varios adjuntos pendientes debe usarse el texto de confirmación plural');
+});
+$test('/Revisar: reencolar sin confirmar (confirm_requeue vacío) se rechaza server-side, pese al CSRF válido',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,original_filename) VALUES (?,?,?)',['needs_review',date('Y-m-d H:i:s'),'x.pdf']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $html=$requestWebApp($webApp,'POST','reviews',['action'=>'requeue','id'=>(string)$id,'csrf'=>$_SESSION['csrf']??'','confirm_requeue'=>'']);
+    $assert(str_contains($html,'no fue confirmada'),'sin confirm_requeue=REQUEUE debe rechazarse aunque el CSRF sea correcto: '.$html);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$id]);
+    $assert($row['status']==='needs_review','no debe cambiar nada si la confirmación no llegó');
+});
+
+// ---- InboxRequeue: "Volver a procesar" ----
+$test('InboxRequeue: needs_review pasa a requeued, con requeued_at y conservando el historial técnico',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $requeue=new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub);
+    $result=$requeue->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true,'debe completarse con éxito: '.$result['message']);
+    $row=$db->one('SELECT * FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='requeued','el estado debe pasar a requeued: '.$row['status']);
+    $assert($row['requeued_at']!==null,'requeued_at debe quedar registrado');
+    $assert($row['debug_trace_json']!==null && str_contains((string)$row['debug_trace_json'],'adjunto-0.pdf'),'el historial técnico del intento anterior debe conservarse intacto');
+    $assert($stub->moved===['uid'=>'777','destination'=>'INBOX'],'debe moverse al input_folder del buzón: '.json_encode($stub->moved));
+    $message=$db->one('SELECT status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message['status']==='requeued','processed_messages también debe quedar marcado requeued, por coherencia histórica');
+});
+$test('InboxRequeue: un hermano classified permanece completamente intacto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review','classified']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $requeue=new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub);
+    $requeue->requeue($fixture['attachmentIds'][0]);
+    $sibling=$db->one('SELECT * FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][1]]);
+    $assert($sibling['status']==='classified','un hermano ya clasificado nunca debe tocarse: '.$sibling['status']);
+    $assert($sibling['requeued_at']===null,'un hermano classified no debe llevar requeued_at');
+});
+$test('InboxRequeue: un hermano duplicate permanece completamente intacto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review','duplicate']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $requeue=new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub);
+    $requeue->requeue($fixture['attachmentIds'][0]);
+    $sibling=$db->one('SELECT * FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][1]]);
+    $assert($sibling['status']==='duplicate','un hermano duplicate nunca debe tocarse: '.$sibling['status']);
+    $assert($sibling['requeued_at']===null);
+});
+$test('InboxRequeue: una fila requeued deja de participar en el dedupe global por SHA-256',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient(['777']);
+    (new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    // Exactamente la misma consulta que Worker::processAttachment() usa para el dedupe global.
+    $prior=$db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate') ORDER BY id LIMIT 1",['sha-0']);
+    $assert($prior===null,'una fila requeued no debe encontrarse nunca por el dedupe global: '.json_encode($prior));
+});
+$test('InboxRequeue: un fallo IMAP provoca rollback completo (nada cambia)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient([],new RuntimeException('conexión IMAP caída'));
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false,'debe fallar de forma controlada');
+    $row=$db->one('SELECT * FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review','tras el rollback el estado debe seguir siendo el original: '.$row['status']);
+    $assert($row['requeued_at']===null,'tras el rollback no debe quedar requeued_at');
+    $message=$db->one('SELECT status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message['status']==='needs_review','processed_messages también debe quedar exactamente como estaba');
+});
+$test('InboxRequeue: 0 resultados por Message-ID aborta sin cambios',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient([]); // ninguna coincidencia
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false,'0 coincidencias debe abortar: '.$result['message']);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review','no debe cambiar nada si no se pudo localizar el correo');
+});
+$test('InboxRequeue: más de 1 resultado por Message-ID aborta sin cambios (nunca adivinar)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient(['777','778']); // ambiguo
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false,'varias coincidencias debe abortar en vez de adivinar: '.$result['message']);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review');
+});
+$test('InboxRequeue: si el movimiento IMAP original falló, no intenta mover nada (ya está en INBOX)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review'],'failed');
+    $neverCalled=static function()use($assert){$assert(false,'no debe construirse ningún ImapClient cuando el movimiento original falló');};
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,$neverCalled))->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true,'debe completarse igualmente, solo con el cambio de estado: '.$result['message']);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='requeued');
+});
+$test('InboxRequeue: un correo con varios adjuntos pendientes reencola todos los no exitosos, ninguno de más',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review','error','classified']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true);
+    $needsReview=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $error=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][1]]);
+    $classified=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][2]]);
+    $assert($needsReview['status']==='requeued' && $error['status']==='requeued','needs_review y error deben reencolarse juntos, por ser el mismo correo');
+    $assert($classified['status']==='classified','el hermano classified nunca se toca, aunque haya otros pendientes en el mismo correo');
+});
+$test('InboxRequeue: un intento posterior con un UID nuevo crea una fila nueva, sin chocar con la histórica',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient(['777']);
+    (new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    // Simula lo que hace Worker::processAttachment() en la siguiente ejecución: el correo
+    // reencolado ha vuelto a INBOX con un UID de IMAP nuevo (otro message_uid), y esta vez
+    // se clasifica bien. No debe chocar con la fila histórica (mismo sha256, distinto uid).
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,status,processed_at) VALUES (?,?,?,?,?,?,?,?,?)',
+        [$fixture['mailboxId'],'1001','600','adjunto-0.pdf','sha-0','application/pdf',1000,'classified',date('Y-m-d H:i:s')]);
+    $newRow=$db->one("SELECT * FROM processed_attachments WHERE mailbox_id=? AND message_uid='600'",[$fixture['mailboxId']]);
+    $assert($newRow!==null && $newRow['status']==='classified','el segundo intento debe insertarse como fila nueva sin chocar con la clave única');
+    $oldRow=$db->one('SELECT status,debug_trace_json FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($oldRow['status']==='requeued' && $oldRow['debug_trace_json']!==null,'la fila histórica del primer intento sigue existiendo, requeued, con su traza técnica intacta');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

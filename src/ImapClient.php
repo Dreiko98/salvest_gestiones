@@ -87,6 +87,18 @@ final class ImapClient
 
     public function markSeen(string $uid): void { $this->command("UID STORE $uid +FLAGS (\\Seen)"); }
 
+    /** Locates a message by its Message-ID header — stable across IMAP moves, unlike UID (a
+     * message gets a brand new UID every time it's copied/moved into a different folder). Used
+     * by InboxRequeue to find where a message actually is now, since the UID recorded at
+     * first-processing time is only ever valid in the folder it was in back then. Searches
+     * whichever folder this client is currently connected to. @return list<string> */
+    public function findUidsByMessageId(string $messageId): array
+    {
+        $response = $this->command('UID SEARCH HEADER Message-ID '.$this->quote($messageId));
+        if (!preg_match('/\* SEARCH([^\r\n]*)/i', $response, $match)) return [];
+        return array_values(array_filter(preg_split('/\s+/', trim($match[1])) ?: []));
+    }
+
     public function move(string $uid, string $destination): void
     {
         $wire = $this->ensureFolder($destination);

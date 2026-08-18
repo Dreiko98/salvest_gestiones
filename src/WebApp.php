@@ -316,6 +316,12 @@ final class WebApp
 
     private function reviews(): void
     {
+        if($_SERVER['REQUEST_METHOD']==='POST'&&($_POST['action']??'')==='requeue'){
+            if(!hash_equals('REQUEUE',(string)($_POST['confirm_requeue']??'')))throw new \RuntimeException('La acción no fue confirmada');
+            $result=(new InboxRequeue($this->db,$this->crypto,$this->config))->requeue((int)($_POST['id']??0));
+            if($result['ok'])$this->audit('requeue','attachment',(int)($_POST['id']??0));
+            $this->redirect('/?route=reviews&'.($result['ok']?'requeued=1':'requeue_error='.rawurlencode($result['message'])));
+        }
         if($_SERVER['REQUEST_METHOD']==='POST'){
             $attachment=$this->db->one('SELECT * FROM processed_attachments WHERE id=?',[(int)$_POST['id']]);
             $community=$this->db->one('SELECT * FROM communities WHERE id=? AND active=1',[(int)$_POST['community_id']]);
@@ -331,6 +337,9 @@ final class WebApp
         }
         $rows=$this->db->all("SELECT pa.*,c.official_name FROM processed_attachments pa LEFT JOIN communities c ON c.id=pa.community_id WHERE pa.status IN ('unclassified','needs_review','error') ORDER BY pa.processed_at DESC LIMIT 200");
         $communities=$this->db->all('SELECT id,official_name FROM communities WHERE active=1 ORDER BY official_name');$suppliers=$this->db->all('SELECT id,official_name FROM suppliers WHERE active=1 ORDER BY official_name');$services=$this->db->all('SELECT normalized_name,name FROM service_types WHERE active=1 ORDER BY name');
+        $banner='';
+        if(($_GET['requeued']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Factura devuelta a la bandeja de entrada</strong><small>Se procesará de nuevo en la próxima ejecución del bot.</small></span></section>';
+        elseif(($_GET['requeue_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo volver a procesar</strong><small>'.$this->e((string)$_GET['requeue_error']).'</small></span></section>';
         $cards='';
         foreach($rows as $row){
             // The system already resolved community_id (a real FK, not just OpenAI's text
@@ -347,10 +356,11 @@ final class WebApp
             // Show them as two clearly distinct facts, not one field pretending to be the other.
             $cards.='<article class="card review-card"><div class="review-head"><div><span class="badge warning">Pendiente de revisión</span><h2>'.$this->e($row['original_filename']).'</h2></div>'.($row['output_path']?'<a class="button button-secondary" href="/?route=download&id='.$row['id'].'">Descargar PDF</a>':'').'</div><div class="review-meta"><span>Proveedor resuelto<strong>'.($row['provider']?$this->e($row['provider']):'Pendiente').'</strong></span><span>Texto detectado<strong>'.$this->e($row['raw_supplier_name']?:'Desconocido').'</strong></span><span>Comunidad sugerida<strong>'.$this->e($row['official_name']?:'Sin asignar').'</strong></span><span>Importe<strong class="mono">'.($row['amount']!==null?$this->e($row['amount']).' €':'—').'</strong></span><span>N.º factura<strong class="mono">'.$this->e($row['invoice_number']?:'—').'</strong></span></div><p class="review-reason">'.$this->e($row['error_message']?:'Comprueba los datos antes de archivar la factura.').'</p>'.
                 '<form method="post" action="/?route=reviews" class="grid review-form"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$row['id'].'"><label>Comunidad<select name="community_id" required><option value="">Seleccionar</option>'.$communityOptions.'</select></label><label>Proveedor<select name="supplier_id" required><option value="">Seleccionar</option>'.$supplierOptions.'</select></label><label>Servicio<select name="service_type" required>'.$serviceOptions.'</select></label><label>Fecha<input type="date" name="invoice_date" value="'.$this->e($row['invoice_date']).'" required></label><label>Importe<input class="mono" name="amount" value="'.$this->e($row['amount']).'"></label><label>Número de factura<input class="mono" name="invoice_number" value="'.$this->e($row['invoice_number']).'"></label><button>Confirmar y archivar</button></form>'.
+                ($row['status']==='needs_review'?$this->requeueForm($row):'').
                 $this->technicalDetail($row['debug_trace_json']??null).'</article>';
         }
         $empty='<section class="card empty-state review-empty"><span class="empty-ring"><i></i></span><h2>No hay facturas pendientes de revisar</h2><p>Las nuevas incidencias aparecerán aquí cuando necesiten una decisión.</p></section>';
-        $this->page('Revisar','<div class="page-heading"><div><span class="eyebrow">Control manual</span><h1>Revisar facturas</h1><p>Confirma únicamente los documentos que el sistema no ha podido clasificar.</p></div>'.($rows?'<span class="count-badge warning">'.count($rows).' pendientes</span>':'').'</div>'.($cards!==''?'<div class="review-list">'.$cards.'</div>':$empty));
+        $this->page('Revisar','<div class="page-heading"><div><span class="eyebrow">Control manual</span><h1>Revisar facturas</h1><p>Confirma únicamente los documentos que el sistema no ha podido clasificar.</p></div>'.($rows?'<span class="count-badge warning">'.count($rows).' pendientes</span>':'').'</div>'.$banner.($cards!==''?'<div class="review-list">'.$cards.'</div>':$empty));
     }
 
     private function storage(): void
@@ -391,6 +401,22 @@ final class WebApp
         echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="app-page">'.$mobile.'<div class="app-shell">'.$sidebar.'<main class="main-content">'.$body.'</main></div></body></html>';
     }
     private function e(mixed $value): string{return htmlspecialchars((string)$value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');}
+
+    /** "Volver a procesar": only ever rendered for status==='needs_review' (checked by the
+     * caller) — InboxRequeue revalidates that server-side regardless. Looks at this attachment's
+     * siblings (same mailbox/uidvalidity/message_uid, i.e. the same email) purely to pick the
+     * right confirmation wording: how many of them are still pending vs already classified, so
+     * the person confirming knows exactly what's about to happen before they click. @param array<string,mixed> $row */
+    private function requeueForm(array $row): string
+    {
+        $siblings=$this->db->all('SELECT status FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
+            [$row['mailbox_id'],$row['uidvalidity'],$row['message_uid']]);
+        $pending=count(array_filter($siblings,static fn(array $s):bool=>!in_array($s['status'],['classified','duplicate'],true)));
+        $confirm=$pending>1
+            ?'Este correo contiene varios adjuntos. Los pendientes se volverán a procesar; los ya clasificados se conservarán y no volverán a clasificarse. Se conservará el historial técnico de los intentos anteriores. ¿Continuar?'
+            :'Esta factura volverá a la bandeja de entrada y Salvest intentará procesarla de nuevo en la próxima ejecución. Se conservará el historial técnico del intento anterior. ¿Continuar?';
+        return '<form method="post" action="/?route=reviews" class="inline requeue-form" data-confirm="'.$this->e($confirm).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="requeue"><input type="hidden" name="confirm_requeue" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="button-secondary">Volver a procesar</button></form>';
+    }
 
     /** Renders processed_attachments.debug_trace_json (a chronological array of {timestamp,step,data},
      * see ReviewTrace) as a closed-by-default <details> block under a review card: one human-readable

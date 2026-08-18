@@ -17,6 +17,7 @@ final class Schema
         self::column($database,'processed_attachments','drive_path','VARCHAR(1000) NULL AFTER drive_file_id');
         self::column($database,'processed_attachments','drive_status','VARCHAR(50) NULL AFTER drive_path');
         self::column($database,'processed_attachments','debug_trace_json','JSON NULL AFTER decision_json');
+        self::column($database,'processed_attachments','requeued_at','DATETIME NULL AFTER debug_trace_json');
         self::column($database,'processing_runs','triggered_by_user_id','INT UNSIGNED NULL AFTER trigger_type');
         self::column($database,'processing_runs','needs_review_count','INT UNSIGNED NOT NULL DEFAULT 0 AFTER unclassified_count');
         $index=$database->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='communities' AND index_name='uq_communities_external_code'");

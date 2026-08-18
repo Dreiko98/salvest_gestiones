@@ -4,6 +4,12 @@ document.addEventListener('submit',event=>{
   if(!window.confirm(form.dataset.confirm||'¿Eliminar permanentemente este elemento?')){event.preventDefault();return;}
   form.elements.confirm_delete.value='DELETE';
 });
+document.addEventListener('submit',event=>{
+  const form=event.target.closest('.requeue-form');
+  if(!form)return;
+  if(!window.confirm(form.dataset.confirm||'¿Volver a procesar esta factura?')){event.preventDefault();return;}
+  form.elements.confirm_requeue.value='REQUEUE';
+});
 
 const menuButton=document.querySelector('.menu-toggle');
 const scrim=document.querySelector('.nav-scrim');

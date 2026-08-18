@@ -40,9 +40,10 @@ $workerSchema=<<<SQL
 CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,process_existing_on_activate INTEGER DEFAULT 0,baseline_uidvalidity TEXT,baseline_uid INTEGER,baseline_captured_at TEXT,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
 CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
 CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,old_values_json TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
-CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT,processed_at TEXT);
-CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,active INTEGER DEFAULT 1);
-CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,active INTEGER DEFAULT 1);
+CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,service_type TEXT,amount TEXT,invoice_number TEXT,invoice_date TEXT,original_filename TEXT,output_path TEXT,error_message TEXT);
+CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
+CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
+CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
 SQL;
 /** @param 'always-free'|'always-busy'|'free-then-busy' $lockBehavior */
 $sqliteDbWithLock=static function(string $lockBehavior='always-free')use($workerSchema):Salvest\Database{
@@ -606,6 +607,109 @@ $test('proveedor reconocido pero no asociado a la comunidad: va a revisión, no 
     $assert($route['status']==='needs_review','un proveedor real pero no asociado nunca debe clasificarse automáticamente: '.json_encode($route));
     $assert($route['supplier']===null,'no debe forzarse un proveedor no asociado a la comunidad resuelta');
     $assert($route['reason']==='Proveedor reconocido pero no asociado a esta comunidad.','debe quedar el motivo exacto para el panel de revisión');
+});
+
+/** Shared fixture: a community plus one supplier linked to it, no CIF anywhere unless given. */
+$makeCommunityWithSupplier=static function(Salvest\Database $db,string $communityCode,string $communityName,string $supplierOfficialName,string $serviceTypeName,?string $supplierCif=null,?string $communityCif=null):array{
+    $communityCif??=$communityCode.'-CIF';
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        [$communityCode,$communityName,Salvest\Text::normalize($communityName),$communityCif,'Calle '.$communityName,'46000','Valencia',$communityCode.' - '.$communityName]);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $service=$db->one('SELECT id FROM service_types WHERE name=?',[$serviceTypeName]);
+    if(!$service){$db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',[$serviceTypeName,Salvest\Text::normalize($serviceTypeName)]);$serviceTypeId=(int)$db->pdo()->lastInsertId();}
+    else $serviceTypeId=(int)$service['id'];
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
+        [$supplierOfficialName,Salvest\Text::normalize($supplierOfficialName),$supplierCif,$serviceTypeId]);
+    $supplierId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,?)',[$communityId,$supplierId,$serviceTypeName,null]);
+    return['communityId'=>$communityId,'supplierId'=>$supplierId,'communityCif'=>$communityCif];
+};
+
+$test('resolución contextual: IBERDROLA (sin CIF) reconoce "IBERDROLA CLIENTES, S.A.U." por contención de nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'23','PK ILLES BALEARS 23','IBERDROLA','ELECTRICIDAD');
+    $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $assert($route['status']==='classified','el caso real (sin CIF de proveedor en el maestro) debe clasificar solo: '.json_encode($route));
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'],'debe resolver al proveedor IBERDROLA');
+    $assert($route['evidence']['supplier']['field']==='proveedor'&&$route['evidence']['supplier']['type']==='name_containment','debe quedar constancia de que fue por contención de nombre, no CIF');
+    $assert($route['service']==='ELECTRICIDAD','debe corregir el "agua" de OpenAI usando el tipo configurado del proveedor: '.$route['service']);
+    $assert($route['evidence']['service']['field']==='supplier_main_service_type');
+});
+$test('resolución contextual: IBERDROLA vs "IBERDROLA CLIENTES" sin forma societaria también contiene el nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'24','CP VEINTICUATRO','IBERDROLA','ELECTRICIDAD');
+    $invoice=['proveedor'=>'IBERDROLA CLIENTES','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
+});
+$test('resolución contextual: formas societarias distintas (maestro S.L., factura S.A.) igualan por nombre comercial',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'25','CP VEINTICINCO','AGUAS DEL LEVANTE, S.L.','AGUA');
+    $invoice=['proveedor'=>'AGUAS DEL LEVANTE, S.A.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@aguaslevante.es');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],'S.L. en el maestro y S.A. en la factura deben considerarse el mismo nombre comercial: '.json_encode($route));
+    $assert($route['evidence']['supplier']['type']==='exact_name','tras quitar la forma societaria ambos nombres deben quedar idénticos, no solo contenidos');
+});
+$test('resolución contextual: mayúsculas, tildes y puntuación no impiden la coincidencia exacta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'26','CP VEINTISEIS','Jardinería Compañía, S.L.','JARDINERIA');
+    $invoice=['proveedor'=>'JARDINERIA COMPAÑIA SL','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@jardineria.es');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
+});
+$test('resolución contextual: alias de proveedor dentro de la comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'27','CP VEINTISIETE','Descalcificadores Este S.L.','DESCALCIFICADOR');
+    $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
+        [$fixture['supplierId'],'name','AQUATREAT',Salvest\Text::normalize('AQUATREAT')]);
+    $invoice=['proveedor'=>'AQUATREAT','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@aquatreat.example');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
+    $assert($route['evidence']['supplier']['field']==='alias','debe quedar constancia de que fue por alias: '.json_encode($route['evidence']['supplier']));
+});
+$test('resolución contextual: dos proveedores igualmente plausibles van a revisión, no se adivina',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['28','CP VEINTIOCHO',Salvest\Text::normalize('CP VEINTIOCHO'),'Z28000000','Calle 28','46028','Valencia','28 - CP VEINTIOCHO']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['MANTENIMIENTO',Salvest\Text::normalize('MANTENIMIENTO')]);
+    $serviceTypeId=(int)$db->pdo()->lastInsertId();
+    foreach(['PROVEEDOR ALFA','PROVEEDOR BETA'] as $name){
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,NULL,?,1)',[$name,Salvest\Text::normalize($name),$serviceTypeId]);
+        $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'MANTENIMIENTO']);
+    }
+    $invoice=['proveedor'=>'PROVEEDOR ALFA PROVEEDOR BETA','proveedor_cif'=>null,'comunidad_cif'=>'Z28000000','tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@ambiguo.example');
+    $assert($route['status']==='needs_review','ante dos candidatos igual de plausibles no debe adivinar: '.json_encode($route));
+    $assert($route['supplier']===null);
+    $assert(str_contains((string)$route['reason'],'Varios proveedores'),'el motivo debe explicar que hay varios candidatos: '.$route['reason']);
+});
+$test('resolución contextual: si hay CIF de proveedor disponible, sigue ganando a un nombre que no coincide',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'29','CP VEINTINUEVE','IBERDROLA','ELECTRICIDAD','A95758389');
+    // El nombre extraído no se parece en nada al maestro, pero el CIF sí coincide exactamente.
+    $invoice=['proveedor'=>'Suministradora Eléctrica Desconocida SL','proveedor_cif'=>'A95758389','comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@otra.example');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],'el CIF debe ganar aunque el nombre extraído no se parezca al maestro: '.json_encode($route));
+    $assert($route['evidence']['supplier']['field']==='supplier_cif' && $route['evidence']['supplier']['type']==='exact');
+    $assert($route['service']==='ELECTRICIDAD');
+});
+$test('panel Revisar: el <select> de comunidad refleja el community_id ya resuelto, no solo el texto sugerido',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO communities(official_name,active) VALUES (?,1)',['PK ILLES BALEARS 23']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['ELECTRICIDAD',Salvest\Text::normalize('ELECTRICIDAD')]);
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,community_id,provider,service_type,original_filename) VALUES (?,?,?,?,?,?)',
+        ['needs_review',date('Y-m-d H:i:s'),$communityId,'IBERDROLA CLIENTES, S.A.U.','electricidad','factura.pdf']);
+    $_SERVER['REQUEST_METHOD']='GET';
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $method=new ReflectionMethod(Salvest\WebApp::class,'reviews');$method->setAccessible(true);
+    ob_start();$method->invoke($webApp);$html=ob_get_clean();restore_error_handler();
+    $assert(str_contains($html,'Comunidad sugerida<strong>PK ILLES BALEARS 23</strong>'),'el texto de sugerencia debe seguir mostrándose');
+    $assert((bool)preg_match('/<option value="'.$communityId.'" selected>PK ILLES BALEARS 23<\/option>/',$html),
+        'el <select> de comunidad debe venir preseleccionado con el community_id ya resuelto, no quedarse en "Seleccionar": '.substr($html,(int)strpos($html,'name="community_id"'),300));
+    $assert((bool)preg_match('/<option value="electricidad" selected>ELECTRICIDAD<\/option>/',$html),'el <select> de servicio también debe venir preseleccionado');
 });
 
 $failed=0;

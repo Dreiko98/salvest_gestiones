@@ -112,26 +112,81 @@ final class Classifier
         return ['supplier'=>null,'evidence'=>null];
     }
 
-    /** Is $supplierId linked to $communityId, and under which category/contract reference? */
-    public function communitySupplierRelation(int $communityId, int $supplierId): ?array
+    /**
+     * Community-scoped supplier resolution — the primary path whenever a community is
+     * already known. Most suppliers have no CIF on file (it is an optional, excellent
+     * signal when present, never a requirement), so the chain has to work by name alone:
+     * exact normalized name -> exact alias -> unambiguous commercial-name containment
+     * ("IBERDROLA" found as a whole word inside "IBERDROLA CLIENTES S.A.U.") -> unambiguous
+     * whole-word overlap -> the existing 92% fuzzy match, still restricted to this
+     * community's suppliers, never loosened globally. Any tier that matches more than one
+     * candidate stops immediately with ambiguous=true instead of guessing.
+     * @param array<string,mixed> $invoice @return array{supplier:?array,evidence:?array,ambiguous:bool}
+     */
+    public function resolveSupplierInCommunity(int $communityId, array $invoice, string $sender): array
     {
-        return $this->db->one('SELECT category,contract_reference FROM community_suppliers WHERE community_id=? AND supplier_id=?', [$communityId, $supplierId]);
+        $rows = $this->db->all('SELECT cs.category,cs.contract_reference,s.*,st.name service_type_name FROM community_suppliers cs
+            JOIN suppliers s ON s.id=cs.supplier_id LEFT JOIN service_types st ON st.id=s.main_service_type_id WHERE cs.community_id=? AND s.active=1', [$communityId]);
+        $none = ['supplier'=>null,'evidence'=>null,'ambiguous'=>false];
+        if (!$rows) return $none;
+
+        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? ''));
+        if ($cif !== '') {
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => (string)($r['cif'] ?? '') !== '' && Text::normalize((string)$r['cif']) === $cif);
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'supplier_cif','type'=>'exact'],'ambiguous'=>false];
+        }
+
+        $providerName = Text::normalizeCompanyName((string)($invoice['proveedor'] ?? ''));
+        if ($providerName !== '') {
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::normalizeCompanyName((string)$r['official_name']) === $providerName);
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'exact_name'],'ambiguous'=>false];
+        }
+
+        $domain = Text::normalize(substr(strrchr($sender, '@') ?: '', 1));
+        $candidateValues = array_filter([$providerName, $cif, $domain], static fn(string $v): bool => $v !== '');
+        if ($candidateValues) {
+            $supplierIds = array_map(static fn(array $r): int => (int)$r['id'], $rows);
+            $placeholders = implode(',', array_fill(0, count($supplierIds), '?'));
+            $aliases = $this->db->all("SELECT * FROM supplier_aliases WHERE active=1 AND supplier_id IN ($placeholders)", $supplierIds);
+            $matchedIds = [];
+            foreach ($aliases as $alias) {
+                if (in_array((string)$alias['normalized_value'], $candidateValues, true)) $matchedIds[(int)$alias['supplier_id']] = true;
+            }
+            if (count($matchedIds) > 1) return ['supplier'=>null,'evidence'=>null,'ambiguous'=>true];
+            if (count($matchedIds) === 1) {
+                $id = array_key_first($matchedIds);
+                foreach ($rows as $row) if ((int)$row['id'] === $id) return ['supplier'=>$row,'evidence'=>['field'=>'alias','type'=>'exact'],'ambiguous'=>false];
+            }
+        }
+
+        if ($providerName !== '') {
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::containsWholeWords($providerName, Text::normalizeCompanyName((string)$r['official_name'])));
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'name_containment'],'ambiguous'=>false];
+
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::containsAllWords($providerName, Text::normalizeCompanyName((string)$r['official_name'])));
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'token_match'],'ambiguous'=>false];
+        }
+
+        $best = null; $bestScore = 0.0; $tied = 0;
+        foreach ($rows as $row) {
+            $name = (string)$row['normalized_name'];
+            $score = max($providerName !== '' ? Text::similarity($providerName, $name) : 0.0, $domain !== '' ? Text::similarity($domain, $name) : 0.0);
+            if ($score > $bestScore) { $bestScore = $score; $best = $row; $tied = 1; }
+            elseif ($score === $bestScore && $score > 0.0) { $tied++; }
+        }
+        if ($bestScore >= $this->threshold) {
+            return $tied > 1 ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$best,'evidence'=>['field'=>'proveedor','type'=>'fuzzy'],'ambiguous'=>false];
+        }
+        return $none;
     }
 
-    /** Fallback used only when resolveSupplier() found nothing globally: fuzzy-match the
-     * community's own configured suppliers by name/sender. Kept for the same cases this
-     * already covered before CIF-first resolution existed.
-     * @param array<string,mixed> $invoice @return array<string,mixed>|null */
-    public function resolveCommunitySupplier(int $communityId,array $invoice,string $sender):?array
+    /** @param list<array<string,mixed>> $rows @param callable(array<string,mixed>):bool $predicate
+     * @return array<string,mixed>|false|null the matching row, false if >1 matched (ambiguous), or null if none matched */
+    private static function uniqueMatch(array $rows, callable $predicate): array|false|null
     {
-        $rows=$this->db->all('SELECT cs.category,cs.contract_reference,s.*,st.name service_type_name FROM community_suppliers cs
-            JOIN suppliers s ON s.id=cs.supplier_id LEFT JOIN service_types st ON st.id=s.main_service_type_id WHERE cs.community_id=? AND s.active=1',[$communityId]);
-        $provider=Text::normalize((string)($invoice['proveedor']??''));$sender=Text::normalize($sender);$best=null;$score=0.0;
-        foreach($rows as$row){
-            $name=(string)$row['normalized_name'];$candidate=max($provider!==''?Text::similarity($provider,$name):0.0,$sender!==''?Text::similarity($sender,$name):0.0);
-            if($candidate>$score){$score=$candidate;$best=$row;}
-        }
-        return$score>=92.0?$best:null;
+        $matches = array_values(array_filter($rows, $predicate));
+        if (count($matches) > 1) return false;
+        return $matches[0] ?? null;
     }
 
     /**

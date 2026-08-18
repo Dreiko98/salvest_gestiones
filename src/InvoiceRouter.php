@@ -6,9 +6,10 @@ namespace Salvest;
 /**
  * Orchestrates Classifier's individual resolutions into one routing decision. OpenAI's
  * extraction is the input; every field that MySQL can resolve deterministically (community
- * by holder CIF/identifier, supplier by CIF, service by the supplier's configured type)
- * overrides whatever OpenAI proposed. A supplier recognized globally but not linked to the
- * resolved community is never silently forced through — it goes to review instead.
+ * by holder CIF/identifier, supplier from that community's own master data, service by the
+ * supplier's configured type) overrides whatever OpenAI proposed. Once a community is known,
+ * supplier resolution happens exclusively among that community's own suppliers — CIF is an
+ * excellent signal when present, never a requirement, since most suppliers have none on file.
  */
 final class InvoiceRouter
 {
@@ -21,25 +22,24 @@ final class InvoiceRouter
         $decision=$this->classifier->classify($invoice,$context);
         $community=$decision['community'];
 
-        $resolved=$this->classifier->resolveSupplier($invoice,$sender);
-        $supplier=$resolved['supplier'];$supplierEvidence=$resolved['evidence'];
-        $relation=null;$reason=null;
+        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;
 
-        if($community&&$supplier){
-            $relation=$this->classifier->communitySupplierRelation((int)$community['id'],(int)$supplier['id']);
-            if(!$relation){
-                // A real, identifiable supplier — just not one this community has on file.
-                // Forcing it through would risk archiving under the wrong community; a human
-                // decides instead.
-                $reason='Proveedor reconocido pero no asociado a esta comunidad.';
-                $supplier=null;
+        if($community){
+            $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender);
+            $supplier=$resolved['supplier'];$supplierEvidence=$resolved['evidence'];
+            if($supplier){
+                $relation=['category'=>$supplier['category'],'contract_reference'=>$supplier['contract_reference']];
+            }elseif($resolved['ambiguous']){
+                $reason='Varios proveedores de esta comunidad coinciden con el nombre extraído; revisa manualmente.';
+            }else{
+                // Not found among this community's own suppliers. Check globally only to give
+                // a more specific reason — never to force a supplier this community doesn't have.
+                $global=$this->classifier->resolveSupplier($invoice,$sender);
+                if($global['supplier'])$reason='Proveedor reconocido pero no asociado a esta comunidad.';
             }
-        }elseif($community&&!$supplier){
-            $fallback=$this->classifier->resolveCommunitySupplier((int)$community['id'],$invoice,$sender);
-            if($fallback){
-                $supplier=$fallback;$relation=['category'=>$fallback['category'],'contract_reference'=>$fallback['contract_reference']];
-                $supplierEvidence=['field'=>'proveedor','type'=>'fuzzy_within_community'];
-            }
+        }else{
+            $global=$this->classifier->resolveSupplier($invoice,$sender);
+            $supplier=$global['supplier'];$supplierEvidence=$global['evidence'];
         }
 
         $openAiService=Text::normalize((string)($invoice['tipo_servicio']??''));

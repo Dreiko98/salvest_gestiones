@@ -13,7 +13,7 @@ final class Worker
 
     /** @param array<string,mixed> $config */
     public function __construct(private Database $db, private Crypto $crypto,
-        private OpenAIExtractor $extractor, private array $config, private DebugTracer $tracer = new DebugTracer(false))
+        private OpenAIExtractor $extractor, private array $config)
     {
         $this->parser = new MimeParser();
         $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
@@ -26,12 +26,10 @@ final class Worker
     }
 
     /** Builds a Worker exactly the way every entry point (cron, CLI, manual button) needs it,
-     * so none of them has to repeat the Crypto/OpenAIExtractor wiring by hand. $tracer defaults
-     * to a disabled DebugTracer — every existing caller (cron.php, WebApp's "Ejecutar bot ahora")
-     * keeps behaving exactly as before; only bin/worker.php --debug ever passes an enabled one. */
-    public static function create(Database $db, array $config, ?DebugTracer $tracer = null): self
+     * so none of them has to repeat the Crypto/OpenAIExtractor wiring by hand. */
+    public static function create(Database $db, array $config): self
     {
-        return new self($db, new Crypto((string)$config['app']['encryption_key']), new OpenAIExtractor($config['openai']), $config, $tracer ?? new DebugTracer(false));
+        return new self($db, new Crypto((string)$config['app']['encryption_key']), new OpenAIExtractor($config['openai']), $config);
     }
 
     /**
@@ -43,7 +41,6 @@ final class Worker
     {
         $locked = $this->db->one("SELECT GET_LOCK('salvest-invoice-worker',0) acquired");
         if (!(int)($locked['acquired'] ?? 0)) throw new WorkerBusyException('Ya hay otro worker ejecutándose');
-        $this->tracer->line('RUN','Worker iniciado');
         $runUuid = $this->uuid();
         $mailboxes = $mailboxEmail
             ? $this->db->all('SELECT * FROM mailboxes WHERE active=1 AND email=? ORDER BY id',[$mailboxEmail])
@@ -66,12 +63,9 @@ final class Worker
             }
             $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,needs_review_count=?,duplicate_count=?,error_count=?,openai_input_tokens=?,openai_output_tokens=? WHERE id=?",
                 [$counts['errors']?'partial':'completed',$counts['messages'],$counts['documents'],$counts['classified'],$counts['unclassified'],$counts['needs_review'],$counts['duplicate'],$counts['errors'],$this->extractor->inputTokens,$this->extractor->outputTokens,$runId]);
-            $this->tracer->fields('RUN',$counts);
-            $this->tracer->line('RUN','Worker finalizado');
             return $counts;
         } catch (\Throwable $error) {
             $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status='error',error_message=? WHERE id=?", [mb_substr($error->getMessage(),0,2000),$runId]);
-            $this->tracer->line('RUN','Worker finalizado con error: '.$error->getMessage());
             throw $error;
         } finally {
             $this->db->one("SELECT RELEASE_LOCK('salvest-invoice-worker') released");
@@ -81,7 +75,6 @@ final class Worker
     /** @param array<string,mixed> $mailbox @param array<string,int> $counts */
     private function processMailbox(array $mailbox, bool $dryRun, ?int $limit, array &$counts): void
     {
-        $this->tracer->line('MAILBOX',(string)$mailbox['email']);
         $client = new ImapClient((string)$mailbox['imap_host'],(int)$mailbox['imap_port'],(string)$mailbox['username'],
             $this->crypto->decrypt((string)$mailbox['encrypted_password']),(string)$mailbox['input_folder'],
             (int)$this->config['imap']['timeout_seconds']);
@@ -93,13 +86,8 @@ final class Worker
                 if ($limit !== null && $examined >= $limit) break;
                 $existing = $this->db->one('SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
                     [$mailbox['id'],$client->uidValidity(),$uid]);
-                $this->tracer->fields('MESSAGE',['uidvalidity'=>$client->uidValidity(),'uid'=>$uid,'ya_procesado'=>$existing['status']??false]);
-                if ($existing && in_array($existing['status'],['completed','ignored','needs_review','error'],true)) {
-                    $this->tracer->line('MESSAGE','omitido (ya procesado, status='.$existing['status'].')');
-                    continue;
-                }
+                if ($existing && in_array($existing['status'],['completed','ignored','needs_review','error'],true)) continue;
                 $message = $this->parser->parse($client->fetch($uid)); $examined++; $counts['messages']++;
-                $this->tracer->fields('MESSAGE',['remitente'=>$message['sender'],'asunto'=>$message['subject'],'fecha'=>$message['date'],'adjuntos'=>count($message['attachments'])]);
                 if (!$message['attachments']) {
                     if (!$dryRun) $this->saveMessage($mailbox,$client,$uid,$message,'ignored',0,null);
                     continue;
@@ -110,10 +98,8 @@ final class Worker
                     foreach ($message['attachments'] as $attachment) {
                         DocumentValidator::validate($attachment,(int)$this->config['processing']['max_attachment_bytes']);
                         $counts['documents']++;
-                        $this->tracer->fields('ATTACHMENT',['filename'=>$attachment['original_filename'],'mime'=>$attachment['mime_type'],'size_bytes'=>$attachment['size'],'sha256'=>$attachment['sha256']]);
                         try { $outcomes[] = $this->processAttachment($mailbox,$client,$uid,$message,$attachment,$counts); }
                         catch (\Throwable $attachmentError) {
-                            $this->tracer->line('ATTACHMENT','error: '.$attachmentError->getMessage());
                             $this->insertAttachment($mailbox,$client,$uid,$attachment,'error',['error_message'=>$attachmentError->getMessage()]);
                             throw $attachmentError;
                         }
@@ -125,10 +111,8 @@ final class Worker
                         $destination = 'Facturas/'.($community['imap_folder_name'] ?: Text::slug((string)$community['official_name']));
                         try {
                             $client->markSeen($uid); $client->move($uid,$destination);
-                            $this->tracer->fields('EFFECTS',['imap_destino'=>$destination,'imap_resultado'=>'moved']);
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'moved');
                         } catch (\Throwable $imapError) {
-                            $this->tracer->fields('EFFECTS',['imap_destino'=>$destination,'imap_resultado'=>'failed','imap_error'=>$imapError->getMessage()]);
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'failed',$imapError->getMessage());
                         }
                     } else {
@@ -136,10 +120,8 @@ final class Worker
                         $destination = $allUnknown ? 'Facturas/Sin clasificar' : 'Facturas/Pendientes de revisión';
                         try {
                             $client->move($uid,$destination);
-                            $this->tracer->fields('EFFECTS',['imap_destino'=>$destination,'imap_resultado'=>'moved']);
                             $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'moved');
                         } catch (\Throwable $imapError) {
-                            $this->tracer->fields('EFFECTS',['imap_destino'=>$destination,'imap_resultado'=>'failed','imap_error'=>$imapError->getMessage()]);
                             $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'failed',$imapError->getMessage());
                         }
                     }
@@ -147,7 +129,6 @@ final class Worker
                     try { $client->move($uid,'Facturas/Errores'); } catch (\Throwable $moveError) {
                         $error = new \RuntimeException($error->getMessage().'; movimiento IMAP: '.$moveError->getMessage(),0,$error);
                     }
-                    $this->tracer->fields('EFFECTS',['imap_destino'=>'Facturas/Errores','imap_resultado'=>'failed','error'=>$error->getMessage()]);
                     $this->saveMessage($mailbox,$client,$uid,$message,'error',count($message['attachments']),'Facturas/Errores','failed',$error->getMessage());
                     $counts['errors']++;
                 }
@@ -191,12 +172,10 @@ final class Worker
     {
         $prior = $this->db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate') ORDER BY id LIMIT 1",[$attachment['sha256']]);
         if ($prior) {
-            $this->tracer->line('ATTACHMENT','duplicado de attachment_id='.$prior['id'].' (status original='.$prior['status'].')');
             $this->insertAttachment($mailbox,$client,$uid,$attachment,'duplicate',$prior);
             $counts['duplicate']++;
             return ['status'=>'duplicate','community_id'=>$prior['community_id'] ? (int)$prior['community_id'] : null];
         }
-        $this->tracer->line('ATTACHMENT','no es duplicado');
         $incoming = rtrim((string)$this->config['processing']['incoming_root'],'/').'/'.Text::slug((string)$mailbox['email']);
         if (!is_dir($incoming) && !mkdir($incoming,0770,true) && !is_dir($incoming)) throw new \RuntimeException('No se pudo crear incoming');
         $path = $incoming.'/'.$uid.'-'.bin2hex(random_bytes(4)).'-'.$attachment['safe_filename'];
@@ -204,70 +183,17 @@ final class Worker
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'downloaded',[]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'processing',[]);
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
-
-        $this->tracer->line('OPENAI','Enviando PDF');
-        $this->tracer->fields('OPENAI',['model'=>$this->config['openai']['model']??null,'reasoning'=>'low']);
-        $tokensBefore=['in'=>$this->extractor->inputTokens,'out'=>$this->extractor->outputTokens];
-        $started=microtime(true);
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
-        $this->tracer->fields('OPENAI',['latencia_ms'=>(int)round((microtime(true)-$started)*1000),
-            'input_tokens'=>$this->extractor->inputTokens-$tokensBefore['in'],'output_tokens'=>$this->extractor->outputTokens-$tokensBefore['out']]);
-        $this->tracer->json('OPENAI','JSON devuelto',$invoice);
-        $openAiServiceRaw=$invoice['tipo_servicio']??null;
-
-        $this->tracer->fields('COMMUNITY',['codigo_extraido'=>$invoice['codigo_comunidad']??null,'nombre_extraido'=>$invoice['nombre_comunidad']??null,
-            'cif_extraido'=>$invoice['comunidad_cif']??null,'cif_normalizado'=>Text::normalizeIdentifier((string)($invoice['comunidad_cif']??'')),
-            'cups'=>$invoice['cups']??null,'contrato'=>$invoice['numero_contrato']??null,'referencia'=>$invoice['referencia_cliente']??null]);
-        $this->tracer->fields('SUPPLIER',['raw_supplier_name'=>$invoice['proveedor']??null,'supplier_cif'=>$invoice['proveedor_cif']??null,
-            'proveedor_normalizado'=>Text::normalizeCompanyName((string)($invoice['proveedor']??''))]);
-
-        // Debug-only observer for Classifier's tier-by-tier reasoning — never influences the
-        // decision, see Classifier::classify()/resolveSupplierInCommunity() docblocks.
-        $trace=function(string $tier,string $outcome,array $details):void{
-            $tag=str_starts_with($tier,'supplier')?'SUPPLIER':'COMMUNITY';
-            $this->tracer->line($tag,$tier.' -> '.$outcome);
-            if($details)$this->tracer->fields($tag,$details);
-        };
         // Second, restricted look at the *same* PDF — headers/logos/stamps included — only
         // reached when the community is known but no deterministic master-data match found a
         // supplier among that community's own suppliers. Never called otherwise, so it never
         // adds latency/cost to the common case.
-        $restrictedCalled=false;$restrictedChosen=null;
-        $restrictedResolver=function(array $candidates,array $community)use($path,$attachment,$context,&$restrictedCalled,&$restrictedChosen):?int{
-            $restrictedCalled=true;
-            $this->tracer->line('OPENAI2','Segunda llamada activada (sin coincidencia determinista)');
-            $this->tracer->json('OPENAI2','Candidatos enviados',$candidates);
-            $this->tracer->fields('OPENAI2',['model'=>$this->config['openai']['model']??null,'reasoning'=>'medium']);
-            $started=microtime(true);
-            try{
-                $chosen=$this->extractor->resolveSupplierAmongCandidates($path,(string)$attachment['mime_type'],$context,(string)$community['official_name'],$candidates);
-                $restrictedChosen=$chosen;
-                $this->tracer->fields('OPENAI2',['latencia_ms'=>(int)round((microtime(true)-$started)*1000),'supplier_id_devuelto'=>$chosen]);
-                $this->tracer->json('OPENAI2','JSON devuelto',['supplier_id'=>$chosen]);
-                return $chosen;
-            }
-            catch(\Throwable$error){
-                $this->tracer->line('OPENAI2','Error: '.$error->getMessage());
-                error_log('restricted_openai_retry status=failed community_id='.$community['id'].' '.$error->getMessage());return null;
-            }
+        $restrictedResolver=function(array $candidates,array $community)use($path,$attachment,$context):?int{
+            try{return $this->extractor->resolveSupplierAmongCandidates($path,(string)$attachment['mime_type'],$context,(string)$community['official_name'],$candidates);}
+            catch(\Throwable$error){error_log('restricted_openai_retry status=failed community_id='.$community['id'].' '.$error->getMessage());return null;}
         };
-        $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver,$trace);
-        if($restrictedCalled){
-            $validated=($route['evidence']['supplier']['type']??null)==='restricted_openai_retry';
-            $this->tracer->line('OPENAI2',$validated?'Validado -> supplier_id='.$restrictedChosen
-                :($restrictedChosen===null?'El modelo no eligió ningún candidato':'Rechazado: id='.$restrictedChosen.' no se confirmó en la comunidad'));
-        }
+        $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver);
         $decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
-
-        $this->tracer->fields('COMMUNITY',['community_id'=>$decision['community']['id']??null,'nombre_maestro'=>$decision['community']['official_name']??null,
-            'evidencia'=>($decision['evidence']['field']??'').'/'.($decision['evidence']['type']??'')]);
-        $this->tracer->fields('SUPPLIER',['supplier_id_final'=>$supplier['id']??null,
-            'evidencia'=>($route['evidence']['supplier']['field']??'').'/'.($route['evidence']['supplier']['type']??'')]);
-        $this->tracer->line('SUPPLIER',($supplier['official_name']??'(ninguno)').' -> '.($route['evidence']['supplier']['type']??'sin resolver'));
-        $this->tracer->fields('SERVICE',['servicio_openai'=>$openAiServiceRaw,'suppliers_main_service_type'=>$supplier['service_type_name']??null,
-            'community_suppliers_category'=>$supplier['category']??null,'servicio_final'=>$route['service'],
-            'motivo'=>($route['evidence']['service']['field']??'').'/'.($route['evidence']['service']['type']??'')]);
-
         // MySQL corrects OpenAI's suggestion here: $route['service'] already went through
         // Classifier::resolveService() (supplier's configured type > community-supplier
         // relation category > OpenAI's own tipo_servicio guess, only as a last resort). And a
@@ -286,9 +212,6 @@ final class Worker
             'error_message'=>$route['reason'],
             'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
-        $this->tracer->line('DECISION',$status);
-        if($route['reason'])$this->tracer->line('DECISION','reason='.$route['reason']);
-        $this->tracer->fields('EFFECTS',['nombre_final'=>$data['final_filename'],'drive_path'=>$data['drive_path']??null,'drive_status'=>$data['drive_status']??null]);
         $counts[$status === 'needs_review' ? 'needs_review' : ($status === 'classified' ? 'classified' : 'unclassified')]++;
         return ['status'=>$status,'community_id'=>$data['community_id'] ? (int)$data['community_id'] : null];
     }

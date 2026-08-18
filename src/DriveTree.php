@@ -64,8 +64,8 @@ final class DriveTree
     {
         $label = '<span class="file-icon"></span>'.self::name($name);
         $content = $webViewLink !== null && $webViewLink !== ''
-            ? '<a href="'.self::e($webViewLink).'" target="_blank" rel="noopener noreferrer">'.$label.'</a>'
-            : '<span>'.$label.'</span>';
+            ? '<a class="node-link" href="'.self::e($webViewLink).'" target="_blank" rel="noopener noreferrer">'.$label.'</a>'
+            : '<span class="node-link">'.$label.'</span>';
         return '<div class="folder-leaf">'.$content.'</div>';
     }
 

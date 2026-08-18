@@ -129,7 +129,8 @@ $test('explorador Drive: carpetas y archivos en el mismo nivel',static function(
     $assert(str_contains($html,'class="file-icon"'),'el archivo debe tener un icono distinto al de carpeta');
     $leafSection=substr($html,(int)strpos($html,'class="folder-leaf"'));
     $assert(!str_contains(substr($leafSection,0,200),'class="folder-icon"'),'la hoja de archivo no debe reutilizar el icono de carpeta');
-    $assert(str_contains($html,'<a href="https://drive.google.com/file/d/file1/view" target="_blank" rel="noopener noreferrer">'),'el pdf con webViewLink debe abrir en una pestaña nueva');
+    $assert(str_contains($html,'<a class="node-link" href="https://drive.google.com/file/d/file1/view" target="_blank" rel="noopener noreferrer">'),'el pdf con webViewLink debe abrir en una pestaña nueva');
+    $assert(str_contains($html,'<span class="node-link">'),'sin webViewLink el envoltorio debe ser un span, no un enlace');
     $assert(str_contains($html,'sin-enlace.pdf') && !preg_match('/<a[^>]*>[^<]*sin-enlace\.pdf/',$html),'sin webViewLink no debe generar enlace');
 });
 $test('explorador Drive: carpeta que solo contiene PDFs no dice "no hay subcarpetas"',static function()use($assert):void{

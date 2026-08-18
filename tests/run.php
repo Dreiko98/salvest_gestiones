@@ -30,6 +30,7 @@ CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,n
 CREATE TABLE supplier_aliases(id INTEGER PRIMARY KEY AUTOINCREMENT,supplier_id INTEGER,alias_type TEXT,value TEXT,normalized_value TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE supplier_service_types(supplier_id INTEGER,service_type_id INTEGER);
+CREATE TABLE community_suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,community_id INTEGER,supplier_id INTEGER,category TEXT,contract_reference TEXT);
 SQL;
 
 // Same in-memory Database helper, but for the manual "run-worker" route: it also
@@ -293,9 +294,9 @@ $test('ocultar campos: los valores existentes de proveedor viajan ocultos y no s
     $assert(!str_contains($html,'<textarea name="aliases"'),'el campo ya no debe ser editable en el alta/edición cotidiana');
     $assert(!str_contains($html,'Otros nombres o dominios conocidos'),'la etiqueta visible debe haber desaparecido');
     $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'A12345678'],'facturas@otra-cosa.example');
-    $assert($resolved!==null && (int)$resolved['id']===$id,'el CIF ocultado en la UI debe seguir siendo utilizable por el Classifier');
+    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id,'el CIF ocultado en la UI debe seguir siendo utilizable por el Classifier');
     $resolvedByAlias=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'Nombre distinto','proveedor_cif'=>''],'facturas@iberdrola.es');
-    $assert($resolvedByAlias!==null && (int)$resolvedByAlias['id']===$id,'el alias/dominio ocultado en la UI debe seguir siendo utilizable por el Classifier');
+    $assert($resolvedByAlias['supplier']!==null && (int)$resolvedByAlias['supplier']['id']===$id,'el alias/dominio ocultado en la UI debe seguir siendo utilizable por el Classifier');
 });
 $test('Classifier sigue clasificando por identificador de contrato (CUPS)',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
@@ -312,7 +313,7 @@ $test('Classifier sigue clasificando por CIF de comunidad',static function()use(
         ['03','CP TRES',Salvest\Text::normalize('CP TRES'),'B99999999','Calle Tres 3','46003','Valencia','03 - CP TRES']);
     $id=(int)$db->pdo()->lastInsertId();
     $result=(new Salvest\Classifier($db))->classify(['comunidad_cif'=>'B99999999']);
-    $assert($result['community']!==null && (int)$result['community']['id']===$id && $result['evidence']['field']==='cif');
+    $assert($result['community']!==null && (int)$result['community']['id']===$id && $result['evidence']['field']==='holder_cif');
 });
 $test('Classifier sigue clasificando comunidades por dirección alias (fuzzy)',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
@@ -554,6 +555,57 @@ $test('edición: transición 0→1 permite procesar el histórico sin necesitar 
     $assert((int)$row['process_existing_on_activate']===1,'la opción debe quedar activada');
     $result=$applyBaseline($db,$config,$row,$fakeImapClient('500'),['1','2','999']);
     $assert($result===['1','2','999'],'con la opción activada el Worker ya no debe filtrar nada, ni siquiera lo anterior al viejo baseline: '.json_encode($result));
+});
+
+$test('caso Iberdrola: MySQL corrige el "Agua" incorrecto de OpenAI usando CIF titular + CIF proveedor + tipo configurado',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['23','PK ILLES BALEARS 23',Salvest\Text::normalize('PK ILLES BALEARS 23'),'H12645537','Illes Balears 23','07001','Palma','23 - PK ILLES BALEARS 23']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['ELECTRICIDAD',Salvest\Text::normalize('ELECTRICIDAD')]);
+    $serviceTypeId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['AGUA',Salvest\Text::normalize('AGUA')]);
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
+        ['IBERDROLA CLIENTES, S.A.U.',Salvest\Text::normalize('IBERDROLA CLIENTES, S.A.U.'),'A95758389',$serviceTypeId]);
+    $supplierId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,?)',[$communityId,$supplierId,'ELECTRICIDAD','763322520']);
+    // Trampa: un identificador de CUPS mal cargado que apuntaría a otra comunidad si el
+    // CIF titular no tuviera prioridad sobre los identificadores contractuales.
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['99','COMUNIDAD SEÑUELO',Salvest\Text::normalize('COMUNIDAD SEÑUELO'),'X00000000','Otra calle','28001','Madrid','99 - SEÑUELO']);
+    $decoyId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_identifiers(community_id,identifier_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
+        [$decoyId,'cups','ES0021000011499086BA',Salvest\Text::normalize('ES0021000011499086BA')]);
+
+    $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>'A95758389','nombre_comunidad'=>'PK ILLES BALEARS 23',
+        'comunidad_cif'=>'H12645537','direccion'=>'','cups'=>'ES0021000011499086BA','numero_contrato'=>'763322520',
+        'tipo_servicio'=>'agua','fecha_factura'=>'2026-08-01','importe'=>123.45,'numero_factura'=>'F-2026-001'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+
+    $assert($route['status']==='classified','el caso real debe quedar clasificado automáticamente: '.json_encode($route));
+    $assert((int)$route['decision']['community']['id']===$communityId,'la comunidad debe ser PK ILLES BALEARS 23, no la del CUPS señuelo');
+    $assert($route['decision']['evidence']['field']==='holder_cif','la comunidad debe resolverse por CIF titular, con prioridad sobre CUPS/contrato');
+    $assert((int)$route['supplier']['id']===$supplierId && $route['supplier']['official_name']==='IBERDROLA CLIENTES, S.A.U.','el proveedor debe ser Iberdrola');
+    $assert($route['evidence']['supplier']['field']==='supplier_cif','el proveedor debe resolverse por su propio CIF, nunca el de la comunidad');
+    $assert($route['service']==='ELECTRICIDAD','MySQL debe corregir el "agua" erróneo de OpenAI: '.$route['service']);
+    $assert($route['evidence']['service']['field']==='supplier_main_service_type','el servicio debe venir del tipo configurado del proveedor, no de la sugerencia de OpenAI');
+    $assert($route['reason']===null,'un caso correctamente asociado no debe llevar motivo de revisión');
+});
+$test('proveedor reconocido pero no asociado a la comunidad: va a revisión, no se fuerza el archivado',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['30','CP TREINTA',Salvest\Text::normalize('CP TREINTA'),'H99999999','Calle Treinta','46030','Valencia','30 - CP TREINTA']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['ELECTRICIDAD',Salvest\Text::normalize('ELECTRICIDAD')]);
+    $serviceTypeId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
+        ['IBERDROLA CLIENTES, S.A.U.',Salvest\Text::normalize('IBERDROLA CLIENTES, S.A.U.'),'A95758389',$serviceTypeId]);
+    // Nótese: no hay fila en community_suppliers vinculando a este proveedor con esta comunidad.
+    $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>'A95758389','comunidad_cif'=>'H99999999','tipo_servicio'=>'agua'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $assert($route['status']==='needs_review','un proveedor real pero no asociado nunca debe clasificarse automáticamente: '.json_encode($route));
+    $assert($route['supplier']===null,'no debe forzarse un proveedor no asociado a la comunidad resuelta');
+    $assert($route['reason']==='Proveedor reconocido pero no asociado a esta comunidad.','debe quedar el motivo exacto para el panel de revisión');
 });
 
 $failed=0;

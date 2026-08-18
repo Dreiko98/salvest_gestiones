@@ -185,13 +185,19 @@ final class Worker
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
         $route=$this->router->route($invoice,(string)$message['sender'],$context);$decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
-        if($supplier){$invoice['proveedor']=$supplier['official_name'];$invoice['tipo_servicio']=mb_strtolower((string)$supplier['category']);}
+        // MySQL corrects OpenAI's suggestion here: $route['service'] already went through
+        // Classifier::resolveService() (supplier's configured type > community-supplier
+        // relation category > OpenAI's own tipo_servicio guess, only as a last resort).
+        if($supplier){$invoice['proveedor']=$supplier['official_name'];}
+        $invoice['tipo_servicio']=mb_strtolower((string)$route['service']);
         $target = $this->archiver->archive($path,(string)$attachment['original_filename'],$invoice,$decision['community'],$status);
         $drive=null;
-        if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$supplier['category'],$invoice);
+        if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$route['service'],$invoice);
+        $decisionTrace=$decision+['supplier_evidence'=>$route['evidence']['supplier'],'service_evidence'=>$route['evidence']['service'],'reason'=>$route['reason']];
         $data = array_merge($invoice,['community_id'=>$decision['community']['id'] ?? null,'confidence'=>$decision['confidence'],
             'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),
-            'decision_json'=>json_encode($decision,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
+            'decision_json'=>json_encode($decisionTrace,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
+            'error_message'=>$route['reason'],
             'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
         $counts[$status === 'needs_review' ? 'needs_review' : ($status === 'classified' ? 'classified' : 'unclassified')]++;

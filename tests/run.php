@@ -695,6 +695,76 @@ $test('resolución contextual: si hay CIF de proveedor disponible, sigue ganando
     $assert($route['evidence']['supplier']['field']==='supplier_cif' && $route['evidence']['supplier']['type']==='exact');
     $assert($route['service']==='ELECTRICIDAD');
 });
+$test('inferencia comunidad+servicio: caso real MENENDEZ YPELAYO 10 / CRISLA — único proveedor de LIMPIEZA se infiere sin coincidencia de nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'82','MENENDEZ YPELAYO 10','CRISLA','LIMPIEZA',null,'H12557229');
+    // OpenAI no acertó el nombre del proveedor (extrajo un texto que no contiene "CRISLA" en
+    // absoluto ni comparte palabras con él — p.ej. de una cabecera o sello confusos), pero sí el servicio.
+    $invoice=['proveedor'=>'Servicios Generales de Mantenimiento Ibérica','proveedor_cif'=>'B12534228','comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
+    // Nótese: aunque el nombre y el CIF del proveedor no están en el maestro (como en la
+    // realidad: suppliers.cif es NULL), la inferencia comunidad+servicio debe bastar igualmente.
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
+    $assert($route['status']==='classified','comunidad+servicio con un único proveedor compatible debe clasificar: '.json_encode($route));
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'],'debe resolver a CRISLA');
+    $assert($route['evidence']['supplier']['field']==='community_service' && $route['evidence']['supplier']['type']==='community_service_unique_supplier','debe quedar constancia de la señal usada: '.json_encode($route['evidence']['supplier']));
+    $assert($route['service']==='LIMPIEZA');
+});
+$test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo servicio nunca se eligen automáticamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['31','CP TREINTAYUNO',Salvest\Text::normalize('CP TREINTAYUNO'),'H31000000','Calle 31','46031','Valencia','31 - CP TREINTAYUNO']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['LIMPIEZA',Salvest\Text::normalize('LIMPIEZA')]);
+    $serviceTypeId=(int)$db->pdo()->lastInsertId();
+    foreach(['LIMPIEZAS NORTE','LIMPIEZAS SUR'] as $name){
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,NULL,?,1)',[$name,Salvest\Text::normalize($name),$serviceTypeId]);
+        $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'LIMPIEZA']);
+    }
+    // El nombre extraído no coincide con ninguno de los dos, así que solo queda la señal comunidad+servicio — y hay dos.
+    $invoice=['proveedor'=>'Proveedor de Limpieza No Identificado','proveedor_cif'=>null,'comunidad_cif'=>'H31000000','tipo_servicio'=>'limpieza'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@limpieza.example');
+    $assert($route['status']==='needs_review','con dos proveedores compatibles no debe elegirse ninguno automáticamente: '.json_encode($route));
+    $assert($route['supplier']===null);
+});
+$test('inferencia comunidad+servicio: un proveedor identificado explícitamente por nombre tiene prioridad sobre esta señal',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['32','CP TREINTAYDOS',Salvest\Text::normalize('CP TREINTAYDOS'),'H32000000','Calle 32','46032','Valencia','32 - CP TREINTAYDOS']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['LIMPIEZA',Salvest\Text::normalize('LIMPIEZA')]);
+    $serviceTypeId=(int)$db->pdo()->lastInsertId();
+    foreach(['LIMPIEZAS NORTE','LIMPIEZAS SUR'] as $name){
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,NULL,?,1)',[$name,Salvest\Text::normalize($name),$serviceTypeId]);
+        $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'LIMPIEZA']);
+    }
+    // Ambos proveedores comparten servicio (la nueva señal por sí sola sería ambigua), pero
+    // el nombre extraído coincide exactamente con uno de ellos: la coincidencia de nombre debe ganar.
+    $invoice=['proveedor'=>'LIMPIEZAS NORTE','proveedor_cif'=>null,'comunidad_cif'=>'H32000000','tipo_servicio'=>'limpieza'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@limpiezasnorte.example');
+    $assert($route['status']==='classified','la coincidencia de nombre explícita debe primar sobre la inferencia comunidad+servicio: '.json_encode($route));
+    $assert($route['evidence']['supplier']['type']==='exact_name','no debe usarse la señal comunidad+servicio cuando el nombre ya resolvió el proveedor: '.json_encode($route['evidence']['supplier']));
+});
+$test('inferencia comunidad+servicio: proveedor confirmado por nombre pero con servicio erróneo de OpenAI — gana el servicio configurado en BD',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'33','CP TREINTAYTRES','CRISLA','LIMPIEZA');
+    // OpenAI acertó el nombre del proveedor pero se equivocó de servicio ("agua" en vez de limpieza).
+    $invoice=['proveedor'=>'CRISLA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
+    $assert($route['evidence']['supplier']['type']==='exact_name','el proveedor se resolvió por nombre, no por la señal comunidad+servicio');
+    $assert($route['service']==='LIMPIEZA','el servicio configurado del proveedor en BD debe corregir el "agua" erróneo de OpenAI: '.$route['service']);
+    $assert($route['evidence']['service']['field']==='supplier_main_service_type');
+});
+$test('inferencia comunidad+servicio: ningún proveedor compatible con el servicio va a revisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    // Esta comunidad solo tiene un proveedor de ELECTRICIDAD; la factura dice ser de LIMPIEZA
+    // y el nombre extraído no coincide con nada, así que ningún proveedor es compatible.
+    $fixture=$makeCommunityWithSupplier($db,'34','CP TREINTAYCUATRO','IBERDROLA','ELECTRICIDAD');
+    $invoice=['proveedor'=>'Proveedor de Limpieza Desconocido','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@desconocido.example');
+    $assert($route['status']==='needs_review','sin ningún proveedor compatible con el servicio no debe clasificarse: '.json_encode($route));
+    $assert($route['supplier']===null);
+});
 $test('panel Revisar: el <select> de comunidad refleja el community_id ya resuelto, no solo el texto sugerido',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
     $db->execute('INSERT INTO communities(official_name,active) VALUES (?,1)',['PK ILLES BALEARS 23']);

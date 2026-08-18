@@ -196,6 +196,26 @@ final class Classifier
         if ($bestScore >= $this->threshold) {
             return $tied > 1 ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$best,'evidence'=>['field'=>'proveedor','type'=>'fuzzy'],'ambiguous'=>false];
         }
+
+        // Last resort, only once every name/alias/CIF/domain tier above has failed to find
+        // even a single candidate: if community_id + service are both known, the master data
+        // itself may already narrow this down. A community rarely has more than one supplier
+        // configured for the same service (e.g. exactly one LIMPIEZA supplier), so when that
+        // holds this document is classifiable even if OpenAI never resolved a usable supplier
+        // name at all. Never applies with zero or several matches — a single tie among several
+        // compatible suppliers would be a guess, not a decision, so it falls through unchanged
+        // (0 -> needs_review once every other path is also exhausted; >1 -> the restricted
+        // OpenAI retry in InvoiceRouter gets a chance next, still never picked arbitrarily here).
+        $serviceHint = Text::normalize((string)($invoice['tipo_servicio'] ?? ''));
+        if ($serviceHint !== '') {
+            $compatible = array_values(array_filter($rows, static fn(array $r): bool =>
+                (!empty($r['service_type_name']) && Text::normalize((string)$r['service_type_name']) === $serviceHint)
+                || (!empty($r['category']) && Text::normalize((string)$r['category']) === $serviceHint)
+            ));
+            if (count($compatible) === 1) {
+                return ['supplier'=>$compatible[0],'evidence'=>['field'=>'community_service','type'=>'community_service_unique_supplier'],'ambiguous'=>false];
+            }
+        }
         return $none;
     }
 

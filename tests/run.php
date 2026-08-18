@@ -32,6 +32,57 @@ CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normal
 CREATE TABLE supplier_service_types(supplier_id INTEGER,service_type_id INTEGER);
 SQL;
 
+// Same in-memory Database helper, but for the manual "run-worker" route: it also
+// registers fake GET_LOCK/RELEASE_LOCK SQL functions (SQLite has no such thing)
+// so Worker's real MySQL locking code can be exercised deterministically.
+$workerSchema=<<<SQL
+CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
+CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
+CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,old_values_json TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
+CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT,processed_at TEXT);
+CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,active INTEGER DEFAULT 1);
+CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,active INTEGER DEFAULT 1);
+SQL;
+/** @param 'always-free'|'always-busy'|'free-then-busy' $lockBehavior */
+$sqliteDbWithLock=static function(string $lockBehavior='always-free')use($workerSchema):Salvest\Database{
+    $pdo=new PDO('sqlite::memory:');
+    $pdo->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE,PDO::FETCH_ASSOC);
+    $pdo->exec($workerSchema);
+    $calls=0;
+    $pdo->sqliteCreateFunction('GET_LOCK',static function()use(&$calls,$lockBehavior):int{
+        $calls++;
+        return match($lockBehavior){'always-busy'=>0,'free-then-busy'=>$calls===1?1:0,default=>1};
+    },2);
+    $pdo->sqliteCreateFunction('RELEASE_LOCK',static fn():int=>1,1);
+    $pdo->sqliteCreateFunction('NOW',static fn():string=>date('Y-m-d H:i:s'),0);
+    $reflection=new ReflectionClass(Salvest\Database::class);
+    $db=$reflection->newInstanceWithoutConstructor();
+    $property=$reflection->getProperty('pdo');$property->setAccessible(true);$property->setValue($db,$pdo);
+    return$db;
+};
+$workerConfig=static fn():array=>['app'=>['base_url'=>'http://127.0.0.1','timezone'=>'Europe/Madrid','session_name'=>'salvest_test_'.bin2hex(random_bytes(4)),
+    'secret_key'=>'test-secret','encryption_key'=>Salvest\Crypto::generateKey(),'cron_token'=>'test','cookie_secure'=>false],
+    'openai'=>['api_key'=>'test-key','model'=>'gpt-test','timeout_seconds'=>5],
+    'imap'=>['default_host'=>'imap.ionos.es','default_port'=>993,'timeout_seconds'=>5,'max_messages_per_mailbox'=>5],
+    'processing'=>['classification_threshold'=>92.0,'max_attachment_bytes'=>1000000,'storage_root'=>sys_get_temp_dir(),'incoming_root'=>sys_get_temp_dir()],
+    'google_drive'=>['enabled'=>false]];
+/** Auth's constructor touches session_start()/header(); see the note on the disclosure tests above. */
+$makeWebApp=static function(Salvest\Database $db,array $config):Salvest\WebApp{
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $webApp=new Salvest\WebApp($db,$config);
+    restore_error_handler();
+    return$webApp;
+};
+/** Calls WebApp::run() through a fake request exactly like a browser would, capturing the output. */
+$requestWebApp=static function(Salvest\WebApp $webApp,string $method,string $route,array $post=[])use($assert):string{
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $_SERVER['REQUEST_METHOD']=$method;$_GET=['route'=>$route];$_POST=$post;
+    ob_start();$webApp->run();$html=ob_get_clean();
+    restore_error_handler();
+    return$html;
+};
+
 $test('normalización y slug',static function()use($assert):void{
     $assert(Salvest\Text::normalize("Carrer del Jardí, 42") === 'calle del jardi 42');
     $assert(Salvest\Text::slug("CP Mirador de l'Horta") === 'cp-mirador-de-l-horta');
@@ -246,6 +297,86 @@ $test('Classifier sigue clasificando comunidades por dirección alias (fuzzy)',s
     $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$id,'address','Avenida Real 45',Salvest\Text::normalize('Avenida Real 45')]);
     $result=(new Salvest\Classifier($db))->classify(['direccion'=>'Avenida Real 45']);
     $assert($result['community']!==null && (int)$result['community']['id']===$id,'debe encontrar la comunidad a través del alias de dirección, no de la dirección principal');
+});
+
+$test('ejecutar bot ahora: happy path, usa el mismo Worker y registra trigger_type=manual y el usuario',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $_SESSION['user_id']=77;
+    $html=$requestWebApp($webApp,'POST','run-worker',['csrf'=>$_SESSION['csrf']]);
+    $payload=json_decode($html,true);
+    $assert($payload!==null,'la respuesta debe ser JSON válido: '.$html);
+    $assert(($payload['status']??null)==='ok','debe reportar éxito sin buzones activos: '.$html);
+    $assert(isset($payload['summary']['classified'],$payload['summary']['needs_review'],$payload['summary']['errors']),'debe devolver un resumen de la ejecución');
+    $run=$db->one('SELECT * FROM processing_runs ORDER BY id DESC LIMIT 1');
+    $assert($run!==null,'debe quedar registrada una ejecución en processing_runs');
+    $assert($run['trigger_type']==='manual','el disparo manual debe distinguirse de "cron" en la traza');
+    $assert((int)$run['triggered_by_user_id']===77,'debe guardar qué usuario de la sesión lanzó la ejecución');
+    $assert($run['status']==='completed','sin buzones activos el ciclo debe completarse sin errores');
+});
+$test('ejecutar bot ahora: CSRF inválido no debe lanzar el worker',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $_SESSION['user_id']=5;
+    $html=$requestWebApp($webApp,'POST','run-worker',['csrf'=>'token-invalido']);
+    $assert(!str_contains($html,'"status":"ok"'),'un CSRF inválido nunca debe llegar a ejecutar el worker: '.$html);
+    $assert(str_contains($html,'La sesión ha caducado'),'debe rechazarse con el mismo mensaje de CSRF que el resto de formularios');
+    $assert((int)$db->one('SELECT COUNT(*) n FROM processing_runs')['n']===0,'no debe quedar ninguna ejecución registrada');
+});
+$test('ejecutar bot ahora: sin sesión no ejecuta nada',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');
+    $webApp=$makeWebApp($db,$workerConfig());
+    unset($_SESSION['user_id']);
+    $html=$requestWebApp($webApp,'POST','run-worker',['csrf'=>$_SESSION['csrf']??'']);
+    $assert(str_contains($html,'Acceso'),'sin sesión debe devolver la pantalla de acceso, no ejecutar el worker: '.$html);
+    $assert(!str_contains($html,'"status":"ok"'));
+    $assert((int)$db->one('SELECT COUNT(*) n FROM processing_runs')['n']===0,'no debe quedar ninguna ejecución registrada');
+});
+$test('ejecutar bot ahora: si el worker ya está bloqueado, responde amigable y no lanza otro',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-busy');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $_SESSION['user_id']=9;
+    $html=$requestWebApp($webApp,'POST','run-worker',['csrf'=>$_SESSION['csrf']]);
+    $payload=json_decode($html,true);
+    $assert($payload!==null && ($payload['status']??null)==='busy','debe responder con estado "busy" cuando el lock ya está tomado: '.$html);
+    $assert(!preg_match('/GET_LOCK|RuntimeException|Salvest\\\\\\\\Worker/',$payload['message']??''),'el mensaje debe ser amigable, no un detalle técnico');
+    $assert((int)$db->one('SELECT COUNT(*) n FROM processing_runs')['n']===0,'no debe crear una segunda ejecución mientras la otra está en marcha');
+});
+$test('ejecutar bot ahora: doble clic / doble petición solo lanza una ejecución',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('free-then-busy');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $_SESSION['user_id']=3;
+    $csrf=$_SESSION['csrf'];
+    $first=json_decode($requestWebApp($webApp,'POST','run-worker',['csrf'=>$csrf]),true);
+    $second=json_decode($requestWebApp($webApp,'POST','run-worker',['csrf'=>$csrf]),true);
+    $assert(($first['status']??null)==='ok','la primera petición debe completarse con éxito');
+    $assert(($second['status']??null)==='busy','la segunda petición casi simultánea debe rechazarse, no relanzar el worker');
+    $assert((int)$db->one('SELECT COUNT(*) n FROM processing_runs')['n']===1,'pese a las dos peticiones solo debe quedar registrada una ejecución');
+});
+$test('estado del bot: el dashboard muestra la última ejecución sin detalles técnicos',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $db->execute('INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status,classified_count,needs_review_count,error_count) VALUES (?,?,?,?,?,?,?,?)',
+        ['uuid-1','manual',date('Y-m-d H:i:s'),date('Y-m-d H:i:s'),'completed',2,1,0]);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'botStatusCard');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'2 archivadas'),'debe mostrar cuántas facturas se archivaron: '.$html);
+    $assert(str_contains($html,'1 pendiente'),'debe mostrar cuántas quedaron pendientes, en singular cuando es 1: '.$html);
+    $assert(str_contains($html,'0 errores'),'debe mostrar cuántas fallaron: '.$html);
+    $assert(str_contains($html,'Última ejecución: <strong>hoy '),'debe mostrar cuándo fue la última ejecución');
+    $assert(str_contains($html,'Ejecutar bot ahora'),'el botón debe estar disponible cuando no hay nada en marcha');
+    $assert(!preg_match('/\bdisabled\b/',$html),'el botón no debe estar deshabilitado si no hay ninguna ejecución en curso');
+    $assert(!preg_match('/api[_-]?key|stack trace|Fatal error|uidvalidity/i',$html),'no debe filtrar detalles técnicos a la interfaz normal');
+});
+$test('estado del bot: mientras se ejecuta se deshabilita el botón y se avisa',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $db->execute('INSERT INTO processing_runs(run_uuid,trigger_type,started_at,status) VALUES (?,?,?,?)',['uuid-running','cron',date('Y-m-d H:i:s'),'running']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'botStatusCard');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'En ejecución'),'debe indicar que ya hay un ciclo en marcha');
+    $assert(str_contains($html,'Bot ejecutándose'),'el botón debe reflejar el estado de ejecución en curso');
+    $assert((bool)preg_match('/\bdisabled\b/',$html),'el botón debe estar deshabilitado mientras hay una ejecución en curso');
 });
 
 $failed=0;

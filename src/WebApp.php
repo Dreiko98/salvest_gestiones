@@ -29,6 +29,7 @@ final class WebApp
                 $path === 'reviews' => $this->reviews(),
                 $path === 'storage' => $this->storage(),
                 $path === 'storage-children' => $this->storageChildren(),
+                $path === 'run-worker' => $this->runWorker(),
                 $path === 'download' => $this->download((int)($_GET['id'] ?? 0)),
                 str_starts_with($path,'download/') => $this->download((int)basename($path)),
                 default => $this->notFound(),
@@ -61,7 +62,57 @@ final class WebApp
         $status=$attention?'<section class="status warning"><div><span class="status-ring"><i></i></span><span><strong>'.$attention.' facturas pendientes de revisar</strong><small>Comprueba la comunidad y el proveedor antes de archivarlas.</small></span></div><a class="button" href="/?route=reviews">Revisar facturas</a></section>'
             :'<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Todo está al día</strong><small>No hay facturas pendientes de revisar.</small></span></section>';
         $this->page('Inicio','<div class="page-heading"><div><span class="eyebrow">Resumen de hoy</span><h1>Gestión de facturas</h1><p>El sistema revisa y archiva automáticamente las facturas recibidas.</p></div></div>'.$status.
-            '<div class="metrics"><article><span class="metric-label">Archivadas hoy</span><strong>'.$classified.'</strong></article><article><span class="metric-label">Comunidades activas</span><strong>'.$communities.'</strong></article><article><span class="metric-label">Proveedores activos</span><strong>'.$suppliers.'</strong></article></div>');
+            '<div class="metrics"><article><span class="metric-label">Archivadas hoy</span><strong>'.$classified.'</strong></article><article><span class="metric-label">Comunidades activas</span><strong>'.$communities.'</strong></article><article><span class="metric-label">Proveedores activos</span><strong>'.$suppliers.'</strong></article></div>'.
+            $this->botStatusCard());
+    }
+
+    private function botStatusCard(): string
+    {
+        $runningNow=(bool)$this->db->one("SELECT 1 ok FROM processing_runs WHERE status='running' ORDER BY id DESC LIMIT 1");
+        $lastRun=$this->db->one('SELECT * FROM processing_runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1');
+        $badge=$runningNow?'<span class="badge warning">En ejecución</span>':'<span class="badge success">En reposo</span>';
+        $when=$lastRun?$this->formatRunTime((string)$lastRun['finished_at']):null;
+        $lastLine=$when?'<p class="bot-status-line">Última ejecución: <strong>'.$this->e($when).'</strong></p>':'<p class="bot-status-line">Todavía no se ha ejecutado.</p>';
+        $resultLine='';
+        if($lastRun){
+            $archivadas=(int)$lastRun['classified_count'];$pendientes=(int)$lastRun['needs_review_count'];$errores=(int)$lastRun['error_count'];
+            $resultLine='<p class="bot-status-line">Resultado: <strong>'.$archivadas.' '.($archivadas===1?'archivada':'archivadas').' · '.$pendientes.' '.($pendientes===1?'pendiente':'pendientes').' · '.$errores.' '.($errores===1?'error':'errores').'</strong></p>';
+        }
+        $label=$runningNow?'Bot ejecutándose…':'Ejecutar bot ahora';
+        $button='<button type="button" class="button" id="run-worker-btn" data-run-worker data-csrf="'.$this->auth->csrf().'" data-idle-label="Ejecutar bot ahora" data-busy-label="Bot ejecutándose…"'.($runningNow?' disabled':'').'>'.$this->e($label).'</button>';
+        return '<section class="card bot-status"><div class="section-heading flat"><div><span class="eyebrow">Automatización</span><h2>Estado del bot</h2></div>'.$badge.'</div>'.$lastLine.$resultLine.
+            '<div class="bot-actions">'.$button.'<p class="bot-message" id="run-worker-message" role="status" hidden></p></div></section>';
+    }
+
+    private function formatRunTime(string $datetime): string
+    {
+        try { $date=new \DateTimeImmutable($datetime); } catch (\Throwable) { return '—'; }
+        $time=$date->format('H:i');
+        $today=new \DateTimeImmutable('today');
+        if ($date >= $today) return 'hoy '.$time;
+        if ($date >= $today->modify('-1 day')) return 'ayer '.$time;
+        return $date->format('d/m/Y').' '.$time;
+    }
+
+    /** Runs the exact same Worker used by the cron endpoint, triggered from the dashboard button. */
+    private function runWorker(): void
+    {
+        header('Content-Type: application/json; charset=UTF-8');
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); echo json_encode(['status'=>'error','message'=>'Método no permitido']); return; }
+        try {
+            $counts = Worker::create($this->db,$this->config)->run(false,(int)$this->config['imap']['max_messages_per_mailbox'],null,'manual',$this->auth->userId());
+            $this->audit('run','worker','manual',$counts);
+            echo json_encode(['status'=>'ok','summary'=>[
+                'classified'=>$counts['classified'],'needs_review'=>$counts['needs_review'],'errors'=>$counts['errors'],
+            ]],JSON_UNESCAPED_UNICODE);
+        } catch (WorkerBusyException) {
+            http_response_code(409);
+            echo json_encode(['status'=>'busy','message'=>'El bot ya se está ejecutando. Espera a que termine.']);
+        } catch (\Throwable $error) {
+            error_log('run_worker status=error '.$error->getMessage());
+            http_response_code(500);
+            echo json_encode(['status'=>'error','message'=>'No se pudo completar la ejecución. Inténtalo de nuevo en unos minutos.']);
+        }
     }
 
     private function communities(): void

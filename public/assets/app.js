@@ -60,6 +60,42 @@ document.addEventListener('click',event=>{
   row.classList.toggle('row-open',open);
 });
 
+document.querySelector('[data-run-worker]')?.addEventListener('click',async event=>{
+  const button=event.currentTarget;
+  if(button.disabled)return;
+  const message=document.getElementById('run-worker-message');
+  const setMessage=text=>{if(!message)return;message.textContent=text||'';message.hidden=!text;};
+  setMessage('');
+  button.disabled=true;
+  button.textContent=button.dataset.busyLabel||'Bot ejecutándose…';
+  try{
+    const response=await fetch('/?route=run-worker',{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},
+      body:new URLSearchParams({csrf:button.dataset.csrf||''}),
+    });
+    let payload=null;
+    try{payload=await response.json();}catch(parseError){payload=null;}
+    if(response.status===409){
+      setMessage((payload&&payload.message)||'El bot ya se está ejecutando. Espera a que termine.');
+      button.disabled=false;
+      button.textContent=button.dataset.idleLabel||'Ejecutar bot ahora';
+      return;
+    }
+    if(!response.ok||!payload||payload.status!=='ok'){
+      setMessage((payload&&payload.message)||'No se pudo completar la ejecución. Inténtalo de nuevo en unos minutos.');
+      button.disabled=false;
+      button.textContent=button.dataset.idleLabel||'Ejecutar bot ahora';
+      return;
+    }
+    window.location.reload();
+  }catch(networkError){
+    setMessage('No se pudo completar la ejecución. Comprueba tu conexión e inténtalo de nuevo.');
+    button.disabled=false;
+    button.textContent=button.dataset.idleLabel||'Ejecutar bot ahora';
+  }
+});
+
 document.addEventListener('toggle',async event=>{
   const node=event.target.closest?.('.folder-node[data-folder-id]');
   if(!node||!node.open||node.dataset.loaded==='true'||node.dataset.loading==='true')return;

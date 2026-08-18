@@ -15,6 +15,8 @@ final class Schema
         self::column($database,'processed_attachments','drive_file_id','VARCHAR(190) NULL AFTER extractor_version');
         self::column($database,'processed_attachments','drive_path','VARCHAR(1000) NULL AFTER drive_file_id');
         self::column($database,'processed_attachments','drive_status','VARCHAR(50) NULL AFTER drive_path');
+        self::column($database,'processing_runs','triggered_by_user_id','INT UNSIGNED NULL AFTER trigger_type');
+        self::column($database,'processing_runs','needs_review_count','INT UNSIGNED NOT NULL DEFAULT 0 AFTER unclassified_count');
         $index=$database->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='communities' AND index_name='uq_communities_external_code'");
         if(!$index)$database->execute('ALTER TABLE communities ADD UNIQUE KEY uq_communities_external_code(external_code)');
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");

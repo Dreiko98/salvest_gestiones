@@ -25,20 +25,32 @@ final class Worker
         }
     }
 
-    /** @return array<string,int> */
-    public function run(bool $dryRun = false, ?int $limit = null, ?string $mailboxEmail = null): array
+    /** Builds a Worker exactly the way every entry point (cron, CLI, manual button) needs it,
+     * so none of them has to repeat the Crypto/OpenAIExtractor wiring by hand. */
+    public static function create(Database $db, array $config): self
+    {
+        return new self($db, new Crypto((string)$config['app']['encryption_key']), new OpenAIExtractor($config['openai']), $config);
+    }
+
+    /**
+     * @param string|null $triggerType overrides the recorded trigger ('cron' or 'dry_run' are inferred when omitted,
+     *   pass 'manual' from the dashboard button so cron and manual runs stay distinguishable in processing_runs)
+     * @return array<string,int>
+     */
+    public function run(bool $dryRun = false, ?int $limit = null, ?string $mailboxEmail = null, ?string $triggerType = null, ?int $triggeredByUserId = null): array
     {
         $locked = $this->db->one("SELECT GET_LOCK('salvest-invoice-worker',0) acquired");
-        if (!(int)($locked['acquired'] ?? 0)) throw new \RuntimeException('Ya hay otro worker ejecutándose');
+        if (!(int)($locked['acquired'] ?? 0)) throw new WorkerBusyException('Ya hay otro worker ejecutándose');
         $runUuid = $this->uuid();
         $mailboxes = $mailboxEmail
             ? $this->db->all('SELECT * FROM mailboxes WHERE active=1 AND email=? ORDER BY id',[$mailboxEmail])
             : $this->db->all('SELECT * FROM mailboxes WHERE active=1 ORDER BY id');
         if($mailboxEmail!==null&&!$mailboxes)throw new \RuntimeException('No existe un buzón activo con ese correo');
-        $this->db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,status,mailboxes_count) VALUES (?,? ,NOW(),'running',?)",
-            [$runUuid,$dryRun?'dry_run':'cron',count($mailboxes)]);
+        $type = $triggerType ?? ($dryRun ? 'dry_run' : 'cron');
+        $this->db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,triggered_by_user_id,started_at,status,mailboxes_count) VALUES (?,?,?,NOW(),'running',?)",
+            [$runUuid,$type,$triggeredByUserId,count($mailboxes)]);
         $runId = (int)$this->db->pdo()->lastInsertId();
-        $counts = ['messages'=>0,'documents'=>0,'classified'=>0,'unclassified'=>0,'duplicate'=>0,'errors'=>0];
+        $counts = ['messages'=>0,'documents'=>0,'classified'=>0,'unclassified'=>0,'needs_review'=>0,'duplicate'=>0,'errors'=>0];
         try {
             foreach ($mailboxes as $mailbox) {
                 try { $this->processMailbox($mailbox, $dryRun, $limit, $counts); }
@@ -49,8 +61,8 @@ final class Worker
                     error_log('mailbox_id='.$mailbox['id'].' status=failed error='.$error->getMessage());
                 }
             }
-            $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,duplicate_count=?,error_count=?,openai_input_tokens=?,openai_output_tokens=? WHERE id=?",
-                [$counts['errors']?'partial':'completed',$counts['messages'],$counts['documents'],$counts['classified'],$counts['unclassified'],$counts['duplicate'],$counts['errors'],$this->extractor->inputTokens,$this->extractor->outputTokens,$runId]);
+            $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,needs_review_count=?,duplicate_count=?,error_count=?,openai_input_tokens=?,openai_output_tokens=? WHERE id=?",
+                [$counts['errors']?'partial':'completed',$counts['messages'],$counts['documents'],$counts['classified'],$counts['unclassified'],$counts['needs_review'],$counts['duplicate'],$counts['errors'],$this->extractor->inputTokens,$this->extractor->outputTokens,$runId]);
             return $counts;
         } catch (\Throwable $error) {
             $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status='error',error_message=? WHERE id=?", [mb_substr($error->getMessage(),0,2000),$runId]);
@@ -151,7 +163,7 @@ final class Worker
             'decision_json'=>json_encode($decision,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
             'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
-        $counts[$status === 'classified' ? 'classified' : 'unclassified']++;
+        $counts[$status === 'needs_review' ? 'needs_review' : ($status === 'classified' ? 'classified' : 'unclassified')]++;
         return ['status'=>$status,'community_id'=>$data['community_id'] ? (int)$data['community_id'] : null];
     }
 

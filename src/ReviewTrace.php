@@ -6,9 +6,10 @@ namespace Salvest;
 /**
  * In-memory technical trace of one attachment's trip through the pipeline, built during
  * Worker::processAttachment() and persisted (as JSON, in processed_attachments.debug_trace_json)
- * only when the attachment ends up in needs_review — /Revisar is the only place it's ever read.
- * classified/duplicate/unclassified/error outcomes simply discard whatever was collected: no
- * extra DB write happens mid-process, and building the trace itself never touches the database.
+ * only when the attachment ends up somewhere a human will actually see it on /Revisar
+ * (unclassified/needs_review/error — see REVIEWABLE_STATUSES). classified/duplicate outcomes
+ * simply discard whatever was collected: no extra DB write happens mid-process, and building
+ * the trace itself never touches the database.
  *
  * Every add() is defensive: a failure to build/redact one step's data can never throw back into
  * the caller, so a bug in here can never break real invoice processing.
@@ -40,14 +41,20 @@ final class ReviewTrace
         return $this->steps;
     }
 
-    /** Serialises the trace to JSON only when $status is 'needs_review' — every other outcome
-     * (classified/unclassified/duplicate/error) explicitly returns null, so a technical trace is
-     * only ever kept for a document a human will actually have to open and debug. Never throws:
-     * a JSON failure (e.g. invalid UTF-8 slipping through from somewhere in the PDF/extraction)
-     * falls back to null, logged, so real invoice processing can continue regardless. */
-    public function persistIfNeedsReview(string $status): ?string
+    /** Every status that ever lands on /Revisar's pending list — see WebApp::reviews()'s SELECT
+     * ...WHERE status IN (...). Kept here, next to the one method that needs it, rather than
+     * duplicated at each call site. */
+    private const REVIEWABLE_STATUSES = ['unclassified', 'needs_review', 'error'];
+
+    /** Serialises the trace to JSON only when $status is one a human will actually see on
+     * /Revisar (unclassified/needs_review/error) — classified and duplicate explicitly return
+     * null, so a technical trace is only ever kept for a document someone will actually have to
+     * open and debug. Never throws: a JSON failure (e.g. invalid UTF-8 slipping through from
+     * somewhere in the PDF/extraction) falls back to null, logged, so real invoice processing
+     * can continue regardless. */
+    public function persistForReview(string $status): ?string
     {
-        if ($status !== 'needs_review') return null;
+        if (!in_array($status, self::REVIEWABLE_STATUSES, true)) return null;
         try {
             return json_encode($this->steps, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_THROW_ON_ERROR);
         } catch (\Throwable $error) {

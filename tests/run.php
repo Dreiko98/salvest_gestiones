@@ -931,24 +931,24 @@ $test('ReviewTrace: redacta claves sensibles pero conserva input_tokens/output_t
     $assert($data0['model']==='gpt-5.6-luna','un campo funcional normal no debe verse afectado');
     $assert($data1['input_tokens']===18342 && $data1['output_tokens']===212,'input_tokens/output_tokens son datos funcionales, no un secreto, pese a contener "token"');
 });
-$test('ReviewTrace: se persiste únicamente cuando el resultado final es needs_review',static function()use($assert):void{
+$test('ReviewTrace: se persiste para cualquier estado que /Revisar muestre (unclassified, needs_review, error), nunca para classified/duplicate',static function()use($assert):void{
     $trace=new Salvest\ReviewTrace();
     $trace->add('final_decision',['status'=>'classified']);
-    $assert($trace->persistIfNeedsReview('classified')===null);
-    $assert($trace->persistIfNeedsReview('unclassified')===null);
-    $assert($trace->persistIfNeedsReview('duplicate')===null);
-    $assert($trace->persistIfNeedsReview('error')===null);
-    $json=$trace->persistIfNeedsReview('needs_review');
-    $assert(is_string($json) && json_decode($json,true)!==null,'needs_review sí debe producir el JSON del timeline');
+    $assert($trace->persistForReview('classified')===null,'classified nunca necesita depuración manual');
+    $assert($trace->persistForReview('duplicate')===null,'un duplicado nunca guarda su propia traza (ver también el caso de Worker que fuerza NULL aunque el original la tuviera)');
+    foreach(['unclassified','needs_review','error'] as $reviewable){
+        $json=$trace->persistForReview($reviewable);
+        $assert(is_string($json) && json_decode($json,true)!==null,"$reviewable debe producir el JSON del timeline, ya que también aparece en /Revisar");
+    }
 });
 $test('ReviewTrace: un dato interno problemático (p.ej. UTF-8 inválido) nunca lanza una excepción que interrumpa el procesamiento',static function()use($assert):void{
     $trace=new Salvest\ReviewTrace();
     $trace->add('document',['filename'=>"factura-\xB1\x31-invalida.pdf"]); // bytes UTF-8 inválidos a propósito
     try{
-        $result=$trace->persistIfNeedsReview('needs_review');
+        $result=$trace->persistForReview('needs_review');
         $assert($result===null||is_string($result),'debe degradar con seguridad (null, o JSON parcial) en vez de lanzar');
     }catch(\Throwable $error){
-        $assert(false,'persistIfNeedsReview() nunca debe dejar escapar una excepción — rompería el procesamiento real de la factura: '.$error->getMessage());
+        $assert(false,'persistForReview() nunca debe dejar escapar una excepción — rompería el procesamiento real de la factura: '.$error->getMessage());
     }
 });
 
@@ -996,7 +996,7 @@ $test('/Revisar: una factura needs_review con debug_trace_json muestra el detall
     $trace=new Salvest\ReviewTrace();
     $trace->add('document',['filename'=>'F-0486_CRISLA.pdf','mime'=>'application/pdf','size_bytes'=>184320,'sha256'=>str_repeat('a',64)]);
     $trace->add('final_decision',['status'=>'needs_review','reason'=>'Proveedor no resuelto']);
-    $json=$trace->persistIfNeedsReview('needs_review');
+    $json=$trace->persistForReview('needs_review');
     $db->execute('INSERT INTO processed_attachments(status,processed_at,community_id,provider,raw_supplier_name,service_type,original_filename,debug_trace_json) VALUES (?,?,?,NULL,?,?,?,?)',
         ['needs_review',date('Y-m-d H:i:s'),$communityId,'LIMPIEZAS ADRIAN','limpieza','F-0486_CRISLA.pdf',$json]);
     $html=$requestWebApp($webApp,'GET','reviews');
@@ -1015,7 +1015,24 @@ $test('/Revisar: una factura needs_review antigua sin debug_trace_json (NULL) si
     $assert(str_contains($html,'factura-antigua.pdf'),'la tarjeta debe seguir renderizándose con normalidad');
     $assert(str_contains($html,'No hay detalle técnico disponible para esta factura.'),'una factura antigua sin traza debe mostrar el mensaje explicativo, no un error');
 });
-
+$test('/Revisar: una factura unclassified (comunidad no resuelta) también muestra el detalle técnico — caso real de producción',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    // Regresión del caso real: "FACTURA Nº FA260071 INFOR TORRENT SLU.pdf" terminó en
+    // unclassified (el Classifier nunca llegó a resolver comunidad) y, antes de este ajuste,
+    // no se guardaba ninguna traza porque persistForReview() solo cubría needs_review.
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('document',['filename'=>'FACTURA Nº FA260071 INFOR TORRENT SLU.pdf','mime'=>'application/pdf','size_bytes'=>90210,'sha256'=>str_repeat('b',64)]);
+    $trace->add('community_resolution',['signals'=>[],'community_id'=>null,'official_name'=>null,'evidence'=>['field'=>'address','type'=>'fuzzy','score'=>0.0]]);
+    $trace->add('final_decision',['status'=>'unclassified','reason'=>null,'blocking_factor'=>'community_unresolved']);
+    $json=$trace->persistForReview('unclassified');
+    $assert($json!==null,'unclassified debe producir traza ahora');
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,community_id,provider,raw_supplier_name,service_type,original_filename,debug_trace_json) VALUES (?,?,NULL,NULL,?,?,?,?)',
+        ['unclassified',date('Y-m-d H:i:s'),'INFOR TORRENT SLU','desconocido','FACTURA Nº FA260071 INFOR TORRENT SLU.pdf',$json]);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'Detalle técnico'),'una factura unclassified también debe mostrar el detalle técnico');
+    $assert(str_contains($html,'community_unresolved'),'debe verse el motivo que impidió clasificar en el JSON completo');
+    $assert(!str_contains($html,'No hay detalle técnico disponible'),'no debe caer en el mensaje de "sin traza" cuando sí la hay');
+});
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

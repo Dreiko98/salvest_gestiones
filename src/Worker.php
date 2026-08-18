@@ -261,9 +261,9 @@ final class Worker
         if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$route['service'],$invoice);
         $decisionTrace=$decision+['supplier_evidence'=>$route['evidence']['supplier'],'service_evidence'=>$route['evidence']['service'],'reason'=>$route['reason']];
         // The full technical trace is only ever worth keeping for a document a human will have to
-        // open and debug — see ReviewTrace::persistIfNeedsReview() for the null-on-anything-else
-        // and never-throws guarantees.
-        $debugTraceJson=$trace->persistIfNeedsReview($status);
+        // open and debug on /Revisar — see ReviewTrace::persistForReview() for exactly which
+        // statuses that covers and its never-throws guarantee.
+        $debugTraceJson=$trace->persistForReview($status);
         $data = array_merge($invoice,['community_id'=>$decision['community']['id'] ?? null,'confidence'=>$decision['confidence'],
             'proveedor'=>$supplier?$supplier['official_name']:null,'raw_supplier_name'=>$route['raw_supplier_name'],
             'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),

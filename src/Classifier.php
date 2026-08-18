@@ -123,6 +123,21 @@ final class Classifier
      * candidate stops immediately with ambiguous=true instead of guessing.
      * @param array<string,mixed> $invoice @return array{supplier:?array,evidence:?array,ambiguous:bool}
      */
+    /** Candidate list for the restricted second OpenAI call — only id + display name, nothing else. @return list<array{id:int,official_name:string}> */
+    public function suppliersForCommunity(int $communityId): array
+    {
+        $rows = $this->db->all('SELECT s.id,s.official_name FROM community_suppliers cs JOIN suppliers s ON s.id=cs.supplier_id WHERE cs.community_id=? AND s.active=1 ORDER BY s.official_name', [$communityId]);
+        return array_map(static fn(array $r): array => ['id'=>(int)$r['id'],'official_name'=>(string)$r['official_name']], $rows);
+    }
+
+    /** Full supplier+relation row for an id the restricted call chose — re-validated by community, never trusted blindly. */
+    public function supplierInCommunity(int $communityId, int $supplierId): ?array
+    {
+        return $this->db->one('SELECT cs.category,cs.contract_reference,s.*,st.name service_type_name FROM community_suppliers cs
+            JOIN suppliers s ON s.id=cs.supplier_id LEFT JOIN service_types st ON st.id=s.main_service_type_id
+            WHERE cs.community_id=? AND cs.supplier_id=? AND s.active=1', [$communityId, $supplierId]);
+    }
+
     public function resolveSupplierInCommunity(int $communityId, array $invoice, string $sender): array
     {
         $rows = $this->db->all('SELECT cs.category,cs.contract_reference,s.*,st.name service_type_name FROM community_suppliers cs

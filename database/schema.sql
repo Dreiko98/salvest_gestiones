@@ -204,6 +204,7 @@ CREATE TABLE IF NOT EXISTS processed_attachments (
   mime_type VARCHAR(100) NOT NULL,
   size_bytes BIGINT UNSIGNED NOT NULL,
   provider VARCHAR(255) NULL,
+  raw_supplier_name VARCHAR(255) NULL,
   provider_cif VARCHAR(50) NULL,
   service_type VARCHAR(100) NULL,
   supply_address VARCHAR(500) NULL,

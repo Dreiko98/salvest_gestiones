@@ -184,17 +184,29 @@ final class Worker
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'processing',[]);
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
-        $route=$this->router->route($invoice,(string)$message['sender'],$context);$decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
+        // Second, restricted look at the *same* PDF — headers/logos/stamps included — only
+        // reached when the community is known but no deterministic master-data match found a
+        // supplier among that community's own suppliers. Never called otherwise, so it never
+        // adds latency/cost to the common case.
+        $restrictedResolver=function(array $candidates,array $community)use($path,$attachment,$context):?int{
+            try{return $this->extractor->resolveSupplierAmongCandidates($path,(string)$attachment['mime_type'],$context,(string)$community['official_name'],$candidates);}
+            catch(\Throwable$error){error_log('restricted_openai_retry status=failed community_id='.$community['id'].' '.$error->getMessage());return null;}
+        };
+        $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver);
+        $decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
         // MySQL corrects OpenAI's suggestion here: $route['service'] already went through
         // Classifier::resolveService() (supplier's configured type > community-supplier
-        // relation category > OpenAI's own tipo_servicio guess, only as a last resort).
-        if($supplier){$invoice['proveedor']=$supplier['official_name'];}
+        // relation category > OpenAI's own tipo_servicio guess, only as a last resort). And a
+        // "proveedor" is only ever the confirmed supplier's own official name — OpenAI's raw
+        // guess is kept apart, in raw_supplier_name, never promoted to a real supplier.
+        $invoice['proveedor']=$supplier?$supplier['official_name']:$route['raw_supplier_name'];
         $invoice['tipo_servicio']=mb_strtolower((string)$route['service']);
         $target = $this->archiver->archive($path,(string)$attachment['original_filename'],$invoice,$decision['community'],$status);
         $drive=null;
         if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$route['service'],$invoice);
         $decisionTrace=$decision+['supplier_evidence'=>$route['evidence']['supplier'],'service_evidence'=>$route['evidence']['service'],'reason'=>$route['reason']];
         $data = array_merge($invoice,['community_id'=>$decision['community']['id'] ?? null,'confidence'=>$decision['confidence'],
+            'proveedor'=>$supplier?$supplier['official_name']:null,'raw_supplier_name'=>$route['raw_supplier_name'],
             'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),
             'decision_json'=>json_encode($decisionTrace,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
             'error_message'=>$route['reason'],
@@ -207,15 +219,15 @@ final class Worker
     private function insertAttachment(array $mailbox, ImapClient $client, string $uid, array $attachment, string $status, array $data): void
     {
         $this->db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,
-            provider,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,confidence,final_filename,output_path,status,
-            extraction_json,decision_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
-            ON DUPLICATE KEY UPDATE provider=VALUES(provider),provider_cif=VALUES(provider_cif),service_type=VALUES(service_type),
+            provider,raw_supplier_name,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,confidence,final_filename,output_path,status,
+            extraction_json,decision_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+            ON DUPLICATE KEY UPDATE provider=VALUES(provider),raw_supplier_name=VALUES(raw_supplier_name),provider_cif=VALUES(provider_cif),service_type=VALUES(service_type),
             supply_address=VALUES(supply_address),amount=VALUES(amount),currency=VALUES(currency),invoice_date=VALUES(invoice_date),
             invoice_number=VALUES(invoice_number),community_id=VALUES(community_id),confidence=VALUES(confidence),final_filename=VALUES(final_filename),
             output_path=VALUES(output_path),status=VALUES(status),extraction_json=VALUES(extraction_json),decision_json=VALUES(decision_json),
             error_message=VALUES(error_message),extractor_version=VALUES(extractor_version),drive_file_id=VALUES(drive_file_id),drive_path=VALUES(drive_path),drive_status=VALUES(drive_status),processed_at=NOW()", [
             $mailbox['id'],$client->uidValidity(),$uid,$attachment['original_filename'],$attachment['sha256'],$attachment['mime_type'],$attachment['size'],
-            $data['proveedor']??$data['provider']??null,$data['proveedor_cif']??$data['provider_cif']??null,$data['tipo_servicio']??$data['service_type']??null,
+            $data['proveedor']??$data['provider']??null,$data['raw_supplier_name']??null,$data['proveedor_cif']??$data['provider_cif']??null,$data['tipo_servicio']??$data['service_type']??null,
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
             $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,

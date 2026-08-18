@@ -12,6 +12,7 @@ final class Schema
         $database->pdo()->exec($sql);
         self::column($database,'communities','external_code','VARCHAR(20) NULL AFTER id');
         self::column($database,'communities','drive_folder_id','VARCHAR(190) NULL AFTER imap_folder_name');
+        self::column($database,'processed_attachments','raw_supplier_name','VARCHAR(255) NULL AFTER provider');
         self::column($database,'processed_attachments','drive_file_id','VARCHAR(190) NULL AFTER extractor_version');
         self::column($database,'processed_attachments','drive_path','VARCHAR(1000) NULL AFTER drive_file_id');
         self::column($database,'processed_attachments','drive_status','VARCHAR(50) NULL AFTER drive_path');

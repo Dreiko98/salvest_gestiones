@@ -141,6 +141,13 @@ $test('explorador Drive: carpeta que solo contiene PDFs no dice "no hay subcarpe
 $test('explorador Drive: carpeta realmente vacía',static function()use($assert):void{
     $assert(Salvest\DriveTree::renderNodes([],3)==='<div class="folder-empty">Carpeta vacía.</div>');
 });
+$test('explorador Drive: los nombres largos llevan una envoltura truncable, no texto suelto',static function()use($assert):void{
+    $longName='2026-08-17_IBERDROLA-COMERCIALIZACION-DE-ULTIMO-RECURSO_FRA-2026-00123456.pdf';
+    $html=Salvest\DriveTree::fileNode($longName,null);
+    $assert(str_contains($html,'<span class="node-name" title="'.$longName.'">'.$longName.'</span>'),'el nombre debe ir en un span truncable con el nombre completo en title');
+    $folderHtml=Salvest\DriveTree::folderNode('f1','Comunidad con un nombre muy muy muy largo',2);
+    $assert(str_contains($folderHtml,'<span class="node-name" title="Comunidad con un nombre muy muy muy largo">'),'las carpetas también deben usar la envoltura truncable');
+});
 $test('explorador Drive: raíz sin comunidades',static function()use($assert):void{
     $assert(str_contains(Salvest\DriveTree::renderRoot([]),'No hay carpetas de comunidad'));
 });

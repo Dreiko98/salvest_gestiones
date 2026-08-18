@@ -55,18 +55,24 @@ final class DriveTree
     {
         $level = max(1, min(5, $level));
         return '<details class="folder-node level-'.$level.'" data-folder-id="'.self::e($id).'" data-level="'.$level.'">'
-            .'<summary><span class="folder-icon"></span>'.self::e($name).'</summary>'
+            .'<summary><span class="folder-icon"></span>'.self::name($name).'</summary>'
             .'<div class="folder-children" data-folder-children><div class="folder-loading">Cargando...</div></div>'
             .'</details>';
     }
 
     public static function fileNode(string $name, ?string $webViewLink): string
     {
-        $label = '<span class="file-icon"></span>'.self::e($name);
+        $label = '<span class="file-icon"></span>'.self::name($name);
         $content = $webViewLink !== null && $webViewLink !== ''
             ? '<a href="'.self::e($webViewLink).'" target="_blank" rel="noopener noreferrer">'.$label.'</a>'
             : '<span>'.$label.'</span>';
         return '<div class="folder-leaf">'.$content.'</div>';
+    }
+
+    /** Truncated, title-tooltipped label so long invoice filenames never overflow the card. */
+    private static function name(string $value): string
+    {
+        return '<span class="node-name" title="'.self::e($value).'">'.self::e($value).'</span>';
     }
 
     private static function stringOrNull(mixed $value): ?string

@@ -346,7 +346,8 @@ final class WebApp
             // A supplier is only ever a confirmed row from suppliers — never OpenAI's raw text.
             // Show them as two clearly distinct facts, not one field pretending to be the other.
             $cards.='<article class="card review-card"><div class="review-head"><div><span class="badge warning">Pendiente de revisión</span><h2>'.$this->e($row['original_filename']).'</h2></div>'.($row['output_path']?'<a class="button button-secondary" href="/?route=download&id='.$row['id'].'">Descargar PDF</a>':'').'</div><div class="review-meta"><span>Proveedor resuelto<strong>'.($row['provider']?$this->e($row['provider']):'Pendiente').'</strong></span><span>Texto detectado<strong>'.$this->e($row['raw_supplier_name']?:'Desconocido').'</strong></span><span>Comunidad sugerida<strong>'.$this->e($row['official_name']?:'Sin asignar').'</strong></span><span>Importe<strong class="mono">'.($row['amount']!==null?$this->e($row['amount']).' €':'—').'</strong></span><span>N.º factura<strong class="mono">'.$this->e($row['invoice_number']?:'—').'</strong></span></div><p class="review-reason">'.$this->e($row['error_message']?:'Comprueba los datos antes de archivar la factura.').'</p>'.
-                '<form method="post" action="/?route=reviews" class="grid review-form"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$row['id'].'"><label>Comunidad<select name="community_id" required><option value="">Seleccionar</option>'.$communityOptions.'</select></label><label>Proveedor<select name="supplier_id" required><option value="">Seleccionar</option>'.$supplierOptions.'</select></label><label>Servicio<select name="service_type" required>'.$serviceOptions.'</select></label><label>Fecha<input type="date" name="invoice_date" value="'.$this->e($row['invoice_date']).'" required></label><label>Importe<input class="mono" name="amount" value="'.$this->e($row['amount']).'"></label><label>Número de factura<input class="mono" name="invoice_number" value="'.$this->e($row['invoice_number']).'"></label><button>Confirmar y archivar</button></form></article>';
+                '<form method="post" action="/?route=reviews" class="grid review-form"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$row['id'].'"><label>Comunidad<select name="community_id" required><option value="">Seleccionar</option>'.$communityOptions.'</select></label><label>Proveedor<select name="supplier_id" required><option value="">Seleccionar</option>'.$supplierOptions.'</select></label><label>Servicio<select name="service_type" required>'.$serviceOptions.'</select></label><label>Fecha<input type="date" name="invoice_date" value="'.$this->e($row['invoice_date']).'" required></label><label>Importe<input class="mono" name="amount" value="'.$this->e($row['amount']).'"></label><label>Número de factura<input class="mono" name="invoice_number" value="'.$this->e($row['invoice_number']).'"></label><button>Confirmar y archivar</button></form>'.
+                $this->technicalDetail($row['debug_trace_json']??null).'</article>';
         }
         $empty='<section class="card empty-state review-empty"><span class="empty-ring"><i></i></span><h2>No hay facturas pendientes de revisar</h2><p>Las nuevas incidencias aparecerán aquí cuando necesiten una decisión.</p></section>';
         $this->page('Revisar','<div class="page-heading"><div><span class="eyebrow">Control manual</span><h1>Revisar facturas</h1><p>Confirma únicamente los documentos que el sistema no ha podido clasificar.</p></div>'.($rows?'<span class="count-badge warning">'.count($rows).' pendientes</span>':'').'</div>'.($cards!==''?'<div class="review-list">'.$cards.'</div>':$empty));
@@ -390,6 +391,53 @@ final class WebApp
         echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="app-page">'.$mobile.'<div class="app-shell">'.$sidebar.'<main class="main-content">'.$body.'</main></div></body></html>';
     }
     private function e(mixed $value): string{return htmlspecialchars((string)$value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');}
+
+    /** Renders processed_attachments.debug_trace_json (a chronological array of {timestamp,step,data},
+     * see ReviewTrace) as a closed-by-default <details> block under a review card: one human-readable
+     * summary line per step, each with its own nested "JSON completo" for the full technical payload.
+     * NULL/unreadable trace (old rows from before this feature, or a row that never went through
+     * needs_review) renders a plain explanatory sentence instead — never an error. */
+    private function technicalDetail(?string $traceJson): string
+    {
+        $unavailable='<details class="tech-trace"><summary>Detalle técnico</summary><p class="muted">No hay detalle técnico disponible para esta factura.</p></details>';
+        if($traceJson===null||$traceJson==='')return $unavailable;
+        $steps=json_decode($traceJson,true);
+        if(!is_array($steps)||!$steps)return $unavailable;
+        $labels=['document'=>'Documento recibido','openai_request'=>'1ª llamada OpenAI','openai_response'=>'Respuesta OpenAI',
+            'community_resolution'=>'Resolución de comunidad','supplier_resolution'=>'Resolución de proveedor',
+            'service_resolution'=>'Resolución de servicio','restricted_openai'=>'2ª llamada OpenAI (restringida)',
+            'final_decision'=>'Decisión final'];
+        $items='';
+        foreach($steps as $step){
+            if(!is_array($step))continue;
+            $kind=(string)($step['step']??'');
+            $data=is_array($step['data']??null)?$step['data']:[];
+            $label=$labels[$kind]??($kind!==''?$kind:'Paso');
+            $json=json_encode($step['data']??null,JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT|JSON_PARTIAL_OUTPUT_ON_ERROR);
+            $items.='<details class="tech-step"><summary><span class="tech-step-time mono">'.$this->e((string)($step['timestamp']??'')).'</span> · '.$this->e($label).'</summary>'.
+                '<p class="tech-step-summary">'.$this->technicalStepSummary($kind,$data).'</p>'.
+                '<details class="tech-step-json"><summary>JSON completo</summary><pre class="mono">'.$this->e((string)$json).'</pre></details></details>';
+        }
+        return '<details class="tech-trace"><summary>Detalle técnico</summary><div class="tech-steps">'.$items.'</div></details>';
+    }
+
+    /** @param array<string,mixed> $data */
+    private function technicalStepSummary(string $kind,array $data):string
+    {
+        $v=fn(mixed $value):string=>$this->e($value===null||$value===''?'—':$value);
+        $evidence=fn(?array $ev):string=>$ev?$this->e(($ev['field']??'').'/'.($ev['type']??'')):'—';
+        return match($kind){
+            'document'=>$v($data['filename']??null).' · '.$v($data['mime']??null).' · '.$v($data['size_bytes']??null).' bytes',
+            'openai_request'=>'modelo='.$v($data['model']??null).', reasoning='.$v($data['reasoning']??null),
+            'openai_response'=>$v($data['latency_ms']??null).' ms · '.$v($data['input_tokens']??null).' in / '.$v($data['output_tokens']??null).' out tokens',
+            'community_resolution'=>$v($data['official_name']??'sin resolver').' ('.$evidence($data['evidence']??null).')',
+            'supplier_resolution'=>$v($data['supplier_name']??'sin resolver').' ('.$evidence($data['evidence']??null).'), ambiguo='.(($data['ambiguous']??false)?'sí':'no'),
+            'service_resolution'=>$v($data['final_service']??null).' ('.$evidence($data['evidence']??null).')',
+            'restricted_openai'=>'supplier_id devuelto='.$v($data['chosen_supplier_id']??null).', validado='.(($data['validated']??false)?'sí':'no'),
+            'final_decision'=>$v($data['status']??null).(!empty($data['reason'])?' — '.$v($data['reason']):''),
+            default=>'',
+        };
+    }
     private function disclosurePanel(string $label,string $content,bool $open):string
     {
         $id='panel-'.bin2hex(random_bytes(5));

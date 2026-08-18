@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS processed_attachments (
   status VARCHAR(50) NOT NULL,
   extraction_json JSON NULL,
   decision_json JSON NULL,
+  debug_trace_json JSON NULL,
   error_message TEXT NULL,
   extractor_version VARCHAR(100) NULL,
   drive_file_id VARCHAR(190) NULL,

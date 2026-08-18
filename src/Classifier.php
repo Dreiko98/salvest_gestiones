@@ -18,13 +18,19 @@ final class Classifier
      * identifier exact (CUPS/contract/customer reference) -> fuzzy name/address
      * (OpenAI's nombre_comunidad/direccion only ever feed this fuzzy step — they are
      * never trusted directly).
-     * @param array<string,mixed> $invoice @return array{community:?array,confidence:float,evidence:array}
+     * @param array<string,mixed> $invoice
+     * @param (callable(string,string,array<string,mixed>):void)|null $trace Observer for
+     *   /Revisar's "Detalle técnico" trace, invoked as ($tier, outcome, details) at every tier
+     *   boundary. Never affects control flow — passing null (every caller except Worker) costs
+     *   nothing extra.
+     * @return array{community:?array,confidence:float,evidence:array}
      */
-    public function classify(array $invoice, string $context = ''): array
+    public function classify(array $invoice, string $context = '', ?callable $trace = null): array
     {
         $code=CommunityCsvImporter::codeOrEmpty((string)($invoice['codigo_comunidad']??''));
         if($code!==''){
             $row=$this->db->one('SELECT * FROM communities WHERE external_code=? AND active=1',[$code]);
+            if($trace)$trace('codigo_comunidad',$row?'match':'none',['codigo'=>$code]);
             if($row)return['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>'codigo_comunidad','type'=>'exact']];
         }
         // Holder/customer CIF — never the supplier's CIF — checked before contractual
@@ -34,6 +40,7 @@ final class Classifier
         $holderCif = Text::normalizeIdentifier((string)($invoice['comunidad_cif'] ?? ''));
         if ($holderCif !== '') {
             $row = $this->matchByNormalizedCif($holderCif);
+            if($trace)$trace('holder_cif',$row?'match':'none',['cif_extraido'=>(string)($invoice['comunidad_cif']??''),'cif_normalizado'=>$holderCif]);
             if ($row) return ['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>'holder_cif','type'=>'exact']];
         }
         foreach (['cups'=>'cups','numero_contrato'=>'contract','referencia_cliente'=>'customer_reference'] as $field => $type) {
@@ -41,6 +48,7 @@ final class Classifier
             if ($value === '') continue;
             $row = $this->db->one("SELECT c.* FROM community_identifiers i JOIN communities c ON c.id=i.community_id
                 WHERE i.identifier_type=? AND i.normalized_value=? AND i.active=1 AND c.active=1", [$type, $value]);
+            if($trace)$trace('community_identifier',$row?'match':'none',['field'=>$field,'type'=>$type,'value'=>$value]);
             if ($row) return ['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>$field,'type'=>'exact']];
         }
         $communities = $this->db->all('SELECT * FROM communities WHERE active=1');
@@ -56,9 +64,11 @@ final class Classifier
         foreach ($candidates as $candidate) {
             foreach ($queries[$candidate['kind']] as $query) {
                 $score = Text::similarity($query, (string)$candidate['value']);
+                if ($trace && $score > 0.0) $trace('community_fuzzy','candidate',['comunidad'=>$candidate['community']['official_name']??null,'kind'=>$candidate['kind'],'score'=>$score]);
                 if ($score > $bestScore) { $best = $candidate['community']; $bestScore = $score; }
             }
         }
+        if($trace)$trace('community_fuzzy',$bestScore>=$this->threshold?'match':'none',['best'=>$best['official_name']??null,'score'=>$bestScore,'threshold'=>$this->threshold]);
         return ['community'=>$bestScore >= $this->threshold ? $best : null,'confidence'=>$bestScore,
             'evidence'=>['field'=>'address','type'=>'fuzzy','score'=>$bestScore / 100]];
     }
@@ -141,22 +151,29 @@ final class Classifier
             WHERE cs.community_id=? AND cs.supplier_id=? AND s.active=1', [$communityId, $supplierId]);
     }
 
-    public function resolveSupplierInCommunity(int $communityId, array $invoice, string $sender): array
+    /** @param (callable(string,string,array<string,mixed>):void)|null $trace Same contract as
+     * classify()'s $trace — a pure observer for /Revisar's technical trace, never influencing
+     * which branch is taken. */
+    public function resolveSupplierInCommunity(int $communityId, array $invoice, string $sender, ?callable $trace = null): array
     {
         $rows = $this->db->all('SELECT cs.category,cs.contract_reference,s.*,st.name service_type_name FROM community_suppliers cs
             JOIN suppliers s ON s.id=cs.supplier_id LEFT JOIN service_types st ON st.id=s.main_service_type_id WHERE cs.community_id=? AND s.active=1', [$communityId]);
         $none = ['supplier'=>null,'evidence'=>null,'ambiguous'=>false];
+        if($trace)$trace('supplier_candidates','listed',['community_id'=>$communityId,'proveedores'=>array_map(
+            static fn(array $r):array=>['id'=>(int)$r['id'],'nombre'=>$r['official_name'],'cif'=>$r['cif'],'servicio'=>$r['service_type_name'],'categoria'=>$r['category']], $rows)]);
         if (!$rows) return $none;
 
         $cifIdentifier = Text::normalizeIdentifier((string)($invoice['proveedor_cif'] ?? ''));
         if ($cifIdentifier !== '') {
             $found = self::uniqueMatch($rows, static fn(array $r): bool => (string)($r['cif'] ?? '') !== '' && Text::normalizeIdentifier((string)$r['cif']) === $cifIdentifier);
+            if($trace)$trace('supplier_cif',$found===false?'ambiguous':($found?'match':'none'),['cif_normalizado'=>$cifIdentifier]);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'supplier_cif','type'=>'exact'],'ambiguous'=>false];
         }
 
         $providerName = Text::normalizeCompanyName((string)($invoice['proveedor'] ?? ''));
         if ($providerName !== '') {
             $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::normalizeCompanyName((string)$r['official_name']) === $providerName);
+            if($trace)$trace('supplier_exact_name',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'exact_name'],'ambiguous'=>false];
         }
 
@@ -171,18 +188,21 @@ final class Classifier
             foreach ($aliases as $alias) {
                 if (in_array((string)$alias['normalized_value'], $candidateValues, true)) $matchedIds[(int)$alias['supplier_id']] = true;
             }
+            if($trace)$trace('supplier_alias',count($matchedIds)>1?'ambiguous':(count($matchedIds)===1?'match':'none'),['candidatos'=>array_values($candidateValues)]);
             if (count($matchedIds) > 1) return ['supplier'=>null,'evidence'=>null,'ambiguous'=>true];
             if (count($matchedIds) === 1) {
                 $id = array_key_first($matchedIds);
                 foreach ($rows as $row) if ((int)$row['id'] === $id) return ['supplier'=>$row,'evidence'=>['field'=>'alias','type'=>'exact'],'ambiguous'=>false];
             }
-        }
+        } elseif ($trace) { $trace('supplier_alias','skipped',[]); }
 
         if ($providerName !== '') {
             $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::containsWholeWords($providerName, Text::normalizeCompanyName((string)$r['official_name'])));
+            if($trace)$trace('supplier_containment',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'name_containment'],'ambiguous'=>false];
 
             $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::containsAllWords($providerName, Text::normalizeCompanyName((string)$r['official_name'])));
+            if($trace)$trace('supplier_token',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'token_match'],'ambiguous'=>false];
         }
 
@@ -190,12 +210,15 @@ final class Classifier
         foreach ($rows as $row) {
             $name = (string)$row['normalized_name'];
             $score = max($providerName !== '' ? Text::similarity($providerName, $name) : 0.0, $domain !== '' ? Text::similarity($domain, $name) : 0.0);
+            if ($trace && $score > 0.0) $trace('supplier_fuzzy','candidate',['proveedor'=>$row['official_name'],'score'=>$score]);
             if ($score > $bestScore) { $bestScore = $score; $best = $row; $tied = 1; }
             elseif ($score === $bestScore && $score > 0.0) { $tied++; }
         }
         if ($bestScore >= $this->threshold) {
+            if($trace)$trace('supplier_fuzzy',$tied>1?'ambiguous':'match',['best'=>$best['official_name']??null,'score'=>$bestScore]);
             return $tied > 1 ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$best,'evidence'=>['field'=>'proveedor','type'=>'fuzzy'],'ambiguous'=>false];
         }
+        if($trace)$trace('supplier_fuzzy','none',['best'=>$best['official_name']??null,'score'=>$bestScore,'threshold'=>$this->threshold]);
 
         // Last resort, only once every name/alias/CIF/domain tier above has failed to find
         // even a single candidate: if community_id + service are both known, the master data
@@ -212,6 +235,7 @@ final class Classifier
                 (!empty($r['service_type_name']) && Text::normalize((string)$r['service_type_name']) === $serviceHint)
                 || (!empty($r['category']) && Text::normalize((string)$r['category']) === $serviceHint)
             ));
+            if($trace)$trace('supplier_community_service',count($compatible)===1?'match':(count($compatible)>1?'ambiguous_skipped':'none'),['service_hint'=>$serviceHint,'compatibles'=>count($compatible)]);
             if (count($compatible) === 1) {
                 return ['supplier'=>$compatible[0],'evidence'=>['field'=>'community_service','type'=>'community_service_unique_supplier'],'ambiguous'=>false];
             }

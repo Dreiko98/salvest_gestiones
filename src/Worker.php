@@ -172,7 +172,10 @@ final class Worker
     {
         $prior = $this->db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate') ORDER BY id LIMIT 1",[$attachment['sha256']]);
         if ($prior) {
-            $this->insertAttachment($mailbox,$client,$uid,$attachment,'duplicate',$prior);
+            // A 'duplicate' row never keeps a technical trace of its own, even if the original
+            // it points to was needs_review and had one — the trace is only ever meaningful for
+            // the specific attachment a human is about to open and debug.
+            $this->insertAttachment($mailbox,$client,$uid,$attachment,'duplicate',['debug_trace_json'=>null]+$prior);
             $counts['duplicate']++;
             return ['status'=>'duplicate','community_id'=>$prior['community_id'] ? (int)$prior['community_id'] : null];
         }
@@ -183,17 +186,69 @@ final class Worker
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'downloaded',[]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'processing',[]);
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
+
+        // Built in memory regardless of outcome — cheap, no I/O of its own — and only ever
+        // persisted (in insertAttachment, below) when the attachment ends up in needs_review.
+        // A failure anywhere in ReviewTrace can never throw: see its own docblock.
+        $trace = new ReviewTrace();
+        $trace->add('document',['filename'=>$attachment['original_filename'],'mime'=>$attachment['mime_type'],'size_bytes'=>$attachment['size'],'sha256'=>$attachment['sha256']]);
+
+        $trace->add('openai_request',['model'=>$this->config['openai']['model']??null,'reasoning'=>'low']);
+        $tokensBefore=['in'=>$this->extractor->inputTokens,'out'=>$this->extractor->outputTokens];
+        $started=microtime(true);
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
+        $trace->add('openai_response',['latency_ms'=>(int)round((microtime(true)-$started)*1000),
+            'input_tokens'=>$this->extractor->inputTokens-$tokensBefore['in'],'output_tokens'=>$this->extractor->outputTokens-$tokensBefore['out'],
+            'response'=>$invoice]);
+        $openAiServiceRaw=$invoice['tipo_servicio']??null;
+
+        // Debug-only observer for Classifier's tier-by-tier reasoning — never influences the
+        // decision, see Classifier::classify()/resolveSupplierInCommunity() docblocks. Buffers
+        // into two lists (community/supplier) so each becomes one readable trace step below,
+        // instead of a dozen tiny ones.
+        $communitySignals=[];$supplierSignals=[];
+        $resolutionTrace=function(string $tier,string $outcome,array $details)use(&$communitySignals,&$supplierSignals):void{
+            $entry=['method'=>$tier,'result'=>$outcome]+$details;
+            if(str_starts_with($tier,'supplier'))$supplierSignals[]=$entry;else $communitySignals[]=$entry;
+        };
         // Second, restricted look at the *same* PDF — headers/logos/stamps included — only
         // reached when the community is known but no deterministic master-data match found a
         // supplier among that community's own suppliers. Never called otherwise, so it never
         // adds latency/cost to the common case.
-        $restrictedResolver=function(array $candidates,array $community)use($path,$attachment,$context):?int{
-            try{return $this->extractor->resolveSupplierAmongCandidates($path,(string)$attachment['mime_type'],$context,(string)$community['official_name'],$candidates);}
-            catch(\Throwable$error){error_log('restricted_openai_retry status=failed community_id='.$community['id'].' '.$error->getMessage());return null;}
+        $restrictedCalled=false;$restrictedCandidates=[];$restrictedResponse=null;$restrictedChosen=null;
+        $restrictedResolver=function(array $candidates,array $community)use($path,$attachment,$context,&$restrictedCalled,&$restrictedCandidates,&$restrictedResponse,&$restrictedChosen):?int{
+            $restrictedCalled=true;$restrictedCandidates=$candidates;
+            try{
+                $chosen=$this->extractor->resolveSupplierAmongCandidates($path,(string)$attachment['mime_type'],$context,(string)$community['official_name'],$candidates);
+                $restrictedChosen=$chosen;$restrictedResponse=['supplier_id'=>$chosen];
+                return $chosen;
+            }catch(\Throwable$error){
+                error_log('restricted_openai_retry status=failed community_id='.$community['id'].' '.$error->getMessage());
+                $restrictedResponse=['error'=>$error->getMessage()];return null;
+            }
         };
-        $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver);
+        $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver,$resolutionTrace);
         $decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
+
+        $trace->add('community_resolution',['signals'=>$communitySignals,'community_id'=>$decision['community']['id']??null,
+            'official_name'=>$decision['community']['official_name']??null,'evidence'=>$decision['evidence']]);
+        $communityCandidates=$decision['community']?$this->classifier->suppliersForCommunity((int)$decision['community']['id']):[];
+        $trace->add('supplier_resolution',['raw_supplier_name'=>$route['raw_supplier_name'],'supplier_cif'=>$invoice['proveedor_cif']??null,
+            'raw_supplier_name_normalized'=>Text::normalizeCompanyName((string)($invoice['proveedor']??'')),
+            'supplier_cif_normalized'=>Text::normalizeIdentifier((string)($invoice['proveedor_cif']??'')),
+            'community_candidates'=>$communityCandidates,'tiers'=>$supplierSignals,
+            'supplier_id'=>$supplier['id']??null,'supplier_name'=>$supplier['official_name']??null,
+            'evidence'=>$route['evidence']['supplier'],'ambiguous'=>$route['supplier_ambiguous']]);
+        $trace->add('service_resolution',['openai_service'=>$openAiServiceRaw,'suppliers_main_service_type'=>$supplier['service_type_name']??null,
+            'community_suppliers_category'=>$supplier['category']??null,'final_service'=>$route['service'],'evidence'=>$route['evidence']['service']]);
+        if($restrictedCalled){
+            $trace->add('restricted_openai',['model'=>$this->config['openai']['model']??null,'reasoning'=>'medium',
+                'candidates_sent'=>$restrictedCandidates,'response'=>$restrictedResponse,'chosen_supplier_id'=>$restrictedChosen,
+                'validated'=>($route['evidence']['supplier']['type']??null)==='restricted_openai_retry']);
+        }
+        $blockingFactor=$status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null);
+        $trace->add('final_decision',['status'=>$status,'reason'=>$route['reason'],'blocking_factor'=>$blockingFactor]);
+
         // MySQL corrects OpenAI's suggestion here: $route['service'] already went through
         // Classifier::resolveService() (supplier's configured type > community-supplier
         // relation category > OpenAI's own tipo_servicio guess, only as a last resort). And a
@@ -205,11 +260,15 @@ final class Worker
         $drive=null;
         if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$route['service'],$invoice);
         $decisionTrace=$decision+['supplier_evidence'=>$route['evidence']['supplier'],'service_evidence'=>$route['evidence']['service'],'reason'=>$route['reason']];
+        // The full technical trace is only ever worth keeping for a document a human will have to
+        // open and debug — see ReviewTrace::persistIfNeedsReview() for the null-on-anything-else
+        // and never-throws guarantees.
+        $debugTraceJson=$trace->persistIfNeedsReview($status);
         $data = array_merge($invoice,['community_id'=>$decision['community']['id'] ?? null,'confidence'=>$decision['confidence'],
             'proveedor'=>$supplier?$supplier['official_name']:null,'raw_supplier_name'=>$route['raw_supplier_name'],
             'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),
             'decision_json'=>json_encode($decisionTrace,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
-            'error_message'=>$route['reason'],
+            'error_message'=>$route['reason'],'debug_trace_json'=>$debugTraceJson,
             'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
         $counts[$status === 'needs_review' ? 'needs_review' : ($status === 'classified' ? 'classified' : 'unclassified')]++;
@@ -220,17 +279,17 @@ final class Worker
     {
         $this->db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,
             provider,raw_supplier_name,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,confidence,final_filename,output_path,status,
-            extraction_json,decision_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+            extraction_json,decision_json,debug_trace_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
             ON DUPLICATE KEY UPDATE provider=VALUES(provider),raw_supplier_name=VALUES(raw_supplier_name),provider_cif=VALUES(provider_cif),service_type=VALUES(service_type),
             supply_address=VALUES(supply_address),amount=VALUES(amount),currency=VALUES(currency),invoice_date=VALUES(invoice_date),
             invoice_number=VALUES(invoice_number),community_id=VALUES(community_id),confidence=VALUES(confidence),final_filename=VALUES(final_filename),
-            output_path=VALUES(output_path),status=VALUES(status),extraction_json=VALUES(extraction_json),decision_json=VALUES(decision_json),
+            output_path=VALUES(output_path),status=VALUES(status),extraction_json=VALUES(extraction_json),decision_json=VALUES(decision_json),debug_trace_json=VALUES(debug_trace_json),
             error_message=VALUES(error_message),extractor_version=VALUES(extractor_version),drive_file_id=VALUES(drive_file_id),drive_path=VALUES(drive_path),drive_status=VALUES(drive_status),processed_at=NOW()", [
             $mailbox['id'],$client->uidValidity(),$uid,$attachment['original_filename'],$attachment['sha256'],$attachment['mime_type'],$attachment['size'],
             $data['proveedor']??$data['provider']??null,$data['raw_supplier_name']??null,$data['proveedor_cif']??$data['provider_cif']??null,$data['tipo_servicio']??$data['service_type']??null,
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
-            $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,
+            $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,$data['debug_trace_json']??null,
             $data['error_message']??null,OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
         ]);
     }

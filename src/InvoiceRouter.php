@@ -25,22 +25,27 @@ final class InvoiceRouter
      *   (not ambiguous), and that community has at least one supplier on file. Must return one
      *   of the candidate ids or null; any other value is treated as null. Worker.php supplies a
      *   closure that makes the real second OpenAI call; tests can supply a plain function.
-     * @return array{decision:array,supplier:?array,raw_supplier_name:string,service:string,status:string,message_status:string,imap_destination:string,drive_upload:bool,reason:?string,evidence:array}
+     * @param (callable(string,string,array<string,mixed>):void)|null $trace Observer for
+     *   /Revisar's technical trace, forwarded verbatim into Classifier::classify()/
+     *   resolveSupplierInCommunity() — see their docblocks. Never affects which branch this
+     *   method takes; null (the normal case) costs nothing.
+     * @return array{decision:array,supplier:?array,raw_supplier_name:string,service:string,status:string,message_status:string,imap_destination:string,drive_upload:bool,reason:?string,evidence:array,supplier_ambiguous:bool}
      */
-    public function route(array $invoice,string $sender,string $context='',?callable $restrictedResolver=null):array
+    public function route(array $invoice,string $sender,string $context='',?callable $restrictedResolver=null,?callable $trace=null):array
     {
-        $decision=$this->classifier->classify($invoice,$context);
+        $decision=$this->classifier->classify($invoice,$context,$trace);
         $community=$decision['community'];
         $rawSupplierName=trim((string)($invoice['proveedor']??''));
 
-        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;
+        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;$supplierAmbiguous=false;
 
         if($community){
-            $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender);
+            $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender,$trace);
             $supplier=$resolved['supplier'];$supplierEvidence=$resolved['evidence'];
             if($supplier){
                 $relation=['category'=>$supplier['category'],'contract_reference'=>$supplier['contract_reference']];
             }elseif($resolved['ambiguous']){
+                $supplierAmbiguous=true;
                 $reason='Varios proveedores de esta comunidad coinciden con el nombre extraído; revisa manualmente.';
             }else{
                 if($restrictedResolver!==null){
@@ -84,6 +89,7 @@ final class InvoiceRouter
             'message_status'=>$status==='classified'?'completed':'needs_review',
             'imap_destination'=>$status==='unclassified'?'Facturas/Sin clasificar':($status==='needs_review'?'Facturas/Pendientes de revisión':''),
             'drive_upload'=>$status==='classified',
+            'supplier_ambiguous'=>$supplierAmbiguous,
         ];
     }
 }

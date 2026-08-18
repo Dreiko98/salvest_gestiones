@@ -40,7 +40,7 @@ $workerSchema=<<<SQL
 CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,process_existing_on_activate INTEGER DEFAULT 0,baseline_uidvalidity TEXT,baseline_uid INTEGER,baseline_captured_at TEXT,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
 CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
 CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,old_values_json TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
-CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,service_type TEXT,amount TEXT,invoice_number TEXT,invoice_date TEXT,original_filename TEXT,output_path TEXT,error_message TEXT);
+CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT);
 CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
@@ -885,6 +885,135 @@ $test('CIF de proveedor con guion también debe resolver contra el maestro sin g
     $assert($global['supplier']!==null && (int)$global['supplier']['id']===$fixture['supplierId'],'resolveSupplier() global también debe ignorar el guion/puntos del CIF: '.json_encode($global));
     $inCommunity=(new Salvest\Classifier($db))->resolveSupplierInCommunity($fixture['communityId'],['proveedor'=>'','proveedor_cif'=>'A-12.815601'],'facturas@otra.example');
     $assert($inCommunity['supplier']!==null && (int)$inCommunity['supplier']['id']===$fixture['supplierId'],'resolveSupplierInCommunity() también debe ignorar el guion/puntos del CIF: '.json_encode($inCommunity));
+});
+
+// ---- ReviewTrace: the in-memory, per-attachment technical trace behind /Revisar's "Detalle técnico" ----
+$test('ReviewTrace: los pasos quedan en orden cronológico real, con timestamp ISO-8601 y milisegundos',static function()use($assert):void{
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('document',['filename'=>'factura.pdf']);
+    usleep(2000);
+    $trace->add('openai_request',['model'=>'gpt-5.6-luna']);
+    $steps=$trace->toArray();
+    $assert(count($steps)===2);
+    $assert((bool)preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/',$steps[0]['timestamp']),'formato esperado 2026-08-18T16:12:03.418+02:00, dio: '.$steps[0]['timestamp']);
+    $assert($steps[0]['timestamp']<=$steps[1]['timestamp'],'los pasos deben quedar en el mismo orden cronológico en que se registraron');
+    $assert($steps[0]['step']==='document' && $steps[1]['step']==='openai_request');
+});
+$test('ReviewTrace: la respuesta completa de OpenAI se conserva íntegra, incluidos campos no usados después',static function()use($assert):void{
+    $trace=new Salvest\ReviewTrace();
+    $response=['proveedor'=>'CRISLA','tipo_servicio'=>'limpieza','direccion'=>'Calle X','importe'=>120.62,'fecha_factura'=>'2026-02-28',
+        'proveedor_cif'=>'B12534228','nombre_comunidad'=>'MENENDEZ PELAYO 10','comunidad_cif'=>'H12557229','codigo_postal'=>'46000',
+        'cups'=>null,'numero_contrato'=>null,'referencia_cliente'=>null,'numero_factura'=>'F-0486','periodo_facturacion'=>'Febrero 2026',
+        'moneda'=>'EUR','codigo_comunidad'=>null];
+    $trace->add('openai_response',['latency_ms'=>2143,'input_tokens'=>18342,'output_tokens'=>212,'response'=>$response]);
+    $stored=$trace->toArray()[0]['data']['response'];
+    foreach($response as $field=>$value)$assert(array_key_exists($field,$stored)&&$stored[$field]===$value,"el campo $field debe conservarse tal cual, aunque no se use después");
+});
+$test('ReviewTrace: candidatos y scores del nivel fuzzy se conservan, no solo el ganador',static function()use($assert):void{
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('supplier_resolution',['tiers'=>[
+        ['method'=>'supplier_cif','result'=>'none'],['method'=>'supplier_exact_name','result'=>'none'],
+        ['method'=>'supplier_fuzzy','result'=>'candidate','proveedor'=>'ADRIAN TURCU','score'=>63.2],
+        ['method'=>'supplier_fuzzy','result'=>'candidate','proveedor'=>'IBERDROLA','score'=>12.1],
+        ['method'=>'supplier_fuzzy','result'=>'none','best'=>'ADRIAN TURCU','score'=>63.2,'threshold'=>92.0],
+    ],'supplier_id'=>null]);
+    $tiers=$trace->toArray()[0]['data']['tiers'];
+    $fuzzyCandidates=array_values(array_filter($tiers,static fn(array$t):bool=>$t['method']==='supplier_fuzzy'&&$t['result']==='candidate'));
+    $assert(count($fuzzyCandidates)===2,'deben verse ambos candidatos fuzzy descartados, no solo el mejor');
+    $assert($fuzzyCandidates[0]['score']===63.2 && $fuzzyCandidates[1]['score']===12.1);
+});
+$test('ReviewTrace: redacta claves sensibles pero conserva input_tokens/output_tokens',static function()use($assert):void{
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('openai_request',['model'=>'gpt-5.6-luna','api_key'=>'sk-esto-no-debe-guardarse','password'=>'x','oauth_token'=>'y','session_id'=>'z']);
+    $trace->add('openai_response',['input_tokens'=>18342,'output_tokens'=>212]);
+    $data0=$trace->toArray()[0]['data'];$data1=$trace->toArray()[1]['data'];
+    $assert($data0['api_key']==='[redacted]' && $data0['password']==='[redacted]' && $data0['oauth_token']==='[redacted]' && $data0['session_id']==='[redacted]','password/api_key/oauth_token/session_id deben quedar redactados');
+    $assert($data0['model']==='gpt-5.6-luna','un campo funcional normal no debe verse afectado');
+    $assert($data1['input_tokens']===18342 && $data1['output_tokens']===212,'input_tokens/output_tokens son datos funcionales, no un secreto, pese a contener "token"');
+});
+$test('ReviewTrace: se persiste únicamente cuando el resultado final es needs_review',static function()use($assert):void{
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('final_decision',['status'=>'classified']);
+    $assert($trace->persistIfNeedsReview('classified')===null);
+    $assert($trace->persistIfNeedsReview('unclassified')===null);
+    $assert($trace->persistIfNeedsReview('duplicate')===null);
+    $assert($trace->persistIfNeedsReview('error')===null);
+    $json=$trace->persistIfNeedsReview('needs_review');
+    $assert(is_string($json) && json_decode($json,true)!==null,'needs_review sí debe producir el JSON del timeline');
+});
+$test('ReviewTrace: un dato interno problemático (p.ej. UTF-8 inválido) nunca lanza una excepción que interrumpa el procesamiento',static function()use($assert):void{
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('document',['filename'=>"factura-\xB1\x31-invalida.pdf"]); // bytes UTF-8 inválidos a propósito
+    try{
+        $result=$trace->persistIfNeedsReview('needs_review');
+        $assert($result===null||is_string($result),'debe degradar con seguridad (null, o JSON parcial) en vez de lanzar');
+    }catch(\Throwable $error){
+        $assert(false,'persistIfNeedsReview() nunca debe dejar escapar una excepción — rompería el procesamiento real de la factura: '.$error->getMessage());
+    }
+});
+
+// ---- InvoiceRouter/Classifier: el observador $trace no cambia ninguna decisión ----
+$test('InvoiceRouter::route($trace): la señal community_service_unique_supplier se observa en el trace sin cambiar la decisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'82','MENENDEZ YPELAYO 10','CRISLA','LIMPIEZA',null,'H12557229');
+    $invoice=['proveedor'=>'Servicios Generales de Mantenimiento Ibérica','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
+    $signals=[];
+    $trace=function(string $tier,string $outcome,array $details)use(&$signals):void{$signals[]=[$tier,$outcome];};
+    $withTrace=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example','',null,$trace);
+    $withoutTrace=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
+    $assert($withTrace['status']===$withoutTrace['status'] && $withTrace['status']==='classified','pasar un $trace no debe cambiar la decisión: '.json_encode($withTrace));
+    $assert((int)$withTrace['supplier']['id']===(int)$withoutTrace['supplier']['id']);
+    $assert(in_array(['supplier_community_service','match'],$signals,true),'debe observarse la señal comunidad+servicio actuando: '.json_encode($signals));
+});
+$test('InvoiceRouter::route(): supplier_ambiguous=true cuando hay varios proveedores igualmente plausibles',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['28','CP VEINTIOCHO',Salvest\Text::normalize('CP VEINTIOCHO'),'Z28000000','Calle 28','46028','Valencia','28 - CP VEINTIOCHO']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',['MANTENIMIENTO',Salvest\Text::normalize('MANTENIMIENTO')]);
+    $serviceTypeId=(int)$db->pdo()->lastInsertId();
+    foreach(['PROVEEDOR ALFA','PROVEEDOR BETA'] as $name){
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,NULL,?,1)',[$name,Salvest\Text::normalize($name),$serviceTypeId]);
+        $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'MANTENIMIENTO']);
+    }
+    $invoice=['proveedor'=>'PROVEEDOR ALFA PROVEEDOR BETA','proveedor_cif'=>null,'comunidad_cif'=>'Z28000000','tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@ambiguo.example');
+    $assert($route['supplier_ambiguous']===true,'el nuevo campo debe reflejar la ambigüedad real: '.json_encode($route));
+});
+$test('InvoiceRouter::route(): supplier_ambiguous=false en un caso normal correctamente clasificado',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'23','PK ILLES BALEARS 23','IBERDROLA','ELECTRICIDAD');
+    $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $assert($route['status']==='classified' && $route['supplier_ambiguous']===false);
+});
+
+// ---- WebApp /Revisar: renderizado del detalle técnico ----
+$test('/Revisar: una factura needs_review con debug_trace_json muestra el detalle técnico, cerrado por defecto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO communities(official_name,active) VALUES (?,1)',['MENENDEZ YPELAYO 10']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $trace=new Salvest\ReviewTrace();
+    $trace->add('document',['filename'=>'F-0486_CRISLA.pdf','mime'=>'application/pdf','size_bytes'=>184320,'sha256'=>str_repeat('a',64)]);
+    $trace->add('final_decision',['status'=>'needs_review','reason'=>'Proveedor no resuelto']);
+    $json=$trace->persistIfNeedsReview('needs_review');
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,community_id,provider,raw_supplier_name,service_type,original_filename,debug_trace_json) VALUES (?,?,?,NULL,?,?,?,?)',
+        ['needs_review',date('Y-m-d H:i:s'),$communityId,'LIMPIEZAS ADRIAN','limpieza','F-0486_CRISLA.pdf',$json]);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'Detalle técnico'),'debe aparecer la sección de detalle técnico');
+    $assert(str_contains($html,'F-0486_CRISLA.pdf'),'el contenido del paso "document" debe verse en el resumen o el JSON');
+    $assert(str_contains($html,'<details class="tech-trace">'),'el detalle técnico debe estar cerrado por defecto (sin atributo open)');
+    $assert(!str_contains($html,'<details class="tech-trace" open'),'nunca debe abrirse automáticamente');
+});
+$test('/Revisar: una factura needs_review antigua sin debug_trace_json (NULL) sigue renderizando con normalidad',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO communities(official_name,active) VALUES (?,1)',['CP HISTORICA']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,community_id,provider,raw_supplier_name,service_type,original_filename,debug_trace_json) VALUES (?,?,?,NULL,?,?,?,NULL)',
+        ['needs_review',date('Y-m-d H:i:s'),$communityId,'PROVEEDOR ANTIGUO','desconocido','factura-antigua.pdf']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'factura-antigua.pdf'),'la tarjeta debe seguir renderizándose con normalidad');
+    $assert(str_contains($html,'No hay detalle técnico disponible para esta factura.'),'una factura antigua sin traza debe mostrar el mensaje explicativo, no un error');
 });
 
 $failed=0;

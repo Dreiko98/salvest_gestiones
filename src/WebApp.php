@@ -28,6 +28,7 @@ final class WebApp
                 $path === 'mailboxes' => $this->mailboxes(),
                 $path === 'reviews' => $this->reviews(),
                 $path === 'storage' => $this->storage(),
+                $path === 'storage-children' => $this->storageChildren(),
                 $path === 'download' => $this->download((int)($_GET['id'] ?? 0)),
                 str_starts_with($path,'download/') => $this->download((int)basename($path)),
                 default => $this->notFound(),
@@ -85,12 +86,27 @@ final class WebApp
         }
         $edit=isset($_GET['edit'])?$this->db->one('SELECT * FROM communities WHERE id=?',[(int)$_GET['edit']]):null;
         $rows=$this->db->all('SELECT * FROM communities ORDER BY active DESC,official_name'); $table='';
-        foreach($rows as $row){$initial=mb_strtoupper(mb_substr(trim((string)$row['official_name']),0,1));$table.='<tr><td class="mono code-cell">'.$this->e($row['external_code']?:'—').'</td><td><div class="entity"><span class="entity-mark'.($row['active']?'':' inactive').'">'.$this->e($initial).'<i></i></span><strong>'.$this->e($row['official_name']).'</strong></div></td><td class="secondary">'.$this->e($row['main_address']).'</td><td><span class="badge '.($row['active']?'success':'neutral').'">'.($row['active']?'Activa':'Desactivada').'</span></td><td class="actions"><a href="/?route=communities&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=communities"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('communities',(int)$row['id'],'la comunidad «'.(string)$row['official_name'].'»').'</td></tr>';}
+        foreach($rows as $row){
+            $initial=mb_strtoupper(mb_substr(trim((string)$row['official_name']),0,1));
+            $detailId='community-detail-'.$row['id'];
+            $entity='<div class="entity"><span class="entity-mark'.($row['active']?'':' inactive').'">'.$this->e($initial).'<i></i></span><strong>'.$this->e($row['official_name']).'</strong></div>';
+            $table.='<tr class="row-summary"><td class="mono code-cell">'.RowDetail::toggle($detailId,$this->e($row['external_code']?:'—')).'</td><td>'.$entity.'</td><td class="secondary">'.$this->e($row['main_address']).'</td><td><span class="badge '.($row['active']?'success':'neutral').'">'.($row['active']?'Activa':'Desactivada').'</span></td><td class="actions"><a href="/?route=communities&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=communities"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('communities',(int)$row['id'],'la comunidad «'.(string)$row['official_name'].'»').'</td></tr>';
+            $table.=RowDetail::row($detailId,[
+                ['Código',(string)($row['external_code']??'')],
+                ['Nombre oficial',(string)($row['official_name']??'')],
+                ['CIF',(string)($row['cif']??'')],
+                ['Dirección principal',(string)($row['main_address']??'')],
+                ['Código postal',(string)($row['postal_code']??'')],
+                ['Ciudad',(string)($row['city']??'')],
+                ['Estado',$row['active']?'Activa':'Desactivada'],
+            ],5);
+        }
         $addressAliases=$edit?$this->relatedText('community_aliases','community_id',(int)$edit['id']):'';
         $identifiers=$edit?$this->identifierText((int)$edit['id']):'';
-        $form='<form method="post" action="/?route=communities" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><div class="form-heading wide"><span class="eyebrow">Datos de clasificación</span><h2>'.($edit?'Editar comunidad':'Añadir comunidad').'</h2></div><label>Código<input class="mono" name="external_code" value="'.$this->e($edit['external_code']??'').'" required></label><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input class="mono" name="cif" value="'.$this->e($edit['cif']??'').'"></label><label class="wide">Dirección principal<input name="main_address" value="'.$this->e($edit['main_address']??'').'" required></label><label>Código postal<input class="mono" name="postal_code" value="'.$this->e($edit['postal_code']??'').'"></label><label>Ciudad<input name="city" value="'.$this->e($edit['city']??'').'"></label><label class="wide">Otras direcciones conocidas<textarea name="address_aliases" rows="3" placeholder="Una dirección por línea">'.$this->e($addressAliases).'</textarea><small>Opcional. Ayuda a reconocer formatos distintos de la misma dirección.</small></label><label class="wide">Identificadores de contrato<textarea class="mono" name="identifiers" rows="3" placeholder="cups: ES...&#10;contract: 12345">'.$this->e($identifiers).'</textarea><small>Opcional. Formato tipo: valor. Tipos permitidos: cups, contract, customer_reference.</small></label><button>Guardar cambios</button></form>';
+        $form='<form method="post" action="/?route=communities" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><input type="hidden" name="address_aliases" value="'.$this->e($addressAliases).'"><input type="hidden" name="identifiers" value="'.$this->e($identifiers).'"><div class="form-heading wide"><span class="eyebrow">Datos de clasificación</span><h2>'.($edit?'Editar comunidad':'Nueva comunidad').'</h2></div><label>Código<input class="mono" name="external_code" value="'.$this->e($edit['external_code']??'').'" required></label><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input class="mono" name="cif" value="'.$this->e($edit['cif']??'').'"></label><label class="wide">Dirección principal<input name="main_address" value="'.$this->e($edit['main_address']??'').'" required></label><label>Código postal<input class="mono" name="postal_code" value="'.$this->e($edit['postal_code']??'').'"></label><label>Ciudad<input name="city" value="'.$this->e($edit['city']??'').'"></label><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=communities">Cancelar</a></div></form>';
         $list=$table!==''?'<div class="table-wrap"><table><thead><tr><th>Código</th><th>Comunidad</th><th>Dirección</th><th>Estado</th><th><span class="sr-only">Acciones</span></th></tr></thead><tbody>'.$table.'</tbody></table></div>':'<section class="empty-state"><span class="empty-ring"><i></i></span><h2>Todavía no hay comunidades</h2><p>Añade la primera para empezar a clasificar facturas.</p></section>';
-        $this->page('Comunidades','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Comunidades</h1><p>Gestiona los datos que utiliza el sistema para clasificar cada factura.</p></div><span class="count-badge">'.count($rows).' registradas</span></div>'.$form.'<section class="card list-card"><div class="section-heading"><h2>Listado de comunidades</h2></div>'.$list.'</section>');
+        $panel=$this->disclosurePanel($edit?'+ Editar comunidad':'+ Nueva comunidad',$form,(bool)$edit);
+        $this->page('Comunidades','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Comunidades</h1><p>Consulta las comunidades dadas de alta y modifica solo cuando haga falta.</p></div><span class="count-badge">'.count($rows).' registradas</span></div>'.$panel.'<section class="card list-card">'.$list.'</section>');
     }
 
     private function suppliers(): void
@@ -108,11 +124,21 @@ final class WebApp
         }
         $edit=isset($_GET['edit'])?$this->db->one('SELECT * FROM suppliers WHERE id=?',[(int)$_GET['edit']]):null;
         $services=$this->db->all('SELECT * FROM service_types WHERE active=1 ORDER BY name'); $options=''; foreach($services as $service)$options.='<option value="'.$service['id'].'"'.((int)($edit['main_service_type_id']??0)===(int)$service['id']?' selected':'').'>'.$this->e($service['name']).'</option>';
-        $rows=$this->db->all('SELECT s.*,st.name service FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id ORDER BY s.active DESC,s.official_name'); $table=''; foreach($rows as $row)$table.='<tr><td><strong>'.$this->e($row['official_name']).'</strong></td><td class="mono">'.$this->e($row['cif']?:'—').'</td><td><span class="badge neutral">'.$this->e($row['service']?:'Sin asignar').'</span></td><td><span class="badge '.($row['active']?'success':'neutral').'">'.($row['active']?'Activo':'Desactivado').'</span></td><td class="actions"><a href="/?route=suppliers&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=suppliers"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('suppliers',(int)$row['id'],'el proveedor «'.(string)$row['official_name'].'»').'</td></tr>';
+        $rows=$this->db->all('SELECT s.*,st.name service FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id ORDER BY s.active DESC,s.official_name'); $table='';
+        foreach($rows as $row){
+            $detailId='supplier-detail-'.$row['id'];
+            $table.='<tr class="row-summary"><td>'.RowDetail::toggle($detailId,'<strong>'.$this->e($row['official_name']).'</strong>').'</td><td><span class="badge neutral">'.$this->e($row['service']?:'Sin asignar').'</span></td><td><span class="badge '.($row['active']?'success':'neutral').'">'.($row['active']?'Activo':'Desactivado').'</span></td><td class="actions"><a href="/?route=suppliers&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=suppliers"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('suppliers',(int)$row['id'],'el proveedor «'.(string)$row['official_name'].'»').'</td></tr>';
+            $table.=RowDetail::row($detailId,[
+                ['Nombre oficial',(string)($row['official_name']??'')],
+                ['Servicio',(string)($row['service']??'Sin asignar')],
+                ['Estado',$row['active']?'Activo':'Desactivado'],
+            ],4);
+        }
         $aliases=$edit?$this->relatedText('supplier_aliases','supplier_id',(int)$edit['id']):'';
-        $form='<form method="post" action="/?route=suppliers" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><div class="form-heading wide"><span class="eyebrow">Directorio</span><h2>'.($edit?'Editar proveedor':'Añadir proveedor').'</h2></div><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>CIF<input class="mono" name="cif" value="'.$this->e($edit['cif']??'').'"></label><label>Servicio<select name="service_id" required><option value="">Seleccionar</option>'.$options.'</select></label><label class="wide">Otros nombres o dominios conocidos<textarea name="aliases" rows="3" placeholder="Un nombre o dominio por línea">'.$this->e($aliases).'</textarea><small>Opcional. Por ejemplo: comercial@proveedor.es o proveedor.es.</small></label><button>Guardar cambios</button></form>';
-        $list=$table!==''?'<div class="table-wrap"><table><thead><tr><th>Proveedor</th><th>CIF</th><th>Servicio</th><th>Estado</th><th><span class="sr-only">Acciones</span></th></tr></thead><tbody>'.$table.'</tbody></table></div>':'<section class="empty-state"><span class="empty-ring"><i></i></span><h2>Todavía no hay proveedores</h2><p>Añade el primero para vincularlo a sus comunidades.</p></section>';
-        $this->page('Proveedores','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Proveedores</h1><p>Define quién factura cada servicio y en qué comunidades trabaja.</p></div><span class="count-badge">'.count($rows).' registrados</span></div>'.$form.'<section class="card list-card"><div class="section-heading"><h2>Listado de proveedores</h2></div>'.$list.'</section>');
+        $form='<form method="post" action="/?route=suppliers" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><input type="hidden" name="cif" value="'.$this->e($edit['cif']??'').'"><input type="hidden" name="aliases" value="'.$this->e($aliases).'"><div class="form-heading wide"><span class="eyebrow">Directorio</span><h2>'.($edit?'Editar proveedor':'Nuevo proveedor').'</h2></div><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>Servicio<select name="service_id" required><option value="">Seleccionar</option>'.$options.'</select></label><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=suppliers">Cancelar</a></div></form>';
+        $list=$table!==''?'<div class="table-wrap"><table><thead><tr><th>Proveedor</th><th>Servicio</th><th>Estado</th><th><span class="sr-only">Acciones</span></th></tr></thead><tbody>'.$table.'</tbody></table></div>':'<section class="empty-state"><span class="empty-ring"><i></i></span><h2>Todavía no hay proveedores</h2><p>Añade el primero para vincularlo a sus comunidades.</p></section>';
+        $panel=$this->disclosurePanel($edit?'+ Editar proveedor':'+ Nuevo proveedor',$form,(bool)$edit);
+        $this->page('Proveedores','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Proveedores</h1><p>Consulta proveedores, servicios y estados sin formularios permanentes.</p></div><span class="count-badge">'.count($rows).' registrados</span></div>'.$panel.'<section class="card list-card">'.$list.'</section>');
     }
 
     private function mailboxes(): void
@@ -158,9 +184,10 @@ final class WebApp
         $rows=$this->db->all('SELECT id,descriptive_name,email,imap_host,active,last_connection_at,last_connection_ok,last_error FROM mailboxes ORDER BY descriptive_name'); $table='';
         foreach($rows as $row){$state=!$row['active']?'Desactivado':($row['last_connection_ok']?'Conectado':'Sin comprobar');$stateClass=$row['active']&&$row['last_connection_ok']?'success':'neutral';$table.='<tr><td><strong>'.$this->e($row['descriptive_name']).'</strong></td><td>'.$this->e($row['email']).'</td><td><span class="badge neutral">'.$this->e(MailboxProvider::fromHost((string)$row['imap_host'])==='gmail'?'Gmail':'IONOS').'</span></td><td><span class="badge '.$stateClass.'">'.$state.'</span></td><td class="actions"><a href="/?route=mailboxes&edit='.$row['id'].'">Editar</a><form class="inline" method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="test"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Probar</button></form>'.($row['active']?'<form class="inline" method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('mailboxes',(int)$row['id'],'el correo «'.(string)$row['email'].'» y todo su historial de procesamiento').'</td></tr>';}
         $provider=$edit?MailboxProvider::fromHost((string)$edit['imap_host']):'gmail';
-        $form='<form method="post" action="/?route=mailboxes" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><div class="form-heading wide"><span class="eyebrow">Entrada de facturas</span><h2>'.($edit?'Editar correo':'Añadir correo').'</h2></div><label>Proveedor<select name="provider"><option value="gmail"'.($provider==='gmail'?' selected':'').'>Gmail</option><option value="ionos"'.($provider==='ionos'?' selected':'').'>IONOS</option></select></label><label>Nombre<input name="name" value="'.$this->e($edit['descriptive_name']??'').'" required></label><label>Dirección<input type="email" name="email" value="'.$this->e($edit['email']??'').'" required></label><label>Contraseña de aplicación<input type="password" name="password" '.($edit?'':'required').' autocomplete="new-password"><small>'.($edit?'Déjala vacía para conservarla.':'En Gmail usa una contraseña de aplicación; se guardará cifrada.').'</small></label><label class="check-label"><input type="checkbox" name="active" value="1" '.((int)($edit['active']??0)===1?'checked':'').'><span>Activar procesamiento automático</span></label><button>Guardar cambios</button></form>';
+        $form='<form method="post" action="/?route=mailboxes" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><div class="form-heading wide"><span class="eyebrow">Entrada de facturas</span><h2>'.($edit?'Editar correo':'Nuevo correo').'</h2></div><label>Proveedor<select name="provider"><option value="gmail"'.($provider==='gmail'?' selected':'').'>Gmail</option><option value="ionos"'.($provider==='ionos'?' selected':'').'>IONOS</option></select></label><label>Nombre<input name="name" value="'.$this->e($edit['descriptive_name']??'').'" required></label><label>Dirección<input type="email" name="email" value="'.$this->e($edit['email']??'').'" required></label><label>Contraseña de aplicación<input type="password" name="password" '.($edit?'':'required').' autocomplete="new-password"><small>'.($edit?'Déjala vacía para conservarla.':'En Gmail usa una contraseña de aplicación; se guardará cifrada.').'</small></label><label class="check-label"><input type="checkbox" name="active" value="1" '.((int)($edit['active']??0)===1?'checked':'').'><span>Activar procesamiento automático</span></label><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=mailboxes">Cancelar</a></div></form>';
         $list=$table!==''?'<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Dirección</th><th>Proveedor</th><th>Estado</th><th><span class="sr-only">Acciones</span></th></tr></thead><tbody>'.$table.'</tbody></table></div>':'<section class="empty-state"><span class="empty-ring"><i></i></span><h2>Todavía no hay correos</h2><p>Añade una cuenta y prueba su conexión antes de activarla.</p></section>';
-        $this->page('Correos','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Correos</h1><p>Conecta las cuentas que reciben facturas y controla cuáles procesa el sistema.</p></div></div>'.$form.'<section class="card list-card"><div class="section-heading"><h2>Cuentas configuradas</h2></div>'.$list.'</section>');
+        $panel=$this->disclosurePanel($edit?'+ Editar correo':'+ Nuevo correo',$form,(bool)$edit);
+        $this->page('Correos','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Correos</h1><p>Consulta las cuentas conectadas y cambia credenciales solo cuando sea necesario.</p></div></div>'.$panel.'<section class="card list-card">'.$list.'</section>');
     }
 
     private function reviews(): void
@@ -195,10 +222,11 @@ final class WebApp
         try{
             if(!$enabled)throw new \RuntimeException('Google Drive no está activado');
             $tokens=new GoogleUserOAuthProvider((string)$drive['oauth_client_file'],(string)$drive['oauth_token_file']);
-            $items=(new GoogleDriveClient($tokens))->children((string)$drive['root_folder_id']);
-            $folders=count(array_filter($items,static fn(array$item):bool=>($item['mimeType']??'')==='application/vnd.google-apps.folder'));
+            $client=new GoogleDriveClient($tokens);
+            $items=$client->children((string)$drive['root_folder_id']);
+            $folders=count(array_filter($items,static fn(array$item):bool=>DriveTree::isFolder($item)));
             $body='<div class="page-heading"><div><span class="eyebrow">Destino documental</span><h1>Almacenamiento</h1><p>Estado de la conexión utilizada para archivar las facturas.</p></div></div><section class="status ok"><span class="status-ring"><i></i></span><span><strong>Google Drive correctamente configurado</strong><small>Las facturas se archivan automáticamente en la carpeta COMUNIDADES.</small></span></section>'.
-                '<section class="card storage-card"><span class="eyebrow">Carpeta de destino</span><h2>COMUNIDADES</h2><p><strong class="mono">'.$folders.'</strong> comunidades preparadas</p></section>';
+                '<section class="card storage-card"><div class="section-heading flat"><div><span class="eyebrow">Carpeta de destino</span><h2>COMUNIDADES</h2><p><strong class="mono">'.$folders.'</strong> comunidades preparadas</p></div></div>'.$this->driveTree($items).'</section>';
         }catch(\Throwable$error){
             $body='<div class="page-heading"><div><span class="eyebrow">Destino documental</span><h1>Almacenamiento</h1></div></div><section class="status warning"><div><span class="status-ring"><i></i></span><span><strong>No se puede conectar con Google Drive</strong><small>Revisa la autorización y vuelve a intentarlo.</small></span></div></section>';
             error_log('storage_drive_check status=error '.$error->getMessage());
@@ -226,6 +254,31 @@ final class WebApp
         echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="app-page">'.$mobile.'<div class="app-shell">'.$sidebar.'<main class="main-content">'.$body.'</main></div></body></html>';
     }
     private function e(mixed $value): string{return htmlspecialchars((string)$value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');}
+    private function disclosurePanel(string $label,string $content,bool $open):string
+    {
+        $id='panel-'.bin2hex(random_bytes(5));
+        return'<section class="disclosure" data-disclosure'.($open?' data-initial-open="true"':'').'><button class="disclosure-toggle" type="button" aria-expanded="'.($open?'true':'false').'" aria-controls="'.$id.'">'.$this->e($label).'</button><div id="'.$id.'" class="disclosure-panel"'.($open?'':' hidden').'>'.$content.'</div></section>';
+    }
+    /** @param list<array<string,mixed>> $items */
+    private function driveTree(array $items):string
+    {
+        return DriveTree::renderRoot($items);
+    }
+    private function storageChildren():void
+    {
+        header('Content-Type: application/json; charset=UTF-8');
+        $drive=$this->config['google_drive']??[];if(!(bool)($drive['enabled']??false)){http_response_code(503);echo json_encode(['error'=>'Google Drive no está activado']);return;}
+        $folderId=(string)($_GET['folder_id']??'');$level=max(1,min(5,(int)($_GET['level']??1)));
+        if(!preg_match('/^[A-Za-z0-9_-]+$/',$folderId)){http_response_code(400);echo json_encode(['error'=>'Carpeta no válida']);return;}
+        try{
+            $tokens=new GoogleUserOAuthProvider((string)$drive['oauth_client_file'],(string)$drive['oauth_token_file']);
+            $items=(new GoogleDriveClient($tokens))->children($folderId);
+            error_log('storage_children status=ok folder_id='.$folderId.' items='.count($items).' names='.implode(',',array_map(static fn(array$item):string=>(string)($item['name']??'?'),$items)));
+            echo json_encode(['html'=>DriveTree::renderNodes($items,$level+1)],JSON_UNESCAPED_UNICODE);
+        }catch(\Throwable$error){
+            http_response_code(500);error_log('storage_children status=error folder_id='.$folderId.' '.$error->getMessage());echo json_encode(['error'=>'No se pudo cargar esta carpeta'],JSON_UNESCAPED_UNICODE);
+        }
+    }
     private function navLink(string$route,string$label,string$icon,string$current):string
     {
         $active=$route===$current;$href=$route===''?'/':'/?route='.$route;

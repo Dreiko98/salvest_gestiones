@@ -10,7 +10,7 @@ final class GoogleDriveClient
     /** @return list<array<string,mixed>> */
     public function children(string $parentId):array
     {
-        $query=http_build_query(['q'=>"'$parentId' in parents and trashed=false",'fields'=>'files(id,name,mimeType,size,modifiedTime)','pageSize'=>1000,'orderBy'=>'name','supportsAllDrives'=>'true','includeItemsFromAllDrives'=>'true']);
+        $query=http_build_query(['q'=>"'$parentId' in parents and trashed=false",'fields'=>'files(id,name,mimeType,size,modifiedTime,webViewLink)','pageSize'=>1000,'orderBy'=>'folder,name','supportsAllDrives'=>'true','includeItemsFromAllDrives'=>'true']);
         return$this->request('GET','https://www.googleapis.com/drive/v3/files?'.$query)['files']??[];
     }
 

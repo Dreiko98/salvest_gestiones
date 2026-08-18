@@ -194,6 +194,7 @@ final class WebApp
 
     private function mailboxes(): void
     {
+        $formError='';
         if ($_SERVER['REQUEST_METHOD']==='POST') {
             if(($_POST['action']??'')==='archive'){$id=(int)$_POST['id'];$this->db->execute('UPDATE mailboxes SET active=0 WHERE id=?',[$id]);$this->audit('archive','mailbox',$id);$this->redirect('/?route=mailboxes');}
             if(($_POST['action']??'')==='delete'){
@@ -216,29 +217,101 @@ final class WebApp
                 }
                 $this->redirect('/?route=mailboxes');
             }
-            $email=mb_strtolower(trim((string)$_POST['email']));
-            $connection=MailboxProvider::connection((string)($_POST['provider']??'ionos'));
-            $active=isset($_POST['active'])?1:0;
-            $id=(int)($_POST['id']??0);$password=(string)($_POST['password']??'');
-            if($id){
-                $existing=$this->db->one('SELECT encrypted_password FROM mailboxes WHERE id=?',[$id]);if(!$existing)throw new \RuntimeException('Correo no encontrado');
-                $encrypted=$password!==''?$this->crypto->encrypt($password):$existing['encrypted_password'];
-                $this->db->execute("UPDATE mailboxes SET descriptive_name=?,email=?,imap_host=?,imap_port=?,use_ssl=?,username=?,encrypted_password=?,active=? WHERE id=?",[trim((string)$_POST['name']),$email,$connection['host'],$connection['port'],$connection['use_ssl'],$email,$encrypted,$active,$id]);
-            }else{
-                if($password==='')throw new \RuntimeException('La contraseña es obligatoria');
-                $this->db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,\'INBOX\',?)',[trim((string)$_POST['name']),$email,$connection['host'],$connection['port'],$connection['use_ssl'],$email,$this->crypto->encrypt($password),$active]);$id=(int)$this->db->pdo()->lastInsertId();
-            }
-            $this->audit(isset($_POST['id'])&&$_POST['id']?'update':'create','mailbox',$id,['email'=>$email]);
-            $this->redirect('/?route=mailboxes');
+            ['id'=>$id,'formError'=>$formError]=$this->saveMailboxFromPost();
+            if($formError===''){$this->redirect('/?route=mailboxes');}
+            $_GET['edit']=(string)$id;
         }
-        $edit=isset($_GET['edit'])?$this->db->one('SELECT id,descriptive_name,email,imap_host,active FROM mailboxes WHERE id=?',[(int)$_GET['edit']]):null;
+        $edit=isset($_GET['edit'])?$this->db->one('SELECT id,descriptive_name,email,imap_host,active,process_existing_on_activate FROM mailboxes WHERE id=?',[(int)$_GET['edit']]):null;
         $rows=$this->db->all('SELECT id,descriptive_name,email,imap_host,active,last_connection_at,last_connection_ok,last_error FROM mailboxes ORDER BY descriptive_name'); $table='';
         foreach($rows as $row){$state=!$row['active']?'Desactivado':($row['last_connection_ok']?'Conectado':'Sin comprobar');$stateClass=$row['active']&&$row['last_connection_ok']?'success':'neutral';$table.='<tr><td><strong>'.$this->e($row['descriptive_name']).'</strong></td><td>'.$this->e($row['email']).'</td><td><span class="badge neutral">'.$this->e(MailboxProvider::fromHost((string)$row['imap_host'])==='gmail'?'Gmail':'IONOS').'</span></td><td><span class="badge '.$stateClass.'">'.$state.'</span></td><td class="actions"><a href="/?route=mailboxes&edit='.$row['id'].'">Editar</a><form class="inline" method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="test"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Probar</button></form>'.($row['active']?'<form class="inline" method="post" action="/?route=mailboxes"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('mailboxes',(int)$row['id'],'el correo «'.(string)$row['email'].'» y todo su historial de procesamiento').'</td></tr>';}
         $provider=$edit?MailboxProvider::fromHost((string)$edit['imap_host']):'gmail';
-        $form='<form method="post" action="/?route=mailboxes" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><div class="form-heading wide"><span class="eyebrow">Entrada de facturas</span><h2>'.($edit?'Editar correo':'Nuevo correo').'</h2></div><label>Proveedor<select name="provider"><option value="gmail"'.($provider==='gmail'?' selected':'').'>Gmail</option><option value="ionos"'.($provider==='ionos'?' selected':'').'>IONOS</option></select></label><label>Nombre<input name="name" value="'.$this->e($edit['descriptive_name']??'').'" required></label><label>Dirección<input type="email" name="email" value="'.$this->e($edit['email']??'').'" required></label><label>Contraseña de aplicación<input type="password" name="password" '.($edit?'':'required').' autocomplete="new-password"><small>'.($edit?'Déjala vacía para conservarla.':'En Gmail usa una contraseña de aplicación; se guardará cifrada.').'</small></label><label class="check-label"><input type="checkbox" name="active" value="1" '.((int)($edit['active']??0)===1?'checked':'').'><span>Activar procesamiento automático</span></label><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=mailboxes">Cancelar</a></div></form>';
+        $form='<form method="post" action="/?route=mailboxes" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><div class="form-heading wide"><span class="eyebrow">Entrada de facturas</span><h2>'.($edit?'Editar correo':'Nuevo correo').'</h2></div><label>Proveedor<select name="provider"><option value="gmail"'.($provider==='gmail'?' selected':'').'>Gmail</option><option value="ionos"'.($provider==='ionos'?' selected':'').'>IONOS</option></select></label><label>Nombre<input name="name" value="'.$this->e($edit['descriptive_name']??'').'" required></label><label>Dirección<input type="email" name="email" value="'.$this->e($edit['email']??'').'" required></label><label>Contraseña de aplicación<input type="password" name="password" '.($edit?'':'required').' autocomplete="new-password"><small>'.($edit?'Déjala vacía para conservarla.':'En Gmail usa una contraseña de aplicación; se guardará cifrada.').'</small></label><label class="check-label"><input type="checkbox" name="active" value="1" '.((int)($edit['active']??0)===1?'checked':'').'><span>Activar procesamiento automático</span></label>'.'<div class="wide">'.$this->disclosurePanel('+ Opciones avanzadas','<label class="check-label"><input type="checkbox" name="process_existing" value="1" '.((int)($edit['process_existing_on_activate']??0)===1?'checked':'').'><span>Procesar correos existentes al activar</span></label><small>Desactivado por defecto: al dar de alta este correo, Salvest ignora todo lo que ya hubiera en la bandeja y solo procesa lo que llegue a partir de ahora. Actívalo únicamente si quieres que también revise el historial existente.</small>',false).'</div><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=mailboxes">Cancelar</a></div></form>';
         $list=$table!==''?'<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Dirección</th><th>Proveedor</th><th>Estado</th><th><span class="sr-only">Acciones</span></th></tr></thead><tbody>'.$table.'</tbody></table></div>':'<section class="empty-state"><span class="empty-ring"><i></i></span><h2>Todavía no hay correos</h2><p>Añade una cuenta y prueba su conexión antes de activarla.</p></section>';
-        $panel=$this->disclosurePanel($edit?'+ Editar correo':'+ Nuevo correo',$form,(bool)$edit);
-        $this->page('Correos','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Correos</h1><p>Consulta las cuentas conectadas y cambia credenciales solo cuando sea necesario.</p></div></div>'.$panel.'<section class="card list-card">'.$list.'</section>');
+        $panel=$this->disclosurePanel($edit?'+ Editar correo':'+ Nuevo correo',$form,(bool)$edit||$formError!=='');
+        $errorBanner=$formError!==''?'<section class="card error">'.$this->e($formError).'</section>':'';
+        $this->page('Correos','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Correos</h1><p>Consulta las cuentas conectadas y cambia credenciales solo cuando sea necesario.</p></div></div>'.$errorBanner.$panel.'<section class="card list-card">'.$list.'</section>');
+    }
+
+    /**
+     * Pure decision of whether saving this mailbox must (re)capture its baseline right now, kept
+     * free of I/O so it can be unit-tested on its own. Rules:
+     *  - a protected mailbox (process_existing_on_activate=0) being activated for the first time
+     *    (no baseline yet) must capture before it is allowed to go active;
+     *  - flipping process_existing_on_activate from 1 to 0 always (re)captures "from this exact
+     *    moment", regardless of active — an old/stale baseline could hide real backlog;
+     *  - anything else (0→0 with an existing baseline, 0→1, already active+protected+baselined)
+     *    never needs a synchronous capture here.
+     * @return array{transitioned1to0:bool,mustCapture:bool}
+     */
+    private static function mailboxCaptureDecision(?int $priorProcessExisting,bool $hadBaseline,int $processExisting,int $active):array
+    {
+        $transitioned1to0=$priorProcessExisting===1&&$processExisting===0;
+        $needsFirstCapture=$processExisting===0&&$active===1&&!$hadBaseline&&!$transitioned1to0;
+        return['transitioned1to0'=>$transitioned1to0,'mustCapture'=>$processExisting===0&&($transitioned1to0||$needsFirstCapture)];
+    }
+
+    /**
+     * Reads $_POST, saves the mailbox (insert or update) and, when required, captures its baseline
+     * synchronously first — kept apart from mailboxes() so it never calls redirect()/exit itself,
+     * which makes it directly callable (and testable) without a real HTTP round trip.
+     * @return array{id:int,formError:string}
+     */
+    private function saveMailboxFromPost():array
+    {
+        $email=mb_strtolower(trim((string)$_POST['email']));
+        $connection=MailboxProvider::connection((string)($_POST['provider']??'ionos'));
+        $active=isset($_POST['active'])?1:0;
+        $processExisting=isset($_POST['process_existing'])?1:0;
+        $id=(int)($_POST['id']??0);$password=(string)($_POST['password']??'');
+        $prior=$id?$this->db->one('SELECT encrypted_password,process_existing_on_activate,baseline_captured_at FROM mailboxes WHERE id=?',[$id]):null;
+        if($id&&!$prior)throw new \RuntimeException('Correo no encontrado');
+        if($id===0&&$password==='')throw new \RuntimeException('La contraseña es obligatoria');
+        $encrypted=$password!==''?$this->crypto->encrypt($password):(string)($prior['encrypted_password']??'');
+        // Point of no return for "process everything from here on": capture it synchronously,
+        // before the mailbox can ever be saved active, so there is no window between saving and
+        // the first Worker cycle where a real new message could be mistaken for old backlog.
+        $priorProcessExisting=$prior?(int)$prior['process_existing_on_activate']:null;
+        $hadBaseline=$prior&&$prior['baseline_captured_at']!==null;
+        $decision=self::mailboxCaptureDecision($priorProcessExisting,$hadBaseline,$processExisting,$active);
+        $baseline=null;$formError='';
+        if($decision['mustCapture']){
+            try{$baseline=$this->captureMailboxBaseline($connection['host'],$connection['port'],$email,$password!==''?$password:$this->crypto->decrypt($encrypted),(int)$this->config['imap']['timeout_seconds']);}
+            catch(\Throwable$error){
+                error_log('mailbox_baseline_capture status=failed email='.$email.' '.$error->getMessage());
+                $formError='No se pudo conectar con el buzón para establecer a partir de qué correo empezar. El correo se ha guardado desactivado; revisa las credenciales y vuelve a intentarlo.';
+                $active=0;
+            }
+        }
+        $fields=['descriptive_name'=>trim((string)$_POST['name']),'email'=>$email,'imap_host'=>$connection['host'],'imap_port'=>$connection['port'],
+            'use_ssl'=>$connection['use_ssl'],'username'=>$email,'encrypted_password'=>$encrypted,'active'=>$active,'process_existing_on_activate'=>$processExisting];
+        if($baseline!==null){$fields['baseline_uidvalidity']=$baseline['uidvalidity'];$fields['baseline_uid']=$baseline['uid'];}
+        if($id){
+            $set=implode(',',array_map(static fn(string$column):string=>"$column=?",array_keys($fields)));
+            if($baseline!==null)$set.=',baseline_captured_at=NOW()';
+            $this->db->execute("UPDATE mailboxes SET $set WHERE id=?",[...array_values($fields),$id]);
+        }else{
+            $columns=implode(',',array_keys($fields)).',input_folder'.($baseline!==null?',baseline_captured_at':'');
+            $placeholders=implode(',',array_fill(0,count($fields),'?')).",'INBOX'".($baseline!==null?',NOW()':'');
+            $this->db->execute("INSERT INTO mailboxes($columns) VALUES ($placeholders)",array_values($fields));$id=(int)$this->db->pdo()->lastInsertId();
+        }
+        $this->audit($prior?'update':'create','mailbox',$id,['email'=>$email,'baseline_captured'=>$baseline!==null,'baseline_capture_failed'=>$formError!=='']);
+        return['id'=>$id,'formError'=>$formError];
+    }
+
+    /**
+     * Snapshots "everything that exists right now" for a protected mailbox, synchronously, as part
+     * of saving the mailbox form — never deferred to the Worker's first cycle. That gap is exactly
+     * the race this exists to close: a message arriving between save and the first cron/manual run
+     * must never be mistaken for pre-existing backlog.
+     * @return array{uidvalidity:string,uid:int}
+     */
+    private function captureMailboxBaseline(string $host,int $port,string $username,string $password,int $timeoutSeconds):array
+    {
+        $client=new ImapClient($host,$port,$username,$password,'INBOX',$timeoutSeconds);
+        try{
+            $client->connect();
+            return MailboxBaseline::fromUids($client->uidValidity(),$client->listUids());
+        }finally{$client->close();}
     }
 
     private function reviews(): void

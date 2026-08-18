@@ -81,7 +81,7 @@ final class Worker
         try {
             $client->connect();
             $this->db->execute('UPDATE mailboxes SET last_connection_at=NOW(),last_connection_ok=1,last_error=NULL WHERE id=?',[$mailbox['id']]);
-            $uids = $client->listUids(); $examined = 0;
+            $uids = $this->applyBaseline($mailbox, $client, $client->listUids()); $examined = 0;
             foreach ($uids as $uid) {
                 if ($limit !== null && $examined >= $limit) break;
                 $existing = $this->db->one('SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
@@ -134,6 +134,37 @@ final class Worker
                 }
             }
         } finally { $client->close(); }
+    }
+
+    /**
+     * Keeps a freshly added (or freshly re-enabled) mailbox from processing whatever was already
+     * sitting in its inbox. "process_existing_on_activate" opts a mailbox out of this entirely
+     * (today's behaviour: every UID is a candidate). Otherwise, the first time this mailbox has no
+     * recorded baseline — brand new, or an admin just turned protection back on — this snapshots the
+     * highest UID currently in the folder as the cut-off and processes nothing this cycle; from the
+     * next cycle on, only UIDs strictly greater than that baseline are considered. A UIDVALIDITY
+     * change invalidates any old baseline (the server has renumbered the mailbox, so old UIDs carry
+     * no meaning) and is treated the same as "never baselined": re-snapshot now, process nothing this
+     * cycle, never blindly replay whatever exists under the new UIDVALIDITY.
+     * @param array<string,mixed> $mailbox @param list<string> $uids @return list<string>
+     */
+    private function applyBaseline(array $mailbox, ImapClient $client, array $uids): array
+    {
+        if ((int)($mailbox['process_existing_on_activate'] ?? 0) === 1) return $uids;
+        $currentUidValidity = $client->uidValidity();
+        $hadBaseline = $mailbox['baseline_captured_at'] !== null;
+        $uidValidityChanged = $hadBaseline && (string)$mailbox['baseline_uidvalidity'] !== $currentUidValidity;
+        if (!$hadBaseline || $uidValidityChanged) {
+            $baseline = MailboxBaseline::fromUids($currentUidValidity, $uids);
+            if ($uidValidityChanged) {
+                error_log('mailbox_id='.$mailbox['id'].' status=uidvalidity_changed old='.$mailbox['baseline_uidvalidity'].' new='.$currentUidValidity.' rebaselined_at_uid='.$baseline['uid']);
+            }
+            $this->db->execute('UPDATE mailboxes SET baseline_uidvalidity=?,baseline_uid=?,baseline_captured_at=NOW() WHERE id=?',
+                [$baseline['uidvalidity'], $baseline['uid'], $mailbox['id']]);
+            return [];
+        }
+        $floor = (int)$mailbox['baseline_uid'];
+        return array_values(array_filter($uids, static fn(string $uid): bool => (int)$uid > $floor));
     }
 
     /** @param array<string,mixed> $mailbox @param array<string,mixed> $message @param array<string,mixed> $attachment @param array<string,int> $counts @return array{status:string,community_id:?int} */

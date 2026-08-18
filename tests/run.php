@@ -36,7 +36,7 @@ SQL;
 // registers fake GET_LOCK/RELEASE_LOCK SQL functions (SQLite has no such thing)
 // so Worker's real MySQL locking code can be exercised deterministically.
 $workerSchema=<<<SQL
-CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
+CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,process_existing_on_activate INTEGER DEFAULT 0,baseline_uidvalidity TEXT,baseline_uid INTEGER,baseline_captured_at TEXT,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
 CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
 CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,old_values_json TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
 CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT,processed_at TEXT);
@@ -67,6 +67,31 @@ $workerConfig=static fn():array=>['app'=>['base_url'=>'http://127.0.0.1','timezo
     'imap'=>['default_host'=>'imap.ionos.es','default_port'=>993,'timeout_seconds'=>5,'max_messages_per_mailbox'=>5],
     'processing'=>['classification_threshold'=>92.0,'max_attachment_bytes'=>1000000,'storage_root'=>sys_get_temp_dir(),'incoming_root'=>sys_get_temp_dir()],
     'google_drive'=>['enabled'=>false]];
+/** A real ImapClient with only uidValidity() usable — no socket, never connects. Worker::applyBaseline()
+ * only calls that one method, so this is enough to exercise it without a live IMAP server. */
+$fakeImapClient=static function(string $uidValidity):Salvest\ImapClient{
+    $reflection=new ReflectionClass(Salvest\ImapClient::class);
+    $client=$reflection->newInstanceWithoutConstructor();
+    $property=$reflection->getProperty('uidValidity');$property->setAccessible(true);$property->setValue($client,$uidValidity);
+    return$client;
+};
+/** @param list<string> $uids @return list<string> */
+$applyBaseline=static function(Salvest\Database $db,array $config,array $mailbox,Salvest\ImapClient $client,array $uids):array{
+    $worker=Salvest\Worker::create($db,$config);
+    $method=new ReflectionMethod(Salvest\Worker::class,'applyBaseline');$method->setAccessible(true);
+    return$method->invoke($worker,$mailbox,$client,$uids);
+};
+/** Calls the private, redirect-free WebApp::saveMailboxFromPost() directly — mailboxes() itself
+ * calls exit() on a successful save, which would kill the whole test runner process if we went
+ * through the real POST/run() round trip instead. */
+$saveMailbox=static function(Salvest\WebApp $webApp,array $post):array{
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $_POST=$post;$_SERVER['REQUEST_METHOD']='POST';
+    $method=new ReflectionMethod(Salvest\WebApp::class,'saveMailboxFromPost');$method->setAccessible(true);
+    $result=$method->invoke($webApp);
+    restore_error_handler();
+    return$result;
+};
 /** Auth's constructor touches session_start()/header(); see the note on the disclosure tests above. */
 $makeWebApp=static function(Salvest\Database $db,array $config):Salvest\WebApp{
     set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
@@ -377,6 +402,158 @@ $test('estado del bot: mientras se ejecuta se deshabilita el botón y se avisa',
     $assert(str_contains($html,'En ejecución'),'debe indicar que ya hay un ciclo en marcha');
     $assert(str_contains($html,'Bot ejecutándose'),'el botón debe reflejar el estado de ejecución en curso');
     $assert((bool)preg_match('/\bdisabled\b/',$html),'el botón debe estar deshabilitado mientras hay una ejecución en curso');
+});
+
+$test('baseline: buzón con 1.000 correos existentes + uno nuevo, solo procesa el nuevo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$fakeImapClient,$applyBaseline):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $mailbox=['id'=>1,'process_existing_on_activate'=>0,'baseline_uidvalidity'=>'1001','baseline_uid'=>1000,'baseline_captured_at'=>date('Y-m-d H:i:s')];
+    $uids=array_map('strval',range(1,1000));$uids[]='1001';
+    $result=$applyBaseline($db,$config,$mailbox,$fakeImapClient('1001'),$uids);
+    $assert($result===['1001'],'solo el UID posterior al baseline debe sobrevivir al filtro: '.json_encode($result));
+});
+$test('baseline: no depende de UNSEEN, un correo ya leído se procesa igual (guarda de regresión del comando IMAP)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/ImapClient.php');
+    $assert(str_contains($source,"UID SEARCH ALL"),'listUids() debe usar SEARCH ALL para no depender de si el correo ya se marcó como leído');
+    $assert(!str_contains($source,'UNSEEN'),'no debe aparecer UNSEEN en ninguna parte del cliente IMAP');
+});
+$test('baseline: buzón vacío al crear, el primer correo que llega después se procesa',static function()use($assert,$sqliteDbWithLock,$workerConfig,$fakeImapClient,$applyBaseline):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,active,process_existing_on_activate) VALUES (?,?,1,0)',['Prueba','prueba@example.com']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $mailboxRow=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    $firstCycle=$applyBaseline($db,$config,$mailboxRow,$fakeImapClient('555'),[]);
+    $assert($firstCycle===[],'una bandeja vacía al dar de alta no debe procesar nada en el ciclo de captura del baseline');
+    $stored=$db->one('SELECT baseline_uid,baseline_uidvalidity,baseline_captured_at FROM mailboxes WHERE id=?',[$id]);
+    $assert((int)$stored['baseline_uid']===0 && $stored['baseline_uidvalidity']==='555' && $stored['baseline_captured_at']!==null,'debe quedar grabado un baseline en 0 aunque la bandeja estuviera vacía');
+    $mailboxRow2=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    $secondCycle=$applyBaseline($db,$config,$mailboxRow2,$fakeImapClient('555'),['1']);
+    $assert($secondCycle===['1'],'el primer correo que llega tras el alta sí debe procesarse: '.json_encode($secondCycle));
+});
+$test('baseline: "procesar correos existentes al activar" activado procesa el histórico completo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$fakeImapClient,$applyBaseline):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $mailbox=['id'=>1,'process_existing_on_activate'=>1,'baseline_uidvalidity'=>null,'baseline_uid'=>null,'baseline_captured_at'=>null];
+    $uids=['1','2','3'];
+    $result=$applyBaseline($db,$config,$mailbox,$fakeImapClient('9'),$uids);
+    $assert($result===$uids,'con la opción activada debe devolver todos los UID sin filtrar, igual que hoy');
+    $assert($db->one('SELECT COUNT(*) n FROM mailboxes')['n']===0,'no debe escribir ningún baseline mientras esta opción esté activada');
+});
+$test('baseline: un cambio de UIDVALIDITY invalida el baseline anterior y no reprocesa histórico a ciegas',static function()use($assert,$sqliteDbWithLock,$workerConfig,$fakeImapClient,$applyBaseline):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,active,process_existing_on_activate,baseline_uidvalidity,baseline_uid,baseline_captured_at) VALUES (?,?,1,0,?,?,?)',
+        ['Prueba','prueba2@example.com','1001',500,date('Y-m-d H:i:s')]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $mailboxRow=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    // El servidor renumeró la carpeta: UIDVALIDITY nueva, y llegan UIDs que bajo la validity vieja
+    // parecerían "antiguos" (1, 2) mezclados con lo que sea que el servidor tenga ahora.
+    $result=$applyBaseline($db,$config,$mailboxRow,$fakeImapClient('2002'),['1','2','999']);
+    $assert($result===[],'ante un cambio de UIDVALIDITY no debe reprocesar el histórico existente a ciegas');
+    $stored=$db->one('SELECT baseline_uidvalidity,baseline_uid FROM mailboxes WHERE id=?',[$id]);
+    $assert($stored['baseline_uidvalidity']==='2002' && (int)$stored['baseline_uid']===999,'debe re-capturar el baseline bajo la nueva UIDVALIDITY, no conservar la antigua');
+    $mailboxRow2=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    $nextCycle=$applyBaseline($db,$config,$mailboxRow2,$fakeImapClient('2002'),['1','2','999','1000']);
+    $assert($nextCycle===['1000'],'tras la re-captura, solo lo posterior al nuevo baseline debe procesarse: '.json_encode($nextCycle));
+});
+$test('baseline: convive con la deduplicación existente por mailbox_id+UIDVALIDITY+UID (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert(str_contains($source,'applyBaseline($mailbox, $client, $client->listUids())'),'el filtro de baseline debe aplicarse sobre el listado de UIDs antes del bucle de mensajes');
+    $assert(str_contains($source,"SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?"),'la deduplicación por mailbox_id+UIDVALIDITY+UID debe seguir intacta después del filtro de baseline');
+    $assert(str_contains($source,"in_array(\$existing['status'],['completed','ignored','needs_review','error'],true)) continue;"),'solo los estados terminales deben saltarse; el baseline no sustituye a esta comprobación');
+});
+$test('baseline: el límite max_messages_per_mailbox se sigue aplicando tras el filtro de baseline (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert((bool)preg_match('/applyBaseline\(\$mailbox, \$client, \$client->listUids\(\)\); \$examined = 0;/',$source),'el contador de mensajes examinados debe arrancar en 0 después de aplicar el baseline, no antes');
+    $assert(str_contains($source,'if ($limit !== null && $examined >= $limit) break;'),'el corte por límite debe seguir activo tras el filtro de baseline');
+});
+
+// Helper to call the private, pure WebApp::mailboxCaptureDecision() without needing an instance.
+$captureDecision=static function(?int $priorProcessExisting,bool $hadBaseline,int $processExisting,int $active):array{
+    $method=new ReflectionMethod(Salvest\WebApp::class,'mailboxCaptureDecision');$method->setAccessible(true);
+    return$method->invoke(null,$priorProcessExisting,$hadBaseline,$processExisting,$active);
+};
+
+$test('activación: crear un buzón protegido y activo debe capturar baseline al guardar (sin esperar al Worker)',static function()use($assert,$captureDecision):void{
+    $decision=$captureDecision(null,false,0,1);
+    $assert($decision['mustCapture']===true,'un buzón nuevo, activo y protegido debe capturar baseline en el propio guardado');
+    $assert($decision['transitioned1to0']===false,'no es una transición 1→0, es alta nueva');
+});
+$test('activación: un buzón protegido que se guarda desactivado no captura todavía',static function()use($assert,$captureDecision):void{
+    $decision=$captureDecision(null,false,0,0);
+    $assert($decision['mustCapture']===false,'si no se activa, la captura se difiere hasta que de verdad pase a estar activo');
+});
+$test('activación: con 1.000 correos ya existentes, el baseline capturado es exactamente 1.000',static function()use($assert):void{
+    $uids=array_map('strval',range(1,1000));
+    $baseline=Salvest\MailboxBaseline::fromUids('9001',$uids);
+    $assert($baseline===['uidvalidity'=>'9001','uid'=>1000],'el punto de corte debe ser el UID más alto existente en el momento de activar: '.json_encode($baseline));
+});
+$test('activación: buzón vacío al crear, el baseline capturado es 0',static function()use($assert):void{
+    $assert(Salvest\MailboxBaseline::fromUids('9001',[])===['uidvalidity'=>'9001','uid'=>0]);
+});
+$test('activación: el UID 1001 que llega antes del primer Worker sí se procesa (baseline capturado al activar + primer ciclo)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$fakeImapClient,$applyBaseline):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    // Lo que WebApp::mailboxes() ya habría hecho al activar el buzón, antes de que corriera ningún Worker:
+    $baselineAtActivation=Salvest\MailboxBaseline::fromUids('9001',array_map('strval',range(1,1000)));
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,active,process_existing_on_activate,baseline_uidvalidity,baseline_uid,baseline_captured_at) VALUES (?,?,1,0,?,?,?)',
+        ['Prueba','activado@example.com',$baselineAtActivation['uidvalidity'],$baselineAtActivation['uid'],date('Y-m-d H:i:s')]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $mailboxRow=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    // Antes de que corra el primer Worker ya llegó el correo 1001 real (no histórico).
+    $uidsEnElPrimerCiclo=array_map('strval',range(1,1000));$uidsEnElPrimerCiclo[]='1001';
+    $result=$applyBaseline($db,$config,$mailboxRow,$fakeImapClient('9001'),$uidsEnElPrimerCiclo);
+    $assert($result===['1001'],'el correo llegado tras la activación debe procesarse aunque el Worker todavía no hubiera corrido nunca: '.json_encode($result));
+});
+$test('activación: si la captura de baseline falla, el código nunca deja el buzón activo (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/WebApp.php');
+    $catchStart=strpos($source,'error_log(\'mailbox_baseline_capture');
+    $assert($catchStart!==false,'debe existir un catch específico alrededor de la captura de baseline');
+    $catchBlock=substr($source,$catchStart,400);
+    $assert(str_contains($catchBlock,'$active=0;'),'si falla la captura, active debe forzarse a 0 antes de guardar, nunca dejar un buzón protegido activo sin baseline válido');
+    $assert((bool)preg_match('/\$formError=.[^;]*;/',$catchBlock),'debe quedar un mensaje amigable para mostrar en el formulario, sin detalles técnicos del error IMAP');
+    $insertPos=strpos($source,'INSERT INTO mailboxes($columns)');
+    $assert($insertPos!==false && $insertPos>$catchStart,'la captura (y el posible active=0 si falla) debe decidirse antes de escribir la fila, no después');
+});
+$test('edición: la casilla refleja el valor persistido y modificar otro campo no la cambia',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$saveMailbox):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute("INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,active,process_existing_on_activate) VALUES (?,?,?,?,1,?,?,1,1)",
+        ['Nombre antiguo','buzon@example.com','imap.gmail.com',993,'buzon@example.com','cifrado-falso']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $result=$saveMailbox($webApp,['id'=>(string)$id,'provider'=>'gmail','name'=>'Nombre nuevo','email'=>'buzon@example.com','password'=>'','active'=>'1','process_existing'=>'1']);
+    $assert($result['formError']==='','no debería haber fallado nada: '.$result['formError']);
+    $row=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    $assert($row['descriptive_name']==='Nombre nuevo','el nombre sí debe actualizarse');
+    $assert((int)$row['process_existing_on_activate']===1,'la opción avanzada no debe cambiar solo por editar otro campo, y seguía marcada');
+    $assert($row['baseline_captured_at']===null,'un buzón con la opción activada nunca debe llevar baseline');
+});
+$test('edición: transición 0→0 no recaptura innecesariamente en cada edición',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$saveMailbox):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $capturedAt='2026-08-10 09:00:00';
+    $db->execute("INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,active,process_existing_on_activate,baseline_uidvalidity,baseline_uid,baseline_captured_at) VALUES (?,?,?,?,1,?,?,1,0,?,?,?)",
+        ['Nombre antiguo','protegido@example.com','imap.gmail.com',993,'protegido@example.com','cifrado-falso','500',250,$capturedAt]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $result=$saveMailbox($webApp,['id'=>(string)$id,'provider'=>'gmail','name'=>'Nombre nuevo','email'=>'protegido@example.com','password'=>'','active'=>'1']);
+    $assert($result['formError']==='','no debería intentar reconectar ni fallar: '.$result['formError']);
+    $row=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    $assert((int)$row['process_existing_on_activate']===0,'sigue protegido');
+    $assert($row['baseline_uidvalidity']==='500' && (int)$row['baseline_uid']===250 && $row['baseline_captured_at']===$capturedAt,'el baseline existente no debe tocarse en una edición que no cambia la protección: '.json_encode($row));
+});
+$test('edición: transición 1→0 recaptura el UID máximo actual, no reutiliza un baseline histórico',static function()use($assert,$captureDecision):void{
+    $decision=$captureDecision(1,false,0,1);
+    $assert($decision['transitioned1to0']===true && $decision['mustCapture']===true,'pasar de "procesar histórico" a protegido debe forzar una captura nueva en ese mismo instante');
+    $decisionIncludingHadBaseline=$captureDecision(1,true,0,0);
+    $assert($decisionIncludingHadBaseline['mustCapture']===true,'debe recapturar aunque hubiera quedado algún baseline antiguo de una protección previa, y aunque el buzón se guarde inactivo');
+});
+$test('edición: transición 0→1 permite procesar el histórico sin necesitar captura',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$saveMailbox,$fakeImapClient,$applyBaseline,$captureDecision):void{
+    $decision=$captureDecision(0,true,1,1);
+    $assert($decision['mustCapture']===false,'activar "procesar histórico" no necesita capturar nada, el Worker simplemente dejará de filtrar');
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute("INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,active,process_existing_on_activate,baseline_uidvalidity,baseline_uid,baseline_captured_at) VALUES (?,?,?,?,1,?,?,1,0,?,?,?)",
+        ['Nombre','historico@example.com','imap.gmail.com',993,'historico@example.com','cifrado-falso','500',250,'2026-08-10 09:00:00']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $result=$saveMailbox($webApp,['id'=>(string)$id,'provider'=>'gmail','name'=>'Nombre','email'=>'historico@example.com','password'=>'','active'=>'1','process_existing'=>'1']);
+    $assert($result['formError']==='','no debería fallar: '.$result['formError']);
+    $row=$db->one('SELECT * FROM mailboxes WHERE id=?',[$id]);
+    $assert((int)$row['process_existing_on_activate']===1,'la opción debe quedar activada');
+    $result=$applyBaseline($db,$config,$row,$fakeImapClient('500'),['1','2','999']);
+    $assert($result===['1','2','999'],'con la opción activada el Worker ya no debe filtrar nada, ni siquiera lo anterior al viejo baseline: '.json_encode($result));
 });
 
 $failed=0;

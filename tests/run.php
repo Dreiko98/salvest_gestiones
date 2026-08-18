@@ -459,7 +459,7 @@ $test('baseline: convive con la deduplicación existente por mailbox_id+UIDVALID
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
     $assert(str_contains($source,'applyBaseline($mailbox, $client, $client->listUids())'),'el filtro de baseline debe aplicarse sobre el listado de UIDs antes del bucle de mensajes');
     $assert(str_contains($source,"SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?"),'la deduplicación por mailbox_id+UIDVALIDITY+UID debe seguir intacta después del filtro de baseline');
-    $assert(str_contains($source,"in_array(\$existing['status'],['completed','ignored','needs_review','error'],true)) continue;"),'solo los estados terminales deben saltarse; el baseline no sustituye a esta comprobación');
+    $assert(str_contains($source,"in_array(\$existing['status'],['completed','ignored','needs_review','error'],true)) {"),'solo los estados terminales deben saltarse; el baseline no sustituye a esta comprobación');
 });
 $test('baseline: el límite max_messages_per_mailbox se sigue aplicando tras el filtro de baseline (guarda de regresión de código)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
@@ -764,6 +764,59 @@ $test('inferencia comunidad+servicio: ningún proveedor compatible con el servic
     $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@desconocido.example');
     $assert($route['status']==='needs_review','sin ningún proveedor compatible con el servicio no debe clasificarse: '.json_encode($route));
     $assert($route['supplier']===null);
+});
+$test('DebugTracer: desactivado no escribe nada por stdout (comportamiento normal, sin --debug)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'82','MENENDEZ YPELAYO 10','CRISLA','LIMPIEZA',null,'H12557229');
+    $invoice=['proveedor'=>'Servicios Generales de Mantenimiento Ibérica','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
+    $tracer=new Salvest\DebugTracer(false);
+    $trace=function(string $tier,string $outcome,array $details)use($tracer):void{$tracer->line(str_starts_with($tier,'supplier')?'SUPPLIER':'COMMUNITY',$tier.' -> '.$outcome);};
+    ob_start();
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example','',null,$trace);
+    $output=ob_get_clean();
+    $assert($output==='','un DebugTracer desactivado no debe escribir absolutamente nada, aunque se le pase un $trace activo');
+    $assert($route['status']==='classified','pasar un $trace no debe cambiar la decisión real');
+});
+$test('DebugTracer: activado imprime el timeline completo con timestamps, sin exponer secretos, y sin cambiar la decisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    // Mismo caso real usado como regresión de la señal comunidad+servicio: MENENDEZ YPELAYO 10 / CRISLA.
+    $fixture=$makeCommunityWithSupplier($db,'82','MENENDEZ YPELAYO 10','CRISLA','LIMPIEZA',null,'H12557229');
+    $invoice=['proveedor'=>'Servicios Generales de Mantenimiento Ibérica','proveedor_cif'=>'B12534228','comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
+    $tracer=new Salvest\DebugTracer(true);
+    $trace=function(string $tier,string $outcome,array $details)use($tracer):void{
+        $tag=str_starts_with($tier,'supplier')?'SUPPLIER':'COMMUNITY';
+        $tracer->line($tag,$tier.' -> '.$outcome);
+        if($details)$tracer->fields($tag,$details);
+    };
+    // Simula lo que Worker::processAttachment() imprime alrededor de la resolución: los datos
+    // extraídos, un secreto colado a propósito (para probar la redacción) y el resultado final.
+    ob_start();
+    $tracer->line('RUN','Worker iniciado');
+    $tracer->line('MAILBOX','buzon-crisla@example.com');
+    $tracer->fields('OPENAI',['model'=>'gpt-test','reasoning'=>'low','api_key'=>'sk-esto-nunca-debe-verse']);
+    $tracer->json('OPENAI','JSON devuelto',$invoice+['encrypted_password'=>'esto-tampoco-debe-verse']);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example','',null,$trace);
+    $tracer->line('DECISION',$route['status']);
+    $output=ob_get_clean();
+
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],'el trace no debe alterar la decisión real: '.json_encode($route));
+    $assert((bool)preg_match('/^\[\d{2}:\d{2}:\d{2}\.\d{3}\] \[RUN\] Worker iniciado$/m',$output),'cada línea debe llevar timestamp con milisegundos: '.$output);
+    $assert(str_contains($output,'[MAILBOX] buzon-crisla@example.com'));
+    $assert(str_contains($output,'supplier_community_service -> match'),'debe verse la señal comunidad+servicio actuando: '.$output);
+    $assert(str_contains($output,'[DECISION] classified'));
+    $assert(!str_contains($output,'sk-esto-nunca-debe-verse'),'una API key nunca debe imprimirse, aunque venga en los campos: '.$output);
+    $assert(!str_contains($output,'esto-tampoco-debe-verse'),'una contraseña/secreto nunca debe imprimirse ni dentro de un bloque JSON: '.$output);
+    $assert(str_contains($output,'[redacted]'),'las claves sensibles deben quedar sustituidas por [redacted], no simplemente omitidas: '.$output);
+});
+$test('DebugTracer: input_tokens/output_tokens son datos funcionales, no se redactan pese a contener "token"',static function()use($assert):void{
+    $tracer=new Salvest\DebugTracer(true);
+    ob_start();
+    $tracer->fields('OPENAI',['input_tokens'=>18342,'output_tokens'=>212,'cron_token'=>'esto-si-debe-redactarse','oauth_access_token'=>'esto-tambien']);
+    $output=ob_get_clean();
+    $assert(str_contains($output,'input_tokens=18342'),'los contadores de tokens de OpenAI son datos funcionales pedidos explícitamente, no un secreto: '.$output);
+    $assert(str_contains($output,'output_tokens=212'),'idem para output_tokens: '.$output);
+    $assert(str_contains($output,'cron_token=[redacted]'),'un token real de autenticación sí debe redactarse: '.$output);
+    $assert(str_contains($output,'oauth_access_token=[redacted]'),'un token OAuth también debe redactarse: '.$output);
 });
 $test('panel Revisar: el <select> de comunidad refleja el community_id ya resuelto, no solo el texto sugerido',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);

@@ -25,18 +25,21 @@ final class InvoiceRouter
      *   (not ambiguous), and that community has at least one supplier on file. Must return one
      *   of the candidate ids or null; any other value is treated as null. Worker.php supplies a
      *   closure that makes the real second OpenAI call; tests can supply a plain function.
+     * @param (callable(string,string,array<string,mixed>):void)|null $trace Debug-only observer
+     *   forwarded verbatim into Classifier::classify()/resolveSupplierInCommunity() — see their
+     *   docblocks. Never affects which branch this method takes; null (the normal case) costs nothing.
      * @return array{decision:array,supplier:?array,raw_supplier_name:string,service:string,status:string,message_status:string,imap_destination:string,drive_upload:bool,reason:?string,evidence:array}
      */
-    public function route(array $invoice,string $sender,string $context='',?callable $restrictedResolver=null):array
+    public function route(array $invoice,string $sender,string $context='',?callable $restrictedResolver=null,?callable $trace=null):array
     {
-        $decision=$this->classifier->classify($invoice,$context);
+        $decision=$this->classifier->classify($invoice,$context,$trace);
         $community=$decision['community'];
         $rawSupplierName=trim((string)($invoice['proveedor']??''));
 
         $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;
 
         if($community){
-            $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender);
+            $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender,$trace);
             $supplier=$resolved['supplier'];$supplierEvidence=$resolved['evidence'];
             if($supplier){
                 $relation=['category'=>$supplier['category'],'contract_reference'=>$supplier['contract_reference']];

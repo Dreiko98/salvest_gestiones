@@ -790,6 +790,33 @@ $test('segunda llamada restringida: con dos candidatos ambiguos en el primer int
     $assert($route['status']==='needs_review');
 });
 
+$test('Text::normalizeIdentifier(): H-12815601, H12815601, H 12815601 y h12815601 son el mismo CIF',static function()use($assert):void{
+    $canonical='h12815601';
+    foreach(['H-12815601','H12815601','H 12815601','h12815601','H.12815601','h-12.815601'] as $value){
+        $assert(Salvest\Text::normalizeIdentifier($value)===$canonical,"\"$value\" debería normalizar a \"$canonical\", dio \"".Salvest\Text::normalizeIdentifier($value).'"');
+    }
+});
+$test('caso real BERNAT GUILLEM DETENÇA 39: el guion del CIF del PDF no debe impedir la coincidencia con el maestro',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    // El maestro guarda el CIF tal cual lo dieron de alta, sin guion.
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['39','BERNAT GUILLEM DETENÇA 39',Salvest\Text::normalize('BERNAT GUILLEM DETENÇA 39'),'H12815601','Carrer Bernat Guillem Detença 39','07000','Palma','39 - BERNAT GUILLEM DETENCA 39']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    // El PDF real lo trae con guion.
+    $result=(new Salvest\Classifier($db))->classify(['comunidad_cif'=>'H-12815601']);
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,
+        'un CIF con guion en el PDF debe reconocer al mismo titular que el maestro sin guion: '.json_encode($result));
+    $assert($result['evidence']['field']==='holder_cif' && $result['evidence']['type']==='exact','debe resolverse como coincidencia exacta de CIF titular, no por fuzzy');
+});
+$test('CIF de proveedor con guion también debe resolver contra el maestro sin guion (global y dentro de comunidad)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'50','CP CINCUENTA','PROTECCION INCENDIOS SL','EXTINTORES','A12815601');
+    $global=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'A-12.815601'],'facturas@otra.example');
+    $assert($global['supplier']!==null && (int)$global['supplier']['id']===$fixture['supplierId'],'resolveSupplier() global también debe ignorar el guion/puntos del CIF: '.json_encode($global));
+    $inCommunity=(new Salvest\Classifier($db))->resolveSupplierInCommunity($fixture['communityId'],['proveedor'=>'','proveedor_cif'=>'A-12.815601'],'facturas@otra.example');
+    $assert($inCommunity['supplier']!==null && (int)$inCommunity['supplier']['id']===$fixture['supplierId'],'resolveSupplierInCommunity() también debe ignorar el guion/puntos del CIF: '.json_encode($inCommunity));
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

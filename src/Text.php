@@ -15,6 +15,21 @@ final class Text
         return implode(' ', array_map(static fn(string $word): string => $replacements[$word] ?? $word, $words));
     }
 
+    /**
+     * For CIF/NIF and other fiscal identifiers only — NOT a replacement for normalize().
+     * normalize() deliberately turns separators into a single space (it's built for matching
+     * addresses/names as sequences of words), so "H-12815601" -> "h 12815601" while
+     * "H12815601" -> "h12815601": two representations of the exact same identifier end up
+     * different. Identifiers have no words to preserve, so every separator is just dropped:
+     * "H-12815601", "H12815601", "H 12815601" and "h12815601" all become "h12815601".
+     */
+    public static function normalizeIdentifier(?string $value): string
+    {
+        $value = trim((string)$value);
+        $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
+        return mb_strtolower((string)preg_replace('/[^a-zA-Z0-9]+/', '', $ascii), 'UTF-8');
+    }
+
     /** Common Spanish legal-form suffixes, longest first so "s a u" strips before a
      * shorter form could partially match. Used only for comparing supplier/company
      * names — general normalize() must stay untouched for addresses etc. */

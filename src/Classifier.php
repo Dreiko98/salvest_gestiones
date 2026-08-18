@@ -31,7 +31,7 @@ final class Classifier
         // identifiers because every community row requires a CIF at import time, while
         // CUPS/contract/reference are optional per-community entries and more likely to
         // be missing or stale.
-        $holderCif = Text::normalize((string)($invoice['comunidad_cif'] ?? ''));
+        $holderCif = Text::normalizeIdentifier((string)($invoice['comunidad_cif'] ?? ''));
         if ($holderCif !== '') {
             $row = $this->matchByNormalizedCif($holderCif);
             if ($row) return ['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>'holder_cif','type'=>'exact']];
@@ -63,11 +63,13 @@ final class Classifier
             'evidence'=>['field'=>'address','type'=>'fuzzy','score'=>$bestScore / 100]];
     }
 
-    /** community.cif is stored as typed (spacing/case may vary), so this compares normalized values in PHP rather than in SQL. */
+    /** community.cif is stored as typed — dashes, spaces, case all vary in practice (real
+     * case: PDF "H-12815601" vs master "H12815601") — so this compares identifier-normalized
+     * values in PHP rather than in SQL. */
     private function matchByNormalizedCif(string $holderCif): ?array
     {
         foreach ($this->db->all('SELECT * FROM communities WHERE active=1') as $community) {
-            if (Text::normalize((string)$community['cif']) === $holderCif) return $community;
+            if (Text::normalizeIdentifier((string)$community['cif']) === $holderCif) return $community;
         }
         return null;
     }
@@ -82,12 +84,13 @@ final class Classifier
     public function resolveSupplier(array $invoice, string $sender): array
     {
         $name = Text::normalize((string)($invoice['proveedor'] ?? ''));
-        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? ''));
+        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? '')); // for alias lookups below, which store their own normalized_value the same way
+        $cifIdentifier = Text::normalizeIdentifier((string)($invoice['proveedor_cif'] ?? '')); // for the real suppliers.cif column, dashes/spaces and all
         $domain = Text::normalize(substr(strrchr($sender, '@') ?: '', 1));
         $suppliers = $this->db->all('SELECT s.*,st.name service_type_name FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id WHERE s.active=1');
-        if ($cif !== '') {
+        if ($cifIdentifier !== '') {
             foreach ($suppliers as $supplier) {
-                if (Text::normalize((string)$supplier['cif']) === $cif) {
+                if (Text::normalizeIdentifier((string)$supplier['cif']) === $cifIdentifier) {
                     return ['supplier'=>$supplier,'evidence'=>['field'=>'supplier_cif','type'=>'exact']];
                 }
             }
@@ -145,9 +148,9 @@ final class Classifier
         $none = ['supplier'=>null,'evidence'=>null,'ambiguous'=>false];
         if (!$rows) return $none;
 
-        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? ''));
-        if ($cif !== '') {
-            $found = self::uniqueMatch($rows, static fn(array $r): bool => (string)($r['cif'] ?? '') !== '' && Text::normalize((string)$r['cif']) === $cif);
+        $cifIdentifier = Text::normalizeIdentifier((string)($invoice['proveedor_cif'] ?? ''));
+        if ($cifIdentifier !== '') {
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => (string)($r['cif'] ?? '') !== '' && Text::normalizeIdentifier((string)$r['cif']) === $cifIdentifier);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'supplier_cif','type'=>'exact'],'ambiguous'=>false];
         }
 
@@ -158,6 +161,7 @@ final class Classifier
         }
 
         $domain = Text::normalize(substr(strrchr($sender, '@') ?: '', 1));
+        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? '')); // aliases store normalized_value via normalize(), not normalizeIdentifier()
         $candidateValues = array_filter([$providerName, $cif, $domain], static fn(string $v): bool => $v !== '');
         if ($candidateValues) {
             $supplierIds = array_map(static fn(array $r): int => (int)$r['id'], $rows);

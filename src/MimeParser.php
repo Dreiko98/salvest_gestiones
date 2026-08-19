@@ -33,8 +33,18 @@ final class MimeParser
     /** @param array<string,string> $headers @param list<array<string,mixed>> $attachments @param list<string> $plain */
     private function walk(array $headers, string $body, array &$attachments, array &$plain, int $index): void
     {
-        $type = strtolower($headers['content-type'] ?? 'text/plain');
-        if (str_starts_with($type, 'multipart/') && preg_match('/boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i', $type, $match)) {
+        // The boundary must keep its original case: Outlook/Hotmail and Apple Mail routinely
+        // generate mixed-case boundaries (e.g. "_002_FED2942EE6AB...hotmailcom_",
+        // "Apple-Mail=_8A6213BB-..."), and explode() is byte-exact. Matching the boundary against
+        // a lowercased copy of Content-Type — used only to check the "multipart/" type prefix,
+        // which genuinely is case-insensitive — silently produced a lowercased boundary that
+        // never matched the real (mixed-case) delimiters in the body. The whole message then fell
+        // through as a single unsplit chunk starting with "--", which the very next check exists
+        // to skip (the closing boundary's epilogue) — so it was discarded as "no parts found",
+        // with zero attachments, for every sender whose mail client capitalises its boundaries.
+        $contentType = $headers['content-type'] ?? 'text/plain';
+        $type = strtolower($contentType);
+        if (str_starts_with($type, 'multipart/') && preg_match('/boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i', $contentType, $match)) {
             $boundary = $match[1] ?: $match[2];
             foreach (explode('--'.$boundary, $body) as $part) {
                 $part = ltrim($part, "\r\n");

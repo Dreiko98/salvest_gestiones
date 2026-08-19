@@ -172,6 +172,35 @@ $test('mime sin documentos',static function()use($assert):void{
     $assert(count($message['attachments'])===0);
     $assert($message['body']==='No contiene facturas.');
 });
+$test('mime con boundary en mayúsculas (Outlook/Hotmail, Apple Mail) sí debe detectar el adjunto — caso real: "Factura rames facsa"',static function()use($assert):void{
+    // Reproduce exactamente la forma real de un correo de Hotmail que se marcó "ignored" sin
+    // haber detectado su PDF: boundary con mayúsculas ("_002_...hotmailcom_"), multipart/mixed
+    // con una parte text/plain y una parte application/pdf con filename en RFC2047 (Windows-1252).
+    $boundary='_002_FED2942EE6AB4DB983A124F2F96043ABhotmailcom_';
+    $pdfPart="Content-Type: application/pdf;\r\n\tname=\"=?Windows-1252?Q?FACSA_ABRIL_45.42=80_RAMSES.pdf?=\"\r\n".
+        "Content-Disposition: attachment;\r\n\tfilename=\"=?Windows-1252?Q?FACSA_ABRIL_45.42=80_RAMSES.pdf?=\"\r\n".
+        "Content-Transfer-Encoding: base64\r\n\r\n".base64_encode('%PDF-demo-outlook');
+    $raw="From: Juan Carlos M P <neococo@hotmail.com>\r\nSubject: Factura rames facsa\r\n".
+        "Content-Type: multipart/mixed;\r\n\tboundary=\"$boundary\"\r\n\r\n".
+        "--$boundary\r\nContent-Type: text/plain; charset=\"Windows-1252\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n\r\n".
+        "--$boundary\r\n$pdfPart\r\n".
+        "--$boundary--\r\n";
+    $message=(new Salvest\MimeParser())->parse($raw);
+    $assert(count($message['attachments'])===1,'debe encontrar el PDF pese al boundary en mayúsculas, no tratarlo como correo sin adjuntos: '.json_encode($message['attachments']));
+    $assert($message['attachments'][0]['original_filename']==='FACSA ABRIL 45.42€ RAMSES.pdf','debe decodificar también el nombre RFC2047 en Windows-1252: '.$message['attachments'][0]['original_filename']);
+    $assert($message['attachments'][0]['sha256']===hash('sha256','%PDF-demo-outlook'));
+});
+$test('mime con boundary en mayúsculas estilo Apple Mail (multipart/alternative con adjunto anidado) también debe detectarse',static function()use($assert):void{
+    $boundary='Apple-Mail=_8A6213BB-9E12-49F2-A6CB-9AD20EABA9C3';
+    $raw="From: Juan Carlos Mallo <juancarlos@infortorrent.com>\r\nSubject: Rdo factura ABEL MUS 1\r\n".
+        "Content-Type: multipart/alternative;\r\n\tboundary=\"$boundary\"\r\n\r\n".
+        "--$boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nVer adjunto.\r\n".
+        "--$boundary\r\nContent-Type: application/pdf; name=\"FACTURA_666.pdf\"\r\nContent-Disposition: attachment; filename=\"FACTURA_666.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n".base64_encode('%PDF-apple-mail')."\r\n".
+        "--$boundary--\r\n";
+    $message=(new Salvest\MimeParser())->parse($raw);
+    $assert(count($message['attachments'])===1,'boundary con mayúsculas de Apple Mail también debe encontrar el adjunto: '.json_encode($message['attachments']));
+    $assert($message['attachments'][0]['original_filename']==='FACTURA_666.pdf');
+});
 $test('validación rechaza un falso pdf',static function()use($assert):void{
     try{
         Salvest\DocumentValidator::validate(['payload'=>'esto no es un PDF','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);

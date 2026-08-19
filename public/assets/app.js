@@ -16,6 +16,13 @@ document.addEventListener('submit',event=>{
   if(!window.confirm(form.dataset.confirm||'¿Confirmas que este correo no contiene ninguna factura?')){event.preventDefault();return;}
   form.elements.confirm_dismiss.value='DISMISS';
 });
+const archivedToggle=document.getElementById('archived-today-toggle');
+const archivedPanel=document.getElementById('archived-today-panel');
+archivedToggle?.addEventListener('click',()=>{
+  const open=archivedPanel.hidden;
+  archivedPanel.hidden=!open;
+  archivedToggle.setAttribute('aria-expanded',String(open));
+});
 
 const menuButton=document.querySelector('.menu-toggle');
 const scrim=document.querySelector('.nav-scrim');

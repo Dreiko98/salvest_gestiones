@@ -59,6 +59,7 @@ $sqliteDbWithLock=static function(string $lockBehavior='always-free')use($worker
     },2);
     $pdo->sqliteCreateFunction('RELEASE_LOCK',static fn():int=>1,1);
     $pdo->sqliteCreateFunction('NOW',static fn():string=>date('Y-m-d H:i:s'),0);
+    $pdo->sqliteCreateFunction('CURDATE',static fn():string=>date('Y-m-d'),0);
     $reflection=new ReflectionClass(Salvest\Database::class);
     $db=$reflection->newInstanceWithoutConstructor();
     $property=$reflection->getProperty('pdo');$property->setAccessible(true);$property->setValue($db,$pdo);
@@ -1371,6 +1372,110 @@ $test('/Revisar: "Esto no es una factura" solo aparece cuando el adjunto es el �
     $html=$requestWebApp($webApp,'GET','reviews');
     $assert(substr_count($html,'Esto no es una factura')===1,'solo el correo con un único adjunto reseñable debe ofrecer la acción: apariciones='.substr_count($html,'Esto no es una factura'));
     $assert(str_contains($html,'Este correo volverá a la bandeja de entrada y Salvest dejará de procesarlo en futuras ejecuciones. Se conservará el historial técnico de este intento. ¿Confirmas que este correo no contiene ninguna factura?'),'debe usarse el texto de confirmación exacto');
+});
+
+// ---- Dashboard: estimación honesta de la próxima ejecución (nunca una cuenta atrás falsa) ----
+$test('WebApp::nextRunEstimate(): sin ninguna ejecución por cron, no hay estimación',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'nextRunEstimate');$method->setAccessible(true);
+    $assert($method->invoke($webApp)===null,'sin datos históricos no debe inventarse ninguna estimación');
+});
+$test('WebApp::nextRunEstimate(): con una sola ejecución por cron tampoco hay estimación (hace falta al menos un intervalo)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u1','cron','2026-08-19 10:00:00','2026-08-19 10:00:05','completed']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'nextRunEstimate');$method->setAccessible(true);
+    $assert($method->invoke($webApp)===null,'un único punto no permite calcular ningún intervalo real');
+});
+$test('WebApp::nextRunEstimate(): calcula el rango real observado (mínimo y máximo intervalo), no una media inventada',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    // Tres ejecuciones por cron: gaps reales de 10 min y 40 min (medio: 25 min).
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u1','cron','2026-08-19 09:00:00','2026-08-19 09:00:05','completed']);
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u2','cron','2026-08-19 09:10:00','2026-08-19 09:10:05','completed']);
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u3','cron','2026-08-19 09:50:00','2026-08-19 09:50:05','completed']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'nextRunEstimate');$method->setAccessible(true);
+    $estimate=$method->invoke($webApp);
+    $assert($estimate!==null,'con dos intervalos reales sí debe poder estimar');
+    $assert($estimate['avg_minutes']===25,'la media de 10 y 40 minutos es 25: dio '.$estimate['avg_minutes']);
+    $assert($estimate['from']->format('H:i')==='10:00','el extremo inferior debe ser el último inicio + el gap más pequeño observado (10 min): '.$estimate['from']->format('H:i'));
+    $assert($estimate['to']->format('H:i')==='10:30','el extremo superior debe ser el último inicio + el gap más grande observado (40 min): '.$estimate['to']->format('H:i'));
+});
+$test('WebApp::nextRunEstimate(): las ejecuciones manuales no distorsionan el patrón del cron automático',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u1','cron','2026-08-19 09:00:00','2026-08-19 09:00:05','completed']);
+    // Un clic manual un minuto después no debe colarse como si fuera el patrón real del cron.
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u2','manual','2026-08-19 09:01:00','2026-08-19 09:01:05','completed']);
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status) VALUES (?,?,?,?,?)",['u3','cron','2026-08-19 09:30:00','2026-08-19 09:30:05','completed']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'nextRunEstimate');$method->setAccessible(true);
+    $estimate=$method->invoke($webApp);
+    $assert($estimate!==null && $estimate['avg_minutes']===30,'el intervalo debe calcularse solo entre ejecuciones cron (09:00 -> 09:30 = 30 min), ignorando la manual: '.json_encode($estimate));
+});
+$test('Inicio: cuando hay estimación, se muestra como rango honesto, no como cuenta atrás con segundos',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    // Tiempos relativos a "ahora", no fechas fijas: la última ejecución fue hace 5 minutos y el
+    // gap observado (20 min) proyecta el extremo superior del rango 15 minutos hacia el futuro,
+    // para que el test siga siendo válido sin importar cuándo se ejecute la batería.
+    $first=(new DateTimeImmutable('-25 minutes'))->format('Y-m-d H:i:s');
+    $second=(new DateTimeImmutable('-5 minutes'))->format('Y-m-d H:i:s');
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status,classified_count,needs_review_count,error_count) VALUES (?,?,?,?,?,?,?,?)",['u1','cron',$first,$first,'completed',0,0,0]);
+    $db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status,classified_count,needs_review_count,error_count) VALUES (?,?,?,?,?,?,?,?)",['u2','cron',$second,$second,'completed',1,0,0]);
+    // botStatusCard() directamente: dashboard() en sí usa CURDATE() para otras métricas ajenas a
+    // esto, que SQLite no soporta — no hace falta pasar por ahí para probar esta pieza concreta.
+    $method=new ReflectionMethod(Salvest\WebApp::class,'botStatusCard');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'Intervalo medio reciente'),'debe verse la etiqueta de intervalo medio: '.$html);
+    $assert(str_contains($html,'Próxima ejecución estimada'),'debe verse la estimación como rango');
+    $assert(!preg_match('/id="[a-z-]*countdown/',$html),'no debe existir ningún elemento de cuenta atrás en directo simulando precisión que no existe');
+});
+
+// ---- Inicio: "Archivadas hoy" despliega dónde se guardó cada factura ----
+$test('Inicio: "Archivadas hoy" sin ninguna factura archivada hoy muestra el mensaje explicativo, no una tabla vacía',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'Todavía no se ha archivado ninguna factura hoy.'),'sin datos debe verse el mensaje explicativo: '.$html);
+    $assert(str_contains($html,'id="archived-today-panel"') && str_contains($html,' hidden'),'el panel debe existir pero permanecer cerrado por defecto');
+});
+$test('Inicio: "Archivadas hoy" lista comunidad, proveedor, servicio y ruta de cada factura archivada hoy',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO communities(official_name,active) VALUES (?,1)',['MENENDEZ YPELAYO 10']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,community_id,provider,service_type,output_path,drive_path) VALUES (?,?,?,?,?,?,NULL)",
+        ['classified',date('Y-m-d H:i:s'),$communityId,'CRISLA','limpieza','/var/storage/comunidades/menendez/2026/08/factura.pdf']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'MENENDEZ YPELAYO 10'),'debe verse la comunidad: '.$html);
+    $assert(str_contains($html,'CRISLA'),'debe verse el proveedor');
+    $assert(str_contains($html,'limpieza'),'debe verse el servicio');
+    $assert(str_contains($html,'/var/storage/comunidades/menendez/2026/08/factura.pdf'),'debe verse la ruta local donde se guardó');
+});
+$test('Inicio: "Archivadas hoy" prefiere la ruta de Drive sobre la ruta local cuando existen ambas',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,provider,service_type,output_path,drive_path) VALUES (?,?,?,?,?,?)",
+        ['classified',date('Y-m-d H:i:s'),'IBERDROLA','electricidad','/var/storage/local/factura.pdf','COMUNIDADES/Menendez/2026/factura.pdf']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'COMUNIDADES/Menendez/2026/factura.pdf'),'con Drive habilitado debe mostrarse la ruta de Drive: '.$html);
+    $assert(!str_contains($html,'/var/storage/local/factura.pdf'),'no debe mostrar también la ruta local cuando ya hay una de Drive');
+});
+$test('Inicio: "Archivadas hoy" no incluye facturas clasificadas en días anteriores',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $yesterday=(new DateTimeImmutable('-1 day'))->format('Y-m-d H:i:s');
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,provider,service_type,output_path) VALUES (?,?,?,?,?)",
+        ['classified',$yesterday,'PROVEEDOR DE AYER','agua','/x/ayer.pdf']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(!str_contains($html,'PROVEEDOR DE AYER'),'una factura archivada ayer no debe aparecer en el historial de hoy: '.$html);
+    $assert(str_contains($html,'Todavía no se ha archivado ninguna factura hoy.'));
+});
+$test('Inicio: el botón "Archivadas hoy" está correctamente enlazado al panel desplegable',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $_SERVER['REQUEST_METHOD']='GET';$_GET=['route'=>''];
+    $method=new ReflectionMethod(Salvest\WebApp::class,'dashboard');$method->setAccessible(true);
+    ob_start();$method->invoke($webApp);$html=ob_get_clean();
+    restore_error_handler();
+    $assert(str_contains($html,'id="archived-today-toggle"') && str_contains($html,'aria-controls="archived-today-panel"'),'el botón debe apuntar al panel por aria-controls: '.$html);
+    $assert(str_contains($html,'id="archived-today-panel"'),'el panel debe existir con el id esperado');
 });
 
 $failed=0;

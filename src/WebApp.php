@@ -62,8 +62,32 @@ final class WebApp
         $status=$attention?'<section class="status warning"><div><span class="status-ring"><i></i></span><span><strong>'.$attention.' facturas pendientes de revisar</strong><small>Comprueba la comunidad y el proveedor antes de archivarlas.</small></span></div><a class="button" href="/?route=reviews">Revisar facturas</a></section>'
             :'<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Todo está al día</strong><small>No hay facturas pendientes de revisar.</small></span></section>';
         $this->page('Inicio','<div class="page-heading"><div><span class="eyebrow">Resumen de hoy</span><h1>Gestión de facturas</h1><p>El sistema revisa y archiva automáticamente las facturas recibidas.</p></div></div>'.$status.
-            '<div class="metrics"><article><span class="metric-label">Archivadas hoy</span><strong>'.$classified.'</strong></article><article><span class="metric-label">Comunidades activas</span><strong>'.$communities.'</strong></article><article><span class="metric-label">Proveedores activos</span><strong>'.$suppliers.'</strong></article></div>'.
+            '<div class="metrics"><button type="button" class="metric-toggle" id="archived-today-toggle" aria-expanded="false" aria-controls="archived-today-panel"><span class="metric-label">Archivadas hoy</span><strong>'.$classified.'</strong></button><article><span class="metric-label">Comunidades activas</span><strong>'.$communities.'</strong></article><article><span class="metric-label">Proveedores activos</span><strong>'.$suppliers.'</strong></article></div>'.
+            $this->archivedTodayPanel().
             $this->botStatusCard());
+    }
+
+    /** The "Archivadas hoy" tile toggles this panel (see app.js's #archived-today-toggle
+     * listener) — where each of today's classified invoices actually ended up: local path and,
+     * when Drive is enabled, its Drive path too. Starts hidden; never rendered open by default,
+     * same closed-by-default convention as the technical-detail panels on /Revisar. */
+    private function archivedTodayPanel(): string
+    {
+        $rows=$this->db->all("SELECT pa.processed_at,pa.provider,pa.service_type,pa.output_path,pa.drive_path,c.official_name
+            FROM processed_attachments pa LEFT JOIN communities c ON c.id=pa.community_id
+            WHERE pa.status='classified' AND DATE(pa.processed_at)=CURDATE() ORDER BY pa.processed_at DESC");
+        if(!$rows){
+            $body='<p class="muted">Todavía no se ha archivado ninguna factura hoy.</p>';
+        }else{
+            $tableRows='';
+            foreach($rows as $row){
+                $time=(static function(string $value):string{try{return(new \DateTimeImmutable($value))->format('H:i');}catch(\Throwable){return'—';}})((string)$row['processed_at']);
+                $location=$row['drive_path']?:($row['output_path']?:'—');
+                $tableRows.='<tr><td class="mono">'.$this->e($time).'</td><td><strong>'.$this->e($row['official_name']?:'Sin comunidad').'</strong></td><td>'.$this->e($row['provider']?:'—').'</td><td>'.$this->e($row['service_type']?:'—').'</td><td class="mono">'.$this->e($location).'</td></tr>';
+            }
+            $body='<div class="table-wrap"><table><thead><tr><th>Hora</th><th>Comunidad</th><th>Proveedor</th><th>Servicio</th><th>Ruta</th></tr></thead><tbody>'.$tableRows.'</tbody></table></div>';
+        }
+        return '<section class="card archived-today-panel" id="archived-today-panel" hidden><div class="section-heading flat"><div><span class="eyebrow">Hoy</span><h2>Facturas archivadas</h2></div></div>'.$body.'</section>';
     }
 
     private function botStatusCard(): string
@@ -78,10 +102,42 @@ final class WebApp
             $archivadas=(int)$lastRun['classified_count'];$pendientes=(int)$lastRun['needs_review_count'];$errores=(int)$lastRun['error_count'];
             $resultLine='<p class="bot-status-line">Resultado: <strong>'.$archivadas.' '.($archivadas===1?'archivada':'archivadas').' · '.$pendientes.' '.($pendientes===1?'pendiente':'pendientes').' · '.$errores.' '.($errores===1?'error':'errores').'</strong></p>';
         }
+        $estimateLine='';
+        if($estimate=$this->nextRunEstimate()){
+            $now=new \DateTimeImmutable('now');
+            $estimateLine=$now<$estimate['to']
+                ?'<p class="bot-status-line">Intervalo medio reciente: <strong>~'.$estimate['avg_minutes'].' min</strong> · Próxima ejecución estimada: <strong>entre las '.$estimate['from']->format('H:i').' y las '.$estimate['to']->format('H:i').'</strong></p>'
+                :'<p class="bot-status-line">Intervalo medio reciente: <strong>~'.$estimate['avg_minutes'].' min</strong> · Según el patrón reciente, podría ejecutarse en cualquier momento.</p>';
+        }
         $label=$runningNow?'Bot ejecutándose…':'Ejecutar bot ahora';
         $button='<button type="button" class="button" id="run-worker-btn" data-run-worker data-csrf="'.$this->auth->csrf().'" data-idle-label="Ejecutar bot ahora" data-busy-label="Bot ejecutándose…"'.($runningNow?' disabled':'').'>'.$this->e($label).'</button>';
-        return '<section class="card bot-status"><div class="section-heading flat"><div><span class="eyebrow">Automatización</span><h2>Estado del bot</h2></div>'.$badge.'</div>'.$lastLine.$resultLine.
+        return '<section class="card bot-status"><div class="section-heading flat"><div><span class="eyebrow">Automatización</span><h2>Estado del bot</h2></div>'.$badge.'</div>'.$lastLine.$resultLine.$estimateLine.
             '<div class="bot-actions">'.$button.'<p class="bot-message" id="run-worker-message" role="status" hidden></p></div></section>';
+    }
+
+    /**
+     * A precise countdown would be dishonest here: the cron trigger runs on GitHub Actions, not
+     * on this server, and Salvest has no way to ask it "when's your next scheduled fire?" — it
+     * only ever finds out a run happened once cron.php is actually hit. GitHub's own cron
+     * scheduling is best-effort, not exact (empirically ~34 min average gap here despite being
+     * configured for every 5 min). So instead of a fake ticking timer, this looks at the actual
+     * gaps between the last several *cron-triggered* runs (manual "Ejecutar bot ahora" clicks are
+     * deliberately excluded — they're not representative of the automatic cadence) and reports
+     * an honest range: the smallest and largest gap actually observed, applied to the last run.
+     * @return array{avg_minutes:int,from:\DateTimeImmutable,to:\DateTimeImmutable}|null
+     */
+    private function nextRunEstimate(): ?array
+    {
+        $runs=$this->db->all("SELECT started_at FROM processing_runs WHERE trigger_type='cron' AND started_at IS NOT NULL ORDER BY started_at DESC LIMIT 11");
+        if(count($runs)<2)return null;
+        try{$starts=array_map(static fn(array $r):\DateTimeImmutable=>new \DateTimeImmutable((string)$r['started_at']),$runs);}
+        catch(\Throwable){return null;}
+        $gaps=[];
+        for($i=0;$i<count($starts)-1;$i++)$gaps[]=$starts[$i]->getTimestamp()-$starts[$i+1]->getTimestamp();
+        if(!$gaps)return null;
+        $avgSeconds=(int)round(array_sum($gaps)/count($gaps));
+        $lastStart=$starts[0];
+        return['avg_minutes'=>(int)round($avgSeconds/60),'from'=>$lastStart->modify('+'.min($gaps).' seconds'),'to'=>$lastStart->modify('+'.max($gaps).' seconds')];
     }
 
     private function formatRunTime(string $datetime): string

@@ -364,7 +364,7 @@ final class WebApp
             // Show them as two clearly distinct facts, not one field pretending to be the other.
             $cards.='<article class="card review-card"><div class="review-head"><div><span class="badge warning">Pendiente de revisión</span><h2>'.$this->e($row['original_filename']).'</h2></div>'.($row['output_path']?'<a class="button button-secondary" href="/?route=download&id='.$row['id'].'">Descargar PDF</a>':'').'</div><div class="review-meta"><span>Proveedor resuelto<strong>'.($row['provider']?$this->e($row['provider']):'Pendiente').'</strong></span><span>Texto detectado<strong>'.$this->e($row['raw_supplier_name']?:'Desconocido').'</strong></span><span>Comunidad sugerida<strong>'.$this->e($row['official_name']?:'Sin asignar').'</strong></span><span>Importe<strong class="mono">'.($row['amount']!==null?$this->e($row['amount']).' €':'—').'</strong></span><span>N.º factura<strong class="mono">'.$this->e($row['invoice_number']?:'—').'</strong></span></div><p class="review-reason">'.$this->e($row['error_message']?:'Comprueba los datos antes de archivar la factura.').'</p>'.
                 '<form method="post" action="/?route=reviews" class="grid review-form"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$row['id'].'"><label>Comunidad<select name="community_id" required><option value="">Seleccionar</option>'.$communityOptions.'</select></label><label>Proveedor<select name="supplier_id" required><option value="">Seleccionar</option>'.$supplierOptions.'</select></label><label>Servicio<select name="service_type" required>'.$serviceOptions.'</select></label><label>Fecha<input type="date" name="invoice_date" value="'.$this->e($row['invoice_date']).'" required></label><label>Importe<input class="mono" name="amount" value="'.$this->e($row['amount']).'"></label><label>Número de factura<input class="mono" name="invoice_number" value="'.$this->e($row['invoice_number']).'"></label><button>Confirmar y archivar</button></form>'.
-                ($row['status']==='needs_review'?$this->reviewActions($row):'').
+                $this->reviewActions($row).
                 $this->technicalDetail($row['debug_trace_json']??null).'</article>';
         }
         $empty='<section class="card empty-state review-empty"><span class="empty-ring"><i></i></span><h2>No hay facturas pendientes de revisar</h2><p>Las nuevas incidencias aparecerán aquí cuando necesiten una decisión.</p></section>';
@@ -415,10 +415,11 @@ final class WebApp
      * siblings (same mailbox/uidvalidity/message_uid, i.e. the same email) purely to pick the
      * right confirmation wording: how many of them are still pending vs already classified, so
      * the person confirming knows exactly what's about to happen before they click. @param array<string,mixed> $row */
-    /** "Volver a procesar" is always available on a needs_review card. "Esto no es una factura"
-     * only appears when this attachment is the sole row for its email — InboxRequeue::dismiss()
-     * enforces the exact same rule server-side regardless, this just avoids showing a button that
-     * would always be refused. @param array<string,mixed> $row */
+    /** "Volver a procesar" is always available on every card /Revisar shows — unclassified,
+     * needs_review or error alike, matching InboxRequeue's own REVIEWABLE_STATUSES exactly.
+     * "Esto no es una factura" only appears when this attachment is the sole row for its email —
+     * InboxRequeue::dismiss() enforces the exact same rule server-side regardless, this just
+     * avoids showing a button that would always be refused. @param array<string,mixed> $row */
     private function reviewActions(array $row): string
     {
         $siblings=$this->db->all('SELECT id,status FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',

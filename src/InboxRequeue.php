@@ -4,8 +4,9 @@ declare(strict_types=1);
 namespace Salvest;
 
 /**
- * Two related /Revisar actions on a needs_review attachment, both of which return the email to
- * INBOX and both of which never delete anything — only relabel status, keeping extraction_json,
+ * Two related /Revisar actions on any attachment /Revisar itself lists as pending — unclassified,
+ * needs_review or error (see REVIEWABLE_STATUSES) — both of which return the email to INBOX and
+ * both of which never delete anything — only relabel status, keeping extraction_json,
  * decision_json, debug_trace_json, output_path exactly as they were:
  *
  * - requeue(): "Volver a procesar" — status='requeued'. Every non-succeeded sibling in the same
@@ -21,6 +22,11 @@ final class InboxRequeue
 {
     /** Statuses that already succeeded and must never be touched by either action. */
     private const UNTOUCHABLE_STATUSES = ['classified', 'duplicate'];
+
+    /** Every status /Revisar itself lists as pending (see WebApp::reviews()'s SELECT) — both
+     * actions are available from any of them, not just needs_review: most of a real backlog is
+     * typically unclassified (community never resolved at all), which is exactly as actionable. */
+    private const REVIEWABLE_STATUSES = ['unclassified', 'needs_review', 'error'];
 
     /** @param array<string,mixed> $config
      * @param (callable(array<string,mixed>,string):object{connect():void,findUidsByMessageId(string):array,move(string,string):void,close():void})|null $imapClientFactory
@@ -115,7 +121,7 @@ final class InboxRequeue
     {
         $attachment = $this->db->one('SELECT * FROM processed_attachments WHERE id=?', [$attachmentId]);
         if (!$attachment) return ['ok' => false, 'message' => 'Esa factura ya no existe.'];
-        if ($attachment['status'] !== 'needs_review') {
+        if (!in_array($attachment['status'], self::REVIEWABLE_STATUSES, true)) {
             return ['ok' => false, 'message' => 'Esta factura ya no está pendiente de revisión (puede que ya se haya actuado sobre ella); no se ha hecho nada.'];
         }
 

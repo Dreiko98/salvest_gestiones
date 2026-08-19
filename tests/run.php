@@ -1064,17 +1064,17 @@ $test('/Revisar: una factura unclassified (comunidad no resuelta) también muest
     $assert(str_contains($html,'community_unresolved'),'debe verse el motivo que impidió clasificar en el JSON completo');
     $assert(!str_contains($html,'No hay detalle técnico disponible'),'no debe caer en el mensaje de "sin traza" cuando sí la hay');
 });
-$test('/Revisar: el botón "Volver a procesar" solo aparece en facturas needs_review, con el texto de confirmación de un único adjunto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+$test('/Revisar: el botón "Volver a procesar" aparece en needs_review, unclassified y error por igual — la mayoría del backlog real es unclassified',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
     $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
     $mailboxId=(int)$db->pdo()->lastInsertId();
-    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
-        [$mailboxId,'1001','500','needs_review',date('Y-m-d H:i:s'),'sola.pdf']);
-    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
-        [$mailboxId,'2002','900','unclassified',date('Y-m-d H:i:s'),'otra-sin-clasificar.pdf']);
+    foreach([['1001','500','needs_review','sola.pdf'],['2002','900','unclassified','otra-sin-clasificar.pdf'],['3003','100','error','con-error.pdf']] as [$uidvalidity,$uid,$status,$filename]){
+        $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+            [$mailboxId,$uidvalidity,$uid,$status,date('Y-m-d H:i:s'),$filename]);
+    }
     $html=$requestWebApp($webApp,'GET','reviews');
-    $assert(substr_count($html,'Volver a procesar')===1,'el botón debe aparecer una sola vez, solo en la tarjeta needs_review: '.substr_count($html,'Volver a procesar'));
+    $assert(substr_count($html,'Volver a procesar')===3,'el botón debe aparecer en las tres tarjetas — needs_review, unclassified y error: '.substr_count($html,'Volver a procesar'));
     $assert(str_contains($html,'Esta factura volverá a la bandeja de entrada y Salvest intentará procesarla de nuevo en la próxima ejecución. Se conservará el historial técnico del intento anterior. ¿Continuar?'),'con un único adjunto pendiente debe usarse el texto de confirmación singular');
 });
 $test('/Revisar: con varios adjuntos pendientes en el mismo correo, la confirmación usa el texto plural',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
@@ -1297,6 +1297,24 @@ $test('InboxRequeue::dismiss(): si el movimiento IMAP original falló, se comple
     $neverCalled=static function()use($assert){$assert(false,'no debe construirse ningún ImapClient cuando el movimiento original falló');};
     $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,$neverCalled))->dismiss($fixture['attachmentIds'][0]);
     $assert($result['ok']===true,'debe completarse igualmente, solo con el cambio de estado: '.$result['message']);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='dismissed_not_invoice');
+});
+$test('InboxRequeue::requeue(): también funciona partiendo de unclassified, no solo needs_review — la mayoría del backlog real es unclassified',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['unclassified']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->requeue($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true,'unclassified debe poder reencolarse igual que needs_review: '.$result['message']);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='requeued');
+});
+$test('InboxRequeue::dismiss(): también funciona partiendo de unclassified, no solo needs_review',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['unclassified']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true,'unclassified debe poder descartarse igual que needs_review: '.$result['message']);
     $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
     $assert($row['status']==='dismissed_not_invoice');
 });

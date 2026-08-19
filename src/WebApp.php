@@ -464,7 +464,10 @@ final class WebApp
     private function page(string $title,string $body,bool $navigation=true): void
     {
         header('X-Content-Type-Options: nosniff'); header('X-Frame-Options: SAMEORIGIN'); header("Content-Security-Policy: default-src 'self'; style-src 'self'; script-src 'self'");
-        $head='<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0A0A0A"><title>'.$this->e($title).' · Salvest</title><link rel="icon" href="/assets/logoSalvest.png"><link rel="stylesheet" href="/assets/fonts.css"><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" defer></script>';
+        // Cache-busted by the file's own mtime — every deploy overwrites app.css/app.js, which
+        // changes their mtime, which changes this query string, which forces browsers to fetch
+        // the new version instead of serving a stale cached copy. No manual version bump needed.
+        $head='<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0A0A0A"><title>'.$this->e($title).' · Salvest</title><link rel="icon" href="/assets/logoSalvest.png"><link rel="stylesheet" href="/assets/fonts.css"><link rel="stylesheet" href="/assets/app.css?v='.$this->assetVersion('app.css').'"><script src="/assets/app.js?v='.$this->assetVersion('app.js').'" defer></script>';
         if(!$navigation){echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="login-page"><main class="login-main">'.$body.'</main></body></html>';return;}
         $route=trim((string)($_GET['route']??''));if($route==='index.php')$route='';
         $nav=$this->navLink('','Inicio','home',$route).$this->navLink('communities','Comunidades','communities',$route).$this->navLink('suppliers','Proveedores','suppliers',$route).$this->navLink('mailboxes','Correos','mail',$route).$this->navLink('reviews','Revisar','review',$route).$this->navLink('storage','Almacenamiento','storage',$route);
@@ -473,6 +476,15 @@ final class WebApp
         echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="app-page">'.$mobile.'<div class="app-shell">'.$sidebar.'<main class="main-content">'.$body.'</main></div></body></html>';
     }
     private function e(mixed $value): string{return htmlspecialchars((string)$value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');}
+
+    /** mtime of a public/assets/ file, used as a cache-busting query string — '0' (a stable,
+     * harmless fallback) if the file can't be stat'd for any reason, never a fatal error over a
+     * caching nicety. */
+    private function assetVersion(string $file): string
+    {
+        $mtime=@filemtime(dirname(__DIR__).'/public/assets/'.$file);
+        return $mtime!==false?(string)$mtime:'0';
+    }
 
     /** "Volver a procesar": only ever rendered for status==='needs_review' (checked by the
      * caller) — InboxRequeue revalidates that server-side regardless. Looks at this attachment's

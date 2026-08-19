@@ -1570,6 +1570,19 @@ $test('AttachmentPurge::purge(): el resultado trae la fila borrada completa, par
     $assert(isset($result['deleted']) && $result['deleted']['original_filename']==='para-auditar.pdf','el resultado debe traer la fila completa que se acaba de borrar, para el audit_log');
 });
 
+// ---- WebApp::page(): cache-busting de app.css/app.js ----
+$test('WebApp::page(): app.css y app.js se sirven con ?v=<mtime real>, para que un despliegue nunca quede oculto tras caché del navegador',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $realCssVersion=(string)filemtime(__DIR__.'/../public/assets/app.css');
+    $realJsVersion=(string)filemtime(__DIR__.'/../public/assets/app.js');
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $method=new ReflectionMethod(Salvest\WebApp::class,'page');$method->setAccessible(true);
+    ob_start();$method->invoke($webApp,'Prueba','<p>contenido</p>');$html=ob_get_clean();
+    restore_error_handler();
+    $assert(str_contains($html,'/assets/app.css?v='.$realCssVersion),'debe usar el mtime real de app.css, no un valor fijo: '.$html);
+    $assert(str_contains($html,'/assets/app.js?v='.$realJsVersion),'debe usar el mtime real de app.js: '.$html);
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

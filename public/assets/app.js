@@ -10,6 +10,12 @@ document.addEventListener('submit',event=>{
   if(!window.confirm(form.dataset.confirm||'¿Volver a procesar esta factura?')){event.preventDefault();return;}
   form.elements.confirm_requeue.value='REQUEUE';
 });
+document.addEventListener('submit',event=>{
+  const form=event.target.closest('.dismiss-form');
+  if(!form)return;
+  if(!window.confirm(form.dataset.confirm||'¿Confirmas que este correo no contiene ninguna factura?')){event.preventDefault();return;}
+  form.elements.confirm_dismiss.value='DISMISS';
+});
 
 const menuButton=document.querySelector('.menu-toggle');
 const scrim=document.querySelector('.nav-scrim');

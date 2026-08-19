@@ -322,6 +322,12 @@ final class WebApp
             if($result['ok'])$this->audit('requeue','attachment',(int)($_POST['id']??0));
             $this->redirect('/?route=reviews&'.($result['ok']?'requeued=1':'requeue_error='.rawurlencode($result['message'])));
         }
+        if($_SERVER['REQUEST_METHOD']==='POST'&&($_POST['action']??'')==='dismiss'){
+            if(!hash_equals('DISMISS',(string)($_POST['confirm_dismiss']??'')))throw new \RuntimeException('La acción no fue confirmada');
+            $result=(new InboxRequeue($this->db,$this->crypto,$this->config))->dismiss((int)($_POST['id']??0));
+            if($result['ok'])$this->audit('dismiss_not_invoice','attachment',(int)($_POST['id']??0));
+            $this->redirect('/?route=reviews&'.($result['ok']?'dismissed=1':'dismiss_error='.rawurlencode($result['message'])));
+        }
         if($_SERVER['REQUEST_METHOD']==='POST'){
             $attachment=$this->db->one('SELECT * FROM processed_attachments WHERE id=?',[(int)$_POST['id']]);
             $community=$this->db->one('SELECT * FROM communities WHERE id=? AND active=1',[(int)$_POST['community_id']]);
@@ -340,6 +346,8 @@ final class WebApp
         $banner='';
         if(($_GET['requeued']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Factura devuelta a la bandeja de entrada</strong><small>Se procesará de nuevo en la próxima ejecución del bot.</small></span></section>';
         elseif(($_GET['requeue_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo volver a procesar</strong><small>'.$this->e((string)$_GET['requeue_error']).'</small></span></section>';
+        elseif(($_GET['dismissed']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Correo marcado como que no contiene ninguna factura</strong><small>Ha vuelto a la bandeja de entrada y Salvest no volverá a procesarlo.</small></span></section>';
+        elseif(($_GET['dismiss_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo completar</strong><small>'.$this->e((string)$_GET['dismiss_error']).'</small></span></section>';
         $cards='';
         foreach($rows as $row){
             // The system already resolved community_id (a real FK, not just OpenAI's text
@@ -356,7 +364,7 @@ final class WebApp
             // Show them as two clearly distinct facts, not one field pretending to be the other.
             $cards.='<article class="card review-card"><div class="review-head"><div><span class="badge warning">Pendiente de revisión</span><h2>'.$this->e($row['original_filename']).'</h2></div>'.($row['output_path']?'<a class="button button-secondary" href="/?route=download&id='.$row['id'].'">Descargar PDF</a>':'').'</div><div class="review-meta"><span>Proveedor resuelto<strong>'.($row['provider']?$this->e($row['provider']):'Pendiente').'</strong></span><span>Texto detectado<strong>'.$this->e($row['raw_supplier_name']?:'Desconocido').'</strong></span><span>Comunidad sugerida<strong>'.$this->e($row['official_name']?:'Sin asignar').'</strong></span><span>Importe<strong class="mono">'.($row['amount']!==null?$this->e($row['amount']).' €':'—').'</strong></span><span>N.º factura<strong class="mono">'.$this->e($row['invoice_number']?:'—').'</strong></span></div><p class="review-reason">'.$this->e($row['error_message']?:'Comprueba los datos antes de archivar la factura.').'</p>'.
                 '<form method="post" action="/?route=reviews" class="grid review-form"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$row['id'].'"><label>Comunidad<select name="community_id" required><option value="">Seleccionar</option>'.$communityOptions.'</select></label><label>Proveedor<select name="supplier_id" required><option value="">Seleccionar</option>'.$supplierOptions.'</select></label><label>Servicio<select name="service_type" required>'.$serviceOptions.'</select></label><label>Fecha<input type="date" name="invoice_date" value="'.$this->e($row['invoice_date']).'" required></label><label>Importe<input class="mono" name="amount" value="'.$this->e($row['amount']).'"></label><label>Número de factura<input class="mono" name="invoice_number" value="'.$this->e($row['invoice_number']).'"></label><button>Confirmar y archivar</button></form>'.
-                ($row['status']==='needs_review'?$this->requeueForm($row):'').
+                ($row['status']==='needs_review'?$this->reviewActions($row):'').
                 $this->technicalDetail($row['debug_trace_json']??null).'</article>';
         }
         $empty='<section class="card empty-state review-empty"><span class="empty-ring"><i></i></span><h2>No hay facturas pendientes de revisar</h2><p>Las nuevas incidencias aparecerán aquí cuando necesiten una decisión.</p></section>';
@@ -407,15 +415,25 @@ final class WebApp
      * siblings (same mailbox/uidvalidity/message_uid, i.e. the same email) purely to pick the
      * right confirmation wording: how many of them are still pending vs already classified, so
      * the person confirming knows exactly what's about to happen before they click. @param array<string,mixed> $row */
-    private function requeueForm(array $row): string
+    /** "Volver a procesar" is always available on a needs_review card. "Esto no es una factura"
+     * only appears when this attachment is the sole row for its email — InboxRequeue::dismiss()
+     * enforces the exact same rule server-side regardless, this just avoids showing a button that
+     * would always be refused. @param array<string,mixed> $row */
+    private function reviewActions(array $row): string
     {
-        $siblings=$this->db->all('SELECT status FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
+        $siblings=$this->db->all('SELECT id,status FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
             [$row['mailbox_id'],$row['uidvalidity'],$row['message_uid']]);
         $pending=count(array_filter($siblings,static fn(array $s):bool=>!in_array($s['status'],['classified','duplicate'],true)));
-        $confirm=$pending>1
+        $confirmRequeue=$pending>1
             ?'Este correo contiene varios adjuntos. Los pendientes se volverán a procesar; los ya clasificados se conservarán y no volverán a clasificarse. Se conservará el historial técnico de los intentos anteriores. ¿Continuar?'
             :'Esta factura volverá a la bandeja de entrada y Salvest intentará procesarla de nuevo en la próxima ejecución. Se conservará el historial técnico del intento anterior. ¿Continuar?';
-        return '<form method="post" action="/?route=reviews" class="inline requeue-form" data-confirm="'.$this->e($confirm).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="requeue"><input type="hidden" name="confirm_requeue" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="button-secondary">Volver a procesar</button></form>';
+        $requeue='<form method="post" action="/?route=reviews" class="inline requeue-form" data-confirm="'.$this->e($confirmRequeue).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="requeue"><input type="hidden" name="confirm_requeue" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="button-secondary">Volver a procesar</button></form>';
+        $dismiss='';
+        if(count($siblings)===1){
+            $confirmDismiss='Este correo volverá a la bandeja de entrada y Salvest dejará de procesarlo en futuras ejecuciones. Se conservará el historial técnico de este intento. ¿Confirmas que este correo no contiene ninguna factura?';
+            $dismiss='<form method="post" action="/?route=reviews" class="inline dismiss-form" data-confirm="'.$this->e($confirmDismiss).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="dismiss"><input type="hidden" name="confirm_dismiss" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="button-quiet">Esto no es una factura</button></form>';
+        }
+        return '<div class="review-actions">'.$requeue.$dismiss.'</div>';
     }
 
     /** Renders processed_attachments.debug_trace_json (a chronological array of {timestamp,step,data},

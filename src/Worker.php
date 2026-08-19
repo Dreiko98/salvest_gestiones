@@ -88,6 +88,13 @@ final class Worker
                     [$mailbox['id'],$client->uidValidity(),$uid]);
                 if ($existing && in_array($existing['status'],['completed','ignored','needs_review','error'],true)) continue;
                 $message = $this->parser->parse($client->fetch($uid)); $examined++; $counts['messages']++;
+                // Recognises "Esto no es una factura" across an IMAP move — the UID this message
+                // has right now was never seen before (that's exactly why the check above didn't
+                // already skip it), but its Message-ID is stable. Checked before touching OpenAI,
+                // before creating any row, before any folder move: if matched, this cycle treats
+                // the message as if it were never fetched — no saveMessage(), no processAttachment(),
+                // nothing. It simply stays wherever it is (normally INBOX) for good.
+                if ($message['message_id'] !== '' && $this->isDismissedNotInvoice((int)$mailbox['id'], $message['message_id'])) continue;
                 if (!$message['attachments']) {
                     if (!$dryRun) $this->saveMessage($mailbox,$client,$uid,$message,'ignored',0,null);
                     continue;
@@ -134,6 +141,16 @@ final class Worker
                 }
             }
         } finally { $client->close(); }
+    }
+
+    /** Recognition side of InvoiceDismissal — deliberately keyed by (mailbox_id,message_id_header)
+     * only, never by attachment_sha256: dismissing one specific email must never turn into a
+     * global "never look at this PDF again" rule, since the exact same file could legitimately
+     * arrive attached to a genuinely different, real invoice email later. */
+    private function isDismissedNotInvoice(int $mailboxId, string $messageIdHeader): bool
+    {
+        return $this->db->one("SELECT 1 ok FROM processed_messages WHERE mailbox_id=? AND message_id_header=? AND status='dismissed_not_invoice' LIMIT 1",
+            [$mailboxId, $messageIdHeader]) !== null;
     }
 
     /**

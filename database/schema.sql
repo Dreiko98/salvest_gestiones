@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS processed_messages (
   error_message TEXT NULL,
   processed_at DATETIME NOT NULL,
   UNIQUE KEY uq_processed_message (mailbox_id, uidvalidity, message_uid),
+  INDEX idx_processed_messages_message_id (message_id_header),
   CONSTRAINT fk_message_mailbox FOREIGN KEY (mailbox_id) REFERENCES mailboxes(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

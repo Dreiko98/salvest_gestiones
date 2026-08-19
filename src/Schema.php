@@ -22,6 +22,9 @@ final class Schema
         self::column($database,'processing_runs','needs_review_count','INT UNSIGNED NOT NULL DEFAULT 0 AFTER unclassified_count');
         $index=$database->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='communities' AND index_name='uq_communities_external_code'");
         if(!$index)$database->execute('ALTER TABLE communities ADD UNIQUE KEY uq_communities_external_code(external_code)');
+        // Backs Worker::isDismissedNotInvoice()'s lookup — recognising a dismissed email by
+        // Message-ID across an IMAP move happens on every processed message, every cycle.
+        self::index($database,'processed_messages','idx_processed_messages_message_id','message_id_header');
         self::mailboxBaselineMigration($database);
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0002_real_drive_structure')");
@@ -53,5 +56,11 @@ final class Schema
     {
         $exists=$database->one('SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?',[$table,$column]);
         if(!$exists)$database->execute("ALTER TABLE `$table` ADD COLUMN `$column` $definition");
+    }
+
+    private static function index(Database $database,string $table,string $indexName,string $column):void
+    {
+        $exists=$database->one('SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? AND index_name=?',[$table,$indexName]);
+        if(!$exists)$database->execute("ALTER TABLE `$table` ADD INDEX `$indexName` (`$column`)");
     }
 }

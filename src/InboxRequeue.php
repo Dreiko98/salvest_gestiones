@@ -4,24 +4,22 @@ declare(strict_types=1);
 namespace Salvest;
 
 /**
- * "Volver a procesar": undoes a needs_review attachment's outcome so its email can be picked up
- * fresh by the next Worker run — without ever deleting anything. The previous attempt's row
- * (extraction_json, decision_json, debug_trace_json, output_path, everything) is kept exactly as
- * it was, just relabelled status='requeued' + requeued_at=NOW(). That status is deliberately
- * absent from every existing allow-list query (Worker's global SHA-256 dedupe, /Revisar's
- * listing, the dashboard's attention count) — see each of those for the exact list — so a
- * requeued row stops being visible or dedupe-relevant without a single line changing there.
+ * Two related /Revisar actions on a needs_review attachment, both of which return the email to
+ * INBOX and both of which never delete anything — only relabel status, keeping extraction_json,
+ * decision_json, debug_trace_json, output_path exactly as they were:
  *
- * A message is a single IMAP object shared by every attachment inside it, so "return to inbox"
- * necessarily affects the whole email: every sibling attachment that hasn't already succeeded
- * (classified/duplicate) gets requeued together, never just the one clicked. Siblings that did
- * succeed are never touched — their SHA-256 already exists in the dedupe allow-list, so the next
- * Worker run recognises them as a 'duplicate' immediately, without re-extracting or re-archiving
- * anything.
+ * - requeue(): "Volver a procesar" — status='requeued'. Every non-succeeded sibling in the same
+ *   email is requeued together (siblings that already succeeded are left untouched).
+ * - dismiss(): "Esto no es una factura" — status='dismissed_not_invoice'. Stricter: only allowed
+ *   when the clicked attachment is the *only* row for that email — see dismiss()'s own docblock.
+ *
+ * Both statuses are deliberately absent from every existing allow-list query (Worker's global
+ * SHA-256 dedupe, /Revisar's listing, the dashboard's attention count), so either one stops being
+ * visible or dedupe-relevant without a single line changing in any of those queries.
  */
 final class InboxRequeue
 {
-    /** Statuses that already succeeded and must never be touched by a requeue. */
+    /** Statuses that already succeeded and must never be touched by either action. */
     private const UNTOUCHABLE_STATUSES = ['classified', 'duplicate'];
 
     /** @param array<string,mixed> $config
@@ -33,17 +31,92 @@ final class InboxRequeue
      *   when the original move never actually happened (imap_move_status !== 'moved'). */
     public function __construct(private Database $db, private Crypto $crypto, private array $config, private $imapClientFactory = null) {}
 
+    /** @return array{ok:bool,message:string} */
+    public function requeue(int $attachmentId): array
+    {
+        $context = $this->loadContext($attachmentId);
+        if (!$context['ok']) return $context;
+        $mailbox = $context['mailbox']; $message = $context['message']; $siblings = $context['siblings'];
+
+        $toRequeue = array_values(array_filter($siblings, static fn(array $row): bool => !in_array($row['status'], self::UNTOUCHABLE_STATUSES, true)));
+        if (!$toRequeue) return ['ok' => false, 'message' => 'No hay nada pendiente que reencolar en este correo.'];
+
+        $driveError = $this->guardDriveEffects($toRequeue);
+        if ($driveError !== null) return ['ok' => false, 'message' => $driveError];
+
+        $located = $this->locateMessage($message);
+        if (!$located['ok']) return $located;
+
+        $result = $this->runTransactional($mailbox, $located, static function (Database $db) use ($toRequeue, $message): void {
+            foreach ($toRequeue as $row) {
+                $db->execute("UPDATE processed_attachments SET status='requeued', requeued_at=NOW() WHERE id=?", [$row['id']]);
+            }
+            $db->execute("UPDATE processed_messages SET status='requeued' WHERE id=?", [$message['id']]);
+        });
+        if (!$result['ok']) return $result;
+
+        $othersRequeued = count($toRequeue) - 1;
+        $resultMessage = $othersRequeued > 0
+            ? 'El correo ha vuelto a la bandeja de entrada. Se reprocesarán ' . count($toRequeue) . ' facturas pendientes; las ya clasificadas de este mismo correo no se han tocado.'
+            : 'La factura ha vuelto a la bandeja de entrada y Salvest intentará procesarla de nuevo en la próxima ejecución. El historial técnico del intento anterior se ha conservado.';
+        return ['ok' => true, 'message' => $resultMessage];
+    }
+
     /**
+     * "Esto no es una factura": the email returns to INBOX and Worker::isDismissedNotInvoice()
+     * makes sure it's never looked at again — recognised by (mailbox_id, message_id_header), not
+     * by the attachment's SHA-256, deliberately: the exact same file could legitimately arrive
+     * attached to a genuinely different, real invoice email later, and that must still get a
+     * fair, independent extraction — dismissing one email must never become a global "never
+     * process this PDF" rule.
+     *
+     * Stricter sibling rule than requeue(): this only proceeds when the clicked attachment is the
+     * *only* row for this email. Any other row at all — whether it already succeeded
+     * (classified/duplicate, proof the email does contain a real invoice) or is simply still
+     * unresolved (needs_review/unclassified/error, an attachment nobody has actually looked at
+     * yet) — blocks the action outright. "This email contains no invoice" is only a safe claim to
+     * make when it is equivalent to "every reviewable thing in this email is this one attachment".
      * @return array{ok:bool,message:string}
      */
-    public function requeue(int $attachmentId): array
+    public function dismiss(int $attachmentId): array
+    {
+        $context = $this->loadContext($attachmentId);
+        if (!$context['ok']) return $context;
+        $attachment = $context['attachment']; $mailbox = $context['mailbox']; $message = $context['message']; $siblings = $context['siblings'];
+
+        $others = array_values(array_filter($siblings, static fn(array $row): bool => (int)$row['id'] !== $attachmentId));
+        if ($others) {
+            $provenInvoice = array_filter($others, static fn(array $row): bool => in_array($row['status'], self::UNTOUCHABLE_STATUSES, true));
+            return ['ok' => false, 'message' => $provenInvoice
+                ? 'Este correo contiene al menos una factura ya clasificada; no se puede marcar como que no contiene ninguna.'
+                : 'Este correo tiene otros adjuntos todavía sin resolver; revísalos antes de descartar el correo entero.'];
+        }
+
+        $driveError = $this->guardDriveEffects([$attachment]);
+        if ($driveError !== null) return ['ok' => false, 'message' => $driveError];
+
+        $located = $this->locateMessage($message);
+        if (!$located['ok']) return $located;
+
+        $result = $this->runTransactional($mailbox, $located, static function (Database $db) use ($attachment, $message): void {
+            $db->execute("UPDATE processed_attachments SET status='dismissed_not_invoice' WHERE id=?", [$attachment['id']]);
+            $db->execute("UPDATE processed_messages SET status='dismissed_not_invoice' WHERE id=?", [$message['id']]);
+        });
+        if (!$result['ok']) return $result;
+
+        return ['ok' => true, 'message' => 'El correo ha vuelto a la bandeja de entrada. Salvest no volverá a procesarlo en próximas ejecuciones. El historial técnico de este intento se ha conservado.'];
+    }
+
+    /** Loads and revalidates everything both actions need: the clicked attachment (must still be
+     * needs_review — the button is only ever rendered for that, but state may have changed since
+     * the page loaded), its mailbox, its message record, and every sibling attachment sharing the
+     * same email. @return array{ok:bool,message?:string,attachment?:array<string,mixed>,mailbox?:array<string,mixed>,message?:array<string,mixed>,siblings?:list<array<string,mixed>>} */
+    private function loadContext(int $attachmentId): array
     {
         $attachment = $this->db->one('SELECT * FROM processed_attachments WHERE id=?', [$attachmentId]);
         if (!$attachment) return ['ok' => false, 'message' => 'Esa factura ya no existe.'];
-        // Server-side revalidation — the button is only ever rendered for needs_review, but the
-        // state could have changed since the page was loaded (another tab, a concurrent run).
         if ($attachment['status'] !== 'needs_review') {
-            return ['ok' => false, 'message' => 'Esta factura ya no está pendiente de revisión (puede que ya se haya vuelto a procesar); no se ha hecho nada.'];
+            return ['ok' => false, 'message' => 'Esta factura ya no está pendiente de revisión (puede que ya se haya actuado sobre ella); no se ha hecho nada.'];
         }
 
         $mailboxId = (int)$attachment['mailbox_id'];
@@ -57,18 +130,28 @@ final class InboxRequeue
         if (!$message) return ['ok' => false, 'message' => 'No se encontró el registro del correo original; no se ha hecho nada.'];
 
         $siblings = $this->db->all('SELECT * FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?', [$mailboxId, $uidvalidity, $messageUid]);
-        $toRequeue = array_values(array_filter($siblings, static fn(array $row): bool => !in_array($row['status'], self::UNTOUCHABLE_STATUSES, true)));
-        if (!$toRequeue) return ['ok' => false, 'message' => 'No hay nada pendiente que reencolar en este correo.'];
+        return ['ok' => true, 'attachment' => $attachment, 'mailbox' => $mailbox, 'message' => $message, 'siblings' => $siblings];
+    }
 
-        // Defence in depth: a needs_review row should never have a Drive upload (only
-        // status='classified' ever triggers DriveInvoiceArchiver — see Worker::processAttachment()),
-        // but refuse rather than silently ignore if that assumption is ever wrong.
-        foreach ($toRequeue as $row) {
+    /** Defence in depth: a needs_review row should never have a Drive upload (only
+     * status='classified' ever triggers DriveInvoiceArchiver — see Worker::processAttachment()),
+     * but refuse rather than silently ignore if that assumption is ever wrong.
+     * @param list<array<string,mixed>> $rows */
+    private function guardDriveEffects(array $rows): ?string
+    {
+        foreach ($rows as $row) {
             if ($row['drive_status'] !== null || $row['drive_file_id'] !== null || $row['drive_path'] !== null) {
-                return ['ok' => false, 'message' => 'Una de las facturas de este correo tiene un archivo en Drive asociado; no se puede reencolar automáticamente.'];
+                return 'Una de las facturas de este correo tiene un archivo en Drive asociado; no se puede completar la acción automáticamente.';
             }
         }
+        return null;
+    }
 
+    /** Works out whether an IMAP move is even needed and whether it can be done unambiguously —
+     * pure validation, no I/O of its own. @param array<string,mixed> $message
+     * @return array{ok:bool,message?:string,needsImapMove?:bool,messageIdHeader?:string,currentFolder?:string} */
+    private function locateMessage(array $message): array
+    {
         $messageIdHeader = trim((string)($message['message_id_header'] ?? ''));
         // If the original IMAP move never actually happened, the message is still sitting in the
         // mailbox's input folder — there is nothing to search for or move, only DB state to fix.
@@ -76,30 +159,29 @@ final class InboxRequeue
         if ($needsImapMove && $messageIdHeader === '') {
             return ['ok' => false, 'message' => 'No se puede localizar el correo de forma inequívoca (falta la cabecera Message-ID); no se ha movido ni modificado nada.'];
         }
+        return ['ok' => true, 'needsImapMove' => $needsImapMove, 'messageIdHeader' => $messageIdHeader, 'currentFolder' => (string)($message['imap_destination'] ?? '')];
+    }
 
+    /** Stages $dbChanges inside a transaction, performs the real IMAP move (if needed) *before*
+     * committing, and rolls the whole transaction back — DB changes included — if the IMAP side
+     * fails for any reason. Nothing is left half-done either way.
+     * @param array<string,mixed> $mailbox @param array{needsImapMove:bool,messageIdHeader:string,currentFolder:string} $located
+     * @param callable(Database):void $dbChanges @return array{ok:bool,message?:string} */
+    private function runTransactional(array $mailbox, array $located, callable $dbChanges): array
+    {
         $pdo = $this->db->pdo();
         $pdo->beginTransaction();
         try {
-            foreach ($toRequeue as $row) {
-                $this->db->execute("UPDATE processed_attachments SET status='requeued', requeued_at=NOW() WHERE id=?", [$row['id']]);
+            $dbChanges($this->db);
+            if ($located['needsImapMove']) {
+                $this->moveBackToInbox($mailbox, $located['currentFolder'], $located['messageIdHeader']);
             }
-            $this->db->execute("UPDATE processed_messages SET status='requeued' WHERE id=?", [$message['id']]);
-
-            if ($needsImapMove) {
-                $this->moveBackToInbox($mailbox, (string)$message['imap_destination'], $messageIdHeader);
-            }
-
             $pdo->commit();
         } catch (\Throwable $error) {
             if ($pdo->inTransaction()) $pdo->rollBack();
             return ['ok' => false, 'message' => 'No se pudo completar: ' . $error->getMessage() . '. No se ha modificado nada.'];
         }
-
-        $othersRequeued = count($toRequeue) - 1;
-        $resultMessage = $othersRequeued > 0
-            ? 'El correo ha vuelto a la bandeja de entrada. Se reprocesarán ' . count($toRequeue) . ' facturas pendientes; las ya clasificadas de este mismo correo no se han tocado.'
-            : 'La factura ha vuelto a la bandeja de entrada y Salvest intentará procesarla de nuevo en la próxima ejecución. El historial técnico del intento anterior se ha conservado.';
-        return ['ok' => true, 'message' => $resultMessage];
+        return ['ok' => true];
     }
 
     /** @param array<string,mixed> $mailbox */

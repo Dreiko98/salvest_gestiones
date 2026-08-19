@@ -1211,6 +1211,150 @@ $test('InboxRequeue: un intento posterior con un UID nuevo crea una fila nueva, 
     $assert($oldRow['status']==='requeued' && $oldRow['debug_trace_json']!==null,'la fila histórica del primer intento sigue existiendo, requeued, con su traza técnica intacta');
 });
 
+// ---- InboxRequeue::dismiss(): "Esto no es una factura" ----
+$test('InboxRequeue::dismiss(): needs_review único pasa a dismissed_not_invoice, conservando el historial técnico y sin crear filas nuevas',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $before=(int)$db->one('SELECT COUNT(*) n FROM processed_attachments WHERE mailbox_id=?',[$fixture['mailboxId']])['n'];
+    $stub=$fakeRequeueImapClient(['777']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true,'debe completarse con éxito: '.$result['message']);
+    $row=$db->one('SELECT * FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='dismissed_not_invoice','el estado debe pasar a dismissed_not_invoice: '.$row['status']);
+    $assert($row['debug_trace_json']!==null && str_contains((string)$row['debug_trace_json'],'adjunto-0.pdf'),'el historial técnico del intento debe conservarse intacto');
+    $message=$db->one('SELECT status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message['status']==='dismissed_not_invoice','processed_messages también debe quedar dismissed_not_invoice');
+    $after=(int)$db->one('SELECT COUNT(*) n FROM processed_attachments WHERE mailbox_id=?',[$fixture['mailboxId']])['n'];
+    $assert($after===$before,'dismiss() nunca debe crear una fila nueva, solo actualizar la existente: antes='.$before.' después='.$after);
+    $assert($stub->moved===['uid'=>'777','destination'=>'INBOX'],'el correo debe volver a la bandeja de entrada del buzón: '.json_encode($stub->moved));
+});
+$test('InboxRequeue::dismiss(): un hermano classified bloquea la acción por completo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review','classified']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false,'un hermano ya clasificado es prueba de que el correo sí contiene una factura: debe rechazarse');
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review','no debe cambiar nada si se rechaza');
+    $sibling=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][1]]);
+    $assert($sibling['status']==='classified','el hermano classified debe permanecer intacto');
+});
+$test('InboxRequeue::dismiss(): un hermano duplicate bloquea la acción por completo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review','duplicate']);
+    $stub=$fakeRequeueImapClient(['777']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false,'un hermano duplicate también es prueba de que el correo contiene una factura real: debe rechazarse');
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review');
+});
+$test('InboxRequeue::dismiss(): cualquier otro hermano pendiente (needs_review/unclassified/error) bloquea la acción, aunque no esté resuelto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    foreach(['needs_review','unclassified','error'] as $siblingStatus){
+        $fixture=$seedRequeueFixture($db,['needs_review',$siblingStatus]);
+        $stub=$fakeRequeueImapClient(['777']);
+        $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+        $assert($result['ok']===false,"un hermano $siblingStatus sin revisar debe bloquear el descarte: no puede asumirse que tampoco es factura");
+        $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+        $assert($row['status']==='needs_review');
+    }
+});
+$test('InboxRequeue::dismiss(): 0 resultados por Message-ID aborta sin cambios',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient([]);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review','sin poder localizar el correo no debe cambiar nada');
+    $message=$db->one('SELECT status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message['status']==='needs_review','processed_messages también debe quedar exactamente como estaba');
+});
+$test('InboxRequeue::dismiss(): más de 1 resultado por Message-ID aborta sin cambios',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient(['777','778']);
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false,'nunca debe adivinar cuál mover');
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review');
+});
+$test('InboxRequeue::dismiss(): un fallo IMAP provoca rollback completo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $stub=$fakeRequeueImapClient([],new RuntimeException('conexión IMAP caída'));
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,static fn(array $mailbox,string $folder)=>$stub))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===false);
+    $row=$db->one('SELECT status,debug_trace_json FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='needs_review','tras el rollback el estado debe volver exactamente al original');
+    $assert($row['debug_trace_json']!==null,'la traza técnica sigue intacta (nunca se llegó a tocar el estado)');
+    $message=$db->one('SELECT status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message['status']==='needs_review');
+});
+$test('InboxRequeue::dismiss(): si el movimiento IMAP original falló, se completa igualmente sin intentar mover nada',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $fixture=$seedRequeueFixture($db,['needs_review'],'failed');
+    $neverCalled=static function()use($assert){$assert(false,'no debe construirse ningún ImapClient cuando el movimiento original falló');};
+    $result=(new Salvest\InboxRequeue($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$config,$neverCalled))->dismiss($fixture['attachmentIds'][0]);
+    $assert($result['ok']===true,'debe completarse igualmente, solo con el cambio de estado: '.$result['message']);
+    $row=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]]);
+    $assert($row['status']==='dismissed_not_invoice');
+});
+
+// ---- Worker: reconocimiento de correos ya descartados como "no es una factura" ----
+$test('Worker: el corte por dismissed_not_invoice ocurre antes de OpenAI, antes de crear filas y antes de cualquier movimiento IMAP (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $messageParsePos=strpos($source,'$message = $this->parser->parse($client->fetch($uid));');
+    $dismissedCheckPos=strpos($source,'isDismissedNotInvoice((int)$mailbox');
+    $attachmentsCheckPos=strpos($source,"if (!\$message['attachments']) {");
+    $documentValidatorPos=strpos($source,'DocumentValidator::validate(');
+    $assert($messageParsePos!==false && $dismissedCheckPos!==false && $attachmentsCheckPos!==false && $documentValidatorPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
+    $assert($dismissedCheckPos>$messageParsePos,'el corte debe comprobarse justo después de parsear el correo, nunca antes');
+    $assert($dismissedCheckPos<$attachmentsCheckPos,'debe cortar antes incluso de la comprobación de "sin adjuntos"');
+    $assert($dismissedCheckPos<$documentValidatorPos,'debe cortar antes de validar o procesar cualquier adjunto — y por tanto antes de cualquier llamada a OpenAI, sin crear filas ni mover el correo');
+});
+$test('Worker::isDismissedNotInvoice(): reconoce el mismo Message-ID aunque el correo tenga ahora un UID nunca visto',static function()use($assert,$sqliteDbWithLock,$workerConfig):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    // Fila histórica: quedó marcada bajo el UID antiguo (500); el correo, tras volver a INBOX,
+    // aparecerá en un futuro ciclo bajo un UID que esta tabla nunca ha visto (p.ej. 999).
+    $db->execute('INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,message_id_header,status,processed_at) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','<msg-1@example.com>','dismissed_not_invoice',date('Y-m-d H:i:s')]);
+    $worker=Salvest\Worker::create($db,$config);
+    $method=new ReflectionMethod(Salvest\Worker::class,'isDismissedNotInvoice');$method->setAccessible(true);
+    $assert($method->invoke($worker,$mailboxId,'<msg-1@example.com>')===true,'debe reconocerlo por Message-ID sin importar el UID actual');
+    $assert($method->invoke($worker,$mailboxId,'<otro@example.com>')===false,'un Message-ID distinto nunca debe reconocerse');
+    $assert($method->invoke($worker,$mailboxId+999,'<msg-1@example.com>')===false,'no debe cruzar buzones distintos');
+});
+$test('Worker::isDismissedNotInvoice(): un correo requeued (no descartado) no debe reconocerse como "no es una factura"',static function()use($assert,$sqliteDbWithLock,$workerConfig):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,message_id_header,status,processed_at) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','<msg-2@example.com>','requeued',date('Y-m-d H:i:s')]);
+    $worker=Salvest\Worker::create($db,$config);
+    $method=new ReflectionMethod(Salvest\Worker::class,'isDismissedNotInvoice');$method->setAccessible(true);
+    $assert($method->invoke($worker,$mailboxId,'<msg-2@example.com>')===false,'requeued no equivale a dismissed_not_invoice: no debe cortar el reprocesamiento normal');
+});
+$test('/Revisar: "Esto no es una factura" solo aparece cuando el adjunto es el único elemento reseñable del correo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','needs_review',date('Y-m-d H:i:s'),'sola.pdf']);
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'2002','900','needs_review',date('Y-m-d H:i:s'),'adjunto-a.pdf']);
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'2002','900','error',date('Y-m-d H:i:s'),'adjunto-b.pdf']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(substr_count($html,'Esto no es una factura')===1,'solo el correo con un único adjunto reseñable debe ofrecer la acción: apariciones='.substr_count($html,'Esto no es una factura'));
+    $assert(str_contains($html,'Este correo volverá a la bandeja de entrada y Salvest dejará de procesarlo en futuras ejecuciones. Se conservará el historial técnico de este intento. ¿Confirmas que este correo no contiene ninguna factura?'),'debe usarse el texto de confirmación exacto');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

@@ -16,6 +16,12 @@ document.addEventListener('submit',event=>{
   if(!window.confirm(form.dataset.confirm||'¿Confirmas que este correo no contiene ninguna factura?')){event.preventDefault();return;}
   form.elements.confirm_dismiss.value='DISMISS';
 });
+document.addEventListener('submit',event=>{
+  const form=event.target.closest('.purge-form');
+  if(!form)return;
+  if(!window.confirm(form.dataset.confirm||'¿Eliminar esta factura por completo?')){event.preventDefault();return;}
+  form.elements.confirm_purge.value='PURGE';
+});
 const archivedToggle=document.getElementById('archived-today-toggle');
 const archivedPanel=document.getElementById('archived-today-panel');
 archivedToggle?.addEventListener('click',()=>{

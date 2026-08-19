@@ -384,6 +384,12 @@ final class WebApp
             if($result['ok'])$this->audit('dismiss_not_invoice','attachment',(int)($_POST['id']??0));
             $this->redirect('/?route=reviews&'.($result['ok']?'dismissed=1':'dismiss_error='.rawurlencode($result['message'])));
         }
+        if($_SERVER['REQUEST_METHOD']==='POST'&&($_POST['action']??'')==='purge'){
+            if(!hash_equals('PURGE',(string)($_POST['confirm_purge']??'')))throw new \RuntimeException('La acción no fue confirmada');
+            $result=(new AttachmentPurge($this->db))->purge((int)($_POST['id']??0));
+            if($result['ok'])$this->audit('purge','attachment',(int)($_POST['id']??0),$result['deleted']??null);
+            $this->redirect('/?route=reviews&'.($result['ok']?'purged=1':'purge_error='.rawurlencode($result['message'])));
+        }
         if($_SERVER['REQUEST_METHOD']==='POST'){
             $attachment=$this->db->one('SELECT * FROM processed_attachments WHERE id=?',[(int)$_POST['id']]);
             $community=$this->db->one('SELECT * FROM communities WHERE id=? AND active=1',[(int)$_POST['community_id']]);
@@ -404,6 +410,8 @@ final class WebApp
         elseif(($_GET['requeue_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo volver a procesar</strong><small>'.$this->e((string)$_GET['requeue_error']).'</small></span></section>';
         elseif(($_GET['dismissed']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Correo marcado como que no contiene ninguna factura</strong><small>Ha vuelto a la bandeja de entrada y Salvest no volverá a procesarlo.</small></span></section>';
         elseif(($_GET['dismiss_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo completar</strong><small>'.$this->e((string)$_GET['dismiss_error']).'</small></span></section>';
+        elseif(($_GET['purged']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Factura eliminada</strong><small>Si el mismo documento vuelve a llegar, se procesará como si fuera nuevo.</small></span></section>';
+        elseif(($_GET['purge_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo eliminar</strong><small>'.$this->e((string)$_GET['purge_error']).'</small></span></section>';
         $cards='';
         foreach($rows as $row){
             // The system already resolved community_id (a real FK, not just OpenAI's text
@@ -475,7 +483,10 @@ final class WebApp
      * needs_review or error alike, matching InboxRequeue's own REVIEWABLE_STATUSES exactly.
      * "Esto no es una factura" only appears when this attachment is the sole row for its email —
      * InboxRequeue::dismiss() enforces the exact same rule server-side regardless, this just
-     * avoids showing a button that would always be refused. @param array<string,mixed> $row */
+     * avoids showing a button that would always be refused. "Eliminar factura" is always
+     * available regardless of siblings — AttachmentPurge only ever touches this one row, never
+     * the email or any sibling, so the sole-attachment safety rule doesn't apply to it.
+     * @param array<string,mixed> $row */
     private function reviewActions(array $row): string
     {
         $siblings=$this->db->all('SELECT id,status FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
@@ -490,7 +501,9 @@ final class WebApp
             $confirmDismiss='Este correo volverá a la bandeja de entrada y Salvest dejará de procesarlo en futuras ejecuciones. Se conservará el historial técnico de este intento. ¿Confirmas que este correo no contiene ninguna factura?';
             $dismiss='<form method="post" action="/?route=reviews" class="inline dismiss-form" data-confirm="'.$this->e($confirmDismiss).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="dismiss"><input type="hidden" name="confirm_dismiss" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="button-quiet">Esto no es una factura</button></form>';
         }
-        return '<div class="review-actions">'.$requeue.$dismiss.'</div>';
+        $confirmPurge='Esta factura se eliminará por completo de Salvest — no podrás recuperarla desde el panel. El correo no se moverá ni se tocará. Si el mismo documento vuelve a llegar, se procesará como si fuera nuevo. ¿Confirmas que quieres eliminarla?';
+        $purge='<form method="post" action="/?route=reviews" class="inline purge-form" data-confirm="'.$this->e($confirmPurge).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="purge"><input type="hidden" name="confirm_purge" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="danger">Eliminar factura</button></form>';
+        return '<div class="review-actions">'.$requeue.$dismiss.$purge.'</div>';
     }
 
     /** Renders processed_attachments.debug_trace_json (a chronological array of {timestamp,step,data},

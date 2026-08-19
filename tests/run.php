@@ -1478,6 +1478,98 @@ $test('Inicio: el botón "Archivadas hoy" está correctamente enlazado al panel 
     $assert(str_contains($html,'id="archived-today-panel"'),'el panel debe existir con el id esperado');
 });
 
+// ---- AttachmentPurge: "Eliminar factura" ----
+$test('AttachmentPurge::purge(): borra la fila y el fichero local, y deja de participar en el dedupe global',static function()use($assert,$sqliteDbWithLock):void{
+    $db=$sqliteDbWithLock('always-free');
+    $tmpFile=tempnam(sys_get_temp_dir(),'purge-test-');
+    file_put_contents($tmpFile,'%PDF-fake');
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,original_filename,attachment_sha256,output_path) VALUES (?,?,?,?,?)",
+        ['needs_review',date('Y-m-d H:i:s'),'x.pdf','sha-purge-1',$tmpFile]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $result=(new Salvest\AttachmentPurge($db))->purge($id);
+    $assert($result['ok']===true,'debe completarse con éxito: '.$result['message']);
+    $assert($db->one('SELECT * FROM processed_attachments WHERE id=?',[$id])===null,'la fila debe desaparecer por completo');
+    $assert(!is_file($tmpFile),'el fichero local debe borrarse también');
+    $prior=$db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate') ORDER BY id LIMIT 1",['sha-purge-1']);
+    $assert($prior===null,'tras eliminarla, el dedupe global no debe encontrar ningún rastro: si el mismo documento vuelve a llegar, se trata como nuevo');
+});
+$test('AttachmentPurge::purge(): no toca processed_messages ni ninguna fila hermana, aunque haya una ya clasificada',static function()use($assert,$sqliteDbWithLock):void{
+    $db=$sqliteDbWithLock('always-free');
+    $db->execute("INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,status,processed_at,document_count) VALUES (?,?,?,?,?,?)",[1,'1001','500','needs_review',date('Y-m-d H:i:s'),2]);
+    $messageId=(int)$db->pdo()->lastInsertId();
+    $db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)",[1,'1001','500','needs_review',date('Y-m-d H:i:s'),'a-eliminar.pdf']);
+    $targetId=(int)$db->pdo()->lastInsertId();
+    $db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)",[1,'1001','500','classified',date('Y-m-d H:i:s'),'ya-clasificada.pdf']);
+    $siblingId=(int)$db->pdo()->lastInsertId();
+    $result=(new Salvest\AttachmentPurge($db))->purge($targetId);
+    $assert($result['ok']===true,'debe permitirse aunque haya un hermano ya clasificado: '.$result['message']);
+    $assert($db->one('SELECT * FROM processed_attachments WHERE id=?',[$targetId])===null,'la fila objetivo debe desaparecer');
+    $sibling=$db->one('SELECT status FROM processed_attachments WHERE id=?',[$siblingId]);
+    $assert($sibling!==null && $sibling['status']==='classified','el hermano classified nunca debe tocarse');
+    $message=$db->one('SELECT status,document_count FROM processed_messages WHERE id=?',[$messageId]);
+    $assert($message!==null && $message['status']==='needs_review' && (int)$message['document_count']===2,'processed_messages no debe modificarse en absoluto: '.json_encode($message));
+});
+$test('AttachmentPurge::purge(): rechaza si el estado ya no es revisable (classified/duplicate/requeued/dismissed_not_invoice)',static function()use($assert,$sqliteDbWithLock):void{
+    $db=$sqliteDbWithLock('always-free');
+    foreach(['classified','duplicate','requeued','dismissed_not_invoice'] as $status){
+        $db->execute("INSERT INTO processed_attachments(status,processed_at,original_filename) VALUES (?,?,?)",[$status,date('Y-m-d H:i:s'),'x.pdf']);
+        $id=(int)$db->pdo()->lastInsertId();
+        $result=(new Salvest\AttachmentPurge($db))->purge($id);
+        $assert($result['ok']===false,"un estado ya resuelto ($status) nunca debe poder eliminarse por esta vía");
+        $assert($db->one('SELECT 1 FROM processed_attachments WHERE id=?',[$id])!==null,'no debe borrarse nada si se rechaza');
+    }
+});
+$test('AttachmentPurge::purge(): rechaza si la factura tiene un archivo en Drive asociado (defensa en profundidad)',static function()use($assert,$sqliteDbWithLock):void{
+    $db=$sqliteDbWithLock('always-free');
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,original_filename,drive_file_id) VALUES (?,?,?,?)",['needs_review',date('Y-m-d H:i:s'),'x.pdf','drive-id-123']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $result=(new Salvest\AttachmentPurge($db))->purge($id);
+    $assert($result['ok']===false,'nunca debe eliminar automáticamente algo con rastro en Drive');
+    $assert($db->one('SELECT 1 FROM processed_attachments WHERE id=?',[$id])!==null);
+});
+$test('AttachmentPurge::purge(): funciona igual desde unclassified, needs_review y error',static function()use($assert,$sqliteDbWithLock):void{
+    $db=$sqliteDbWithLock('always-free');
+    foreach(['unclassified','needs_review','error'] as $status){
+        $db->execute("INSERT INTO processed_attachments(status,processed_at,original_filename) VALUES (?,?,?)",[$status,date('Y-m-d H:i:s'),'x.pdf']);
+        $id=(int)$db->pdo()->lastInsertId();
+        $result=(new Salvest\AttachmentPurge($db))->purge($id);
+        $assert($result['ok']===true,"debe poder eliminarse desde $status: ".$result['message']);
+    }
+});
+$test('/Revisar: "Eliminar factura" aparece siempre, incluso cuando hay un hermano ya clasificado (a diferencia de "Esto no es una factura")',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','needs_review',date('Y-m-d H:i:s'),'objetivo.pdf']);
+    $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,status,processed_at,original_filename) VALUES (?,?,?,?,?,?)',
+        [$mailboxId,'1001','500','classified',date('Y-m-d H:i:s'),'ya-clasificada.pdf']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'Eliminar factura'),'el botón de eliminar debe verse aunque el correo tenga un hermano ya clasificado');
+    $assert(!str_contains($html,'Esto no es una factura'),'en cambio, descartar todo el correo sí debe seguir bloqueado en este caso');
+});
+$test('/Revisar: eliminar sin confirmar (confirm_purge vacío) se rechaza server-side, pese al CSRF válido',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,original_filename) VALUES (?,?,?)',['needs_review',date('Y-m-d H:i:s'),'x.pdf']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $html=$requestWebApp($webApp,'POST','reviews',['action'=>'purge','id'=>(string)$id,'csrf'=>$_SESSION['csrf']??'','confirm_purge'=>'']);
+    $assert(str_contains($html,'no fue confirmada'),'sin confirm_purge=PURGE debe rechazarse aunque el CSRF sea correcto: '.$html);
+    $assert($db->one('SELECT 1 FROM processed_attachments WHERE id=?',[$id])!==null,'no debe borrarse nada si la confirmación no llegó');
+});
+$test('AttachmentPurge::purge(): el resultado trae la fila borrada completa, para que WebApp pueda auditarla',static function()use($assert,$sqliteDbWithLock):void{
+    // No se prueba a través de la ruta POST completa: un éxito real dispara WebApp::redirect(),
+    // que llama a exit() y mataría el proceso del test runner (mismo motivo por el que
+    // requeue()/dismiss() tampoco se prueban así en su camino de éxito). Se verifica en su lugar
+    // que purge() devuelve lo necesario para que el $this->audit(...) del controlador funcione.
+    $db=$sqliteDbWithLock('always-free');
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,original_filename) VALUES (?,?,?)',['needs_review',date('Y-m-d H:i:s'),'para-auditar.pdf']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $result=(new Salvest\AttachmentPurge($db))->purge($id);
+    $assert($result['ok']===true);
+    $assert(isset($result['deleted']) && $result['deleted']['original_filename']==='para-auditar.pdf','el resultado debe traer la fila completa que se acaba de borrar, para el audit_log');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

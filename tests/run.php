@@ -26,7 +26,7 @@ $classifierSchema=<<<SQL
 CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,external_code TEXT,official_name TEXT,normalized_name TEXT,cif TEXT,main_address TEXT,postal_code TEXT,city TEXT,imap_folder_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE community_identifiers(id INTEGER PRIMARY KEY AUTOINCREMENT,community_id INTEGER,identifier_type TEXT,value TEXT,normalized_value TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE community_aliases(id INTEGER PRIMARY KEY AUTOINCREMENT,community_id INTEGER,alias_type TEXT,value TEXT,normalized_value TEXT,active INTEGER DEFAULT 1);
-CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,normalized_name TEXT,cif TEXT,main_service_type_id INTEGER,active INTEGER DEFAULT 1);
+CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,official_name TEXT,normalized_official_name TEXT,normalized_name TEXT,cif TEXT,main_service_type_id INTEGER,active INTEGER DEFAULT 1);
 CREATE TABLE supplier_aliases(id INTEGER PRIMARY KEY AUTOINCREMENT,supplier_id INTEGER,alias_type TEXT,value TEXT,normalized_value TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE supplier_service_types(supplier_id INTEGER,service_type_id INTEGER);
@@ -1610,6 +1610,136 @@ $test('WebApp::page(): app.css y app.js se sirven con ?v=<mtime real>, para que 
     restore_error_handler();
     $assert(str_contains($html,'/assets/app.css?v='.$realCssVersion),'debe usar el mtime real de app.css, no un valor fijo: '.$html);
     $assert(str_contains($html,'/assets/app.js?v='.$realJsVersion),'debe usar el mtime real de app.js: '.$html);
+});
+
+// ---- Fase 2 del maestro de proveedores: estructura nueva, ningún comportamiento nuevo ----
+// Corre contra el MySQL real de desarrollo/tests que ya usa config/config.php
+// (`$dbConfig['name']`, típicamente "salvest_test") — nunca contra producción, que solo se
+// toca por SFTP con scripts de solo-lectura, jamás desde este runner. El usuario configurado
+// ahí normalmente no tiene privilegio CREATE DATABASE, así que se conecta directo a esa base
+// (no se crea ninguna nueva): Schema::migrate() es aditivo e idempotente por diseño, así que
+// dejarlo aplicado ahí entre ejecuciones es seguro y deseable (así se comporta igual que en
+// producción cuando llegue el día). Los tests que insertan filas de prueba (aliases, suppliers)
+// lo hacen dentro de una transacción con rollback en el finally, así que no dejan datos
+// residuales pase lo que pase. Si no hay MySQL disponible en el entorno donde corre
+// tests/run.php, cada test se salta con un aviso explícito en vez de fallar: Schema::migrate()
+// es MySQL-específico (information_schema) y no tiene sentido simularlo contra SQLite, a
+// diferencia del resto de la suite.
+$mysqlSchemaTest=static function()use($assert):?array{
+    $configFile=dirname(__DIR__).'/config/config.php';
+    if(!is_file($configFile))return null;
+    $dbConfig=(require $configFile)['database'];
+    try{
+        $pdo=new PDO("mysql:host={$dbConfig['host']};port={$dbConfig['port']};dbname={$dbConfig['name']};charset={$dbConfig['charset']}",$dbConfig['user'],$dbConfig['password'],[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+    }catch(Throwable $error){return null;}
+    $reflection=new ReflectionClass(Salvest\Database::class);
+    $db=$reflection->newInstanceWithoutConstructor();
+    $property=$reflection->getProperty('pdo');$property->setAccessible(true);$property->setValue($db,$pdo);
+    return['db'=>$db,'pdo'=>$pdo];
+};
+$mysqlSchemaCleanup=static function(array $ctx)use($assert):void{
+    // Nada que borrar: la migración es aditiva/idempotente (queda aplicada, a propósito) y
+    // cualquier fila insertada por un test individual vive dentro de su propia transacción.
+};
+
+$test('Schema::migrate(): idempotente sobre MySQL real — correr 3 veces no falla ni duplica columnas/índices',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible — ver config/config.php)\n";return;}
+    $db=$ctx['db'];$schemaFile=dirname(__DIR__).'/database/schema.sql';
+    try{
+        Salvest\Schema::migrate($db,$schemaFile);
+        Salvest\Schema::migrate($db,$schemaFile);
+        Salvest\Schema::migrate($db,$schemaFile);
+    }finally{$mysqlSchemaCleanup($ctx);}
+    // Si algo no fuera idempotente, la segunda o tercera pasada ya habría lanzado antes de llegar aquí.
+    $assert(true);
+});
+$test('Schema::migrate(): añade suppliers.name y suppliers.normalized_official_name',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    try{
+        Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+        $assert($db->one("SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='suppliers' AND column_name='name'")!==null,'falta suppliers.name');
+        $assert($db->one("SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='suppliers' AND column_name='normalized_official_name'")!==null,'falta suppliers.normalized_official_name');
+        $columns=$db->all("SELECT column_name AS name,is_nullable AS nullable FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='suppliers' AND column_name IN ('name','normalized_official_name')");
+        foreach($columns as $column)$assert($column['nullable']==='YES',$column['name'].' debe ser NULLABLE en esta fase');
+    }finally{$mysqlSchemaCleanup($ctx);}
+});
+$test('Schema::migrate(): crea idx_supplier_normalized_official, idx_supplier_cif y uq_supplier_alias',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    try{
+        Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+        $assert($db->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='suppliers' AND index_name='idx_supplier_normalized_official'")!==null,'falta idx_supplier_normalized_official');
+        $assert($db->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='suppliers' AND index_name='idx_supplier_cif'")!==null,'falta idx_supplier_cif');
+        $cifIndex=$db->one("SELECT non_unique AS n FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='suppliers' AND index_name='idx_supplier_cif' LIMIT 1");
+        $assert((int)$cifIndex['n']===1,'idx_supplier_cif NO debe ser UNIQUE en esta fase');
+        $assert($db->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='supplier_aliases' AND index_name='uq_supplier_alias'")!==null,'falta uq_supplier_alias');
+        $aliasIndex=$db->one("SELECT non_unique AS n FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='supplier_aliases' AND index_name='uq_supplier_alias' LIMIT 1");
+        $assert((int)$aliasIndex['n']===0,'uq_supplier_alias SÍ debe ser UNIQUE');
+    }finally{$mysqlSchemaCleanup($ctx);}
+});
+$test('supplier_aliases: el UNIQUE(supplier_id,normalized_value) impide el mismo alias normalizado duplicado para el mismo proveedor',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];$pdo=$ctx['pdo'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $pdo->beginTransaction();
+    try{
+        $db->execute("INSERT INTO service_types(name,normalized_name) VALUES ('Extintores fase2 test','extintores fase2 test')");
+        $serviceId=(int)$db->pdo()->lastInsertId();
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,main_service_type_id,active) VALUES (?,?,?,1)',['PROFOC TEST FASE2','profoc test fase2',$serviceId]);
+        $supplierId=(int)$db->pdo()->lastInsertId();
+        $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$supplierId,'name','PROFOC','profoc']);
+        $rejected=false;
+        try{
+            $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$supplierId,'domain','PROFOC','profoc']);
+        }catch(Throwable $error){$rejected=true;}
+        $assert($rejected,'un segundo alias con el mismo (supplier_id,normalized_value) debe ser rechazado por la BD, aunque cambie alias_type');
+        $count=$db->one('SELECT COUNT(*) n FROM supplier_aliases WHERE supplier_id=? AND normalized_value=?',[$supplierId,'profoc']);
+        $assert((int)$count['n']===1,'solo debe quedar una fila');
+    }finally{if($pdo->inTransaction())$pdo->rollBack();$mysqlSchemaCleanup($ctx);}
+});
+$test('supplier_aliases: distintos supplier_id SÍ pueden compartir el mismo normalized_value (la UNIQUE es por par, no global)',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];$pdo=$ctx['pdo'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $pdo->beginTransaction();
+    try{
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,active) VALUES (?,?,1)',['Proveedor A fase2 test','proveedor a fase2 test']);
+        $idA=(int)$db->pdo()->lastInsertId();
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,active) VALUES (?,?,1)',['Proveedor B fase2 test','proveedor b fase2 test']);
+        $idB=(int)$db->pdo()->lastInsertId();
+        $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$idA,'name','mismo-dominio.es','mismo dominio es']);
+        $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$idB,'name','mismo-dominio.es','mismo dominio es']);
+        $assert(true,'no debe lanzar — supplier_id distinto, mismo normalized_value es válido');
+    }finally{$pdo->rollBack();$mysqlSchemaCleanup($ctx);}
+});
+$test('compatibilidad: crear un supplier con el modelo actual (solo official_name/normalized_name/cif) sigue funcionando con name y normalized_official_name presentes pero NULL',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    // Exactamente el mismo INSERT que WebApp::suppliers() emite hoy — nunca toca name/normalized_official_name.
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
+        ['GARCÍA MARÍN CONSULTORES, S.L.',Salvest\Text::normalize('GARCÍA MARÍN CONSULTORES, S.L.'),null,null]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $row=$db->one('SELECT * FROM suppliers WHERE id=?',[$id]);
+    $assert($row!==null && $row['name']===null && $row['normalized_official_name']===null,'las columnas nuevas deben existir en la fila y valer NULL, sin romper el INSERT actual');
+    $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'GARCÍA MARÍN CONSULTORES, S.L.','proveedor_cif'=>''],'facturas@example.com');
+    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id,'la resolución global debe seguir encontrando el proveedor exactamente igual que antes de Fase 2');
+});
+$test('compatibilidad: Classifier::resolveSupplierInCommunity() da el mismo resultado con las columnas nuevas presentes-pero-inactivas',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Extintores',?,1)",[Salvest\Text::normalize('Extintores')]);
+    $serviceId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',['PROFOC',Salvest\Text::normalize('PROFOC'),null,$serviceId]);
+    $supplierId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['99','CP Fase 2',Salvest\Text::normalize('CP Fase 2'),null,'Calle Test 1']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$supplierId,'Extintores']);
+    $found=(new Salvest\Classifier($db))->resolveSupplierInCommunity($communityId,['proveedor'=>'PROFOC','proveedor_cif'=>''],'facturas@example.com');
+    $assert($found['supplier']!==null && (int)$found['supplier']['id']===$supplierId && $found['ambiguous']===false,'debe resolver exactamente igual que antes de Fase 2 — sin ningún tier nuevo todavía');
 });
 
 $failed=0;

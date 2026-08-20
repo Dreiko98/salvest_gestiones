@@ -77,7 +77,13 @@ CREATE TABLE IF NOT EXISTS service_types (
 
 CREATE TABLE IF NOT EXISTS suppliers (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  -- name: nombre corto/comercial (p.ej. "FACSA", "PROFOC"). Nullable hasta que la migración de
+  -- Fase 3 lo rellene; hasta entonces, inactivo — nada del código actual lo lee ni lo escribe.
+  name VARCHAR(255) NULL,
   official_name VARCHAR(255) NOT NULL,
+  -- normalized_official_name: version normalizada de la razón social legal, análoga a
+  -- normalized_name pero para "official_name". Nullable y sin rellenar hasta Fase 3.
+  normalized_official_name VARCHAR(255) NULL,
   normalized_name VARCHAR(255) NOT NULL,
   cif VARCHAR(50) NULL,
   main_service_type_id BIGINT UNSIGNED NULL,
@@ -90,6 +96,10 @@ CREATE TABLE IF NOT EXISTS suppliers (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_supplier_normalized (normalized_name),
+  INDEX idx_supplier_normalized_official (normalized_official_name),
+  -- No UNIQUE: el maestro todavía tiene duplicados conocidos (EXTNCAS/EXTINCAS, ENERVIA) por
+  -- fusionar en Fase 3; forzar unicidad ahora bloquearía esa migración antes de sanear los datos.
+  INDEX idx_supplier_cif (cif),
   CONSTRAINT fk_supplier_service FOREIGN KEY (main_service_type_id) REFERENCES service_types(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -109,6 +119,10 @@ CREATE TABLE IF NOT EXISTS supplier_aliases (
   normalized_value VARCHAR(500) NOT NULL,
   active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- Un mismo valor normalizado no puede repetirse para el mismo proveedor, sin importar su
+  -- alias_type (a proposito fuera de la unicidad: dos alias_type distintos con el mismo valor
+  -- normalizado siguen siendo el mismo alias a efectos de matching).
+  UNIQUE KEY uq_supplier_alias (supplier_id, normalized_value),
   CONSTRAINT fk_alias_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

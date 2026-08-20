@@ -26,8 +26,26 @@ final class Schema
         // Message-ID across an IMAP move happens on every processed message, every cycle.
         self::index($database,'processed_messages','idx_processed_messages_message_id','message_id_header');
         self::mailboxBaselineMigration($database);
+        self::supplierMasterDataScaffolding($database);
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0002_real_drive_structure')");
+    }
+
+    /**
+     * Fase 2 del maestro de proveedores: solo estructura, ninguna columna se lee ni se escribe
+     * todavía. `name`/`normalized_official_name` quedan NULL para todos los proveedores
+     * existentes hasta la migración de datos de Fase 3 — Classifier sigue usando exactamente
+     * `official_name`/`normalized_name` como hoy, sin ningún cambio de comportamiento.
+     */
+    private static function supplierMasterDataScaffolding(Database $database): void
+    {
+        self::column($database,'suppliers','name','VARCHAR(255) NULL AFTER id');
+        self::column($database,'suppliers','normalized_official_name','VARCHAR(255) NULL AFTER official_name');
+        self::index($database,'suppliers','idx_supplier_normalized_official','normalized_official_name');
+        // No UNIQUE en cif: hay duplicados conocidos (EXTNCAS/EXTINCAS, ENERVIA) pendientes de
+        // fusionar en Fase 3; forzarla ahora bloquearía esa migración.
+        self::index($database,'suppliers','idx_supplier_cif','cif');
+        self::uniqueIndex($database,'supplier_aliases','uq_supplier_alias','supplier_id,normalized_value');
     }
 
     /**
@@ -62,5 +80,13 @@ final class Schema
     {
         $exists=$database->one('SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? AND index_name=?',[$table,$indexName]);
         if(!$exists)$database->execute("ALTER TABLE `$table` ADD INDEX `$indexName` (`$column`)");
+    }
+
+    /** Same idempotency contract as index(), for a UNIQUE constraint. $columns is a raw,
+     * comma-separated, already-backtick-free column list (e.g. "supplier_id,normalized_value"). */
+    private static function uniqueIndex(Database $database,string $table,string $indexName,string $columns):void
+    {
+        $exists=$database->one('SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? AND index_name=?',[$table,$indexName]);
+        if(!$exists)$database->execute("ALTER TABLE `$table` ADD UNIQUE KEY `$indexName` ($columns)");
     }
 }

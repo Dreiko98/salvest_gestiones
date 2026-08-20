@@ -2579,6 +2579,205 @@ $test('PDF-only: el dedupe por SHA-256 de adjuntos PDF sigue exactamente igual q
     $assert($prior!==null && (int)$prior['id']===$fixture['attachmentIds'][0],'la consulta de dedupe por SHA-256 (sin relación con Fase 4) sigue encontrando el original');
 });
 
+// ---- Fase 5: resolveSupplier() global endurecido — mismo rigor que resolveSupplierInCommunity() ----
+$insertSupplier=static function(Salvest\Database $db,string $name,string $officialName,?string $cif,int $active=1):int{
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,active) VALUES (?,?,?,?,?,?)',
+        [$name,$officialName,Salvest\Text::normalizeCompanyName($name),Salvest\Text::normalizeCompanyName($officialName),$cif,$active]);
+    return (int)$db->pdo()->lastInsertId();
+};
+$insertAlias=static function(Salvest\Database $db,int $supplierId,string $value):void{
+    $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
+        [$supplierId,'name',$value,Salvest\Text::normalizeCompanyName($value)]);
+};
+
+// -- 13. Tests contra el maestro real (datos reproducidos tal como quedaron en producción) --
+$test('Fase 5 — CIF real: FACSA/PROFOC/CRISLA/ADRIAN TURCU/YOLIMPIO/SERGIO RAUL resuelven por supplier_cif exacto',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $real=[
+        ['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','A12000022'],
+        ['PROFOC','GARCÍA MARÍN CONSULTORES, S.L.','B12802971'],
+        ['CRISLA','CRISLA LIMPIEZAS Y CRISTALIZADOS, S.L.','B12534228'],
+        ['ADRIAN TURCU','ADRIAN TURCU','X4153497L'],
+        ['YOLIMPIO','RAFAEL GUIJARRO PRADES','18965195Q'],
+        ['SERGIO RAUL','SERGIO RAUL MARIN RUIZ','53376935F'],
+    ];
+    $ids=[];foreach($real as[$name,$official,$cif])$ids[$name]=$insertSupplier($db,$name,$official,$cif);
+    $classifier=new Salvest\Classifier($db);
+    foreach($real as[$name,,$cif]){
+        $result=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$cif],'facturas@proveedor.example');
+        $assert($result['supplier']!==null && (int)$result['supplier']['id']===$ids[$name] && $result['evidence']['type']==='exact' && $result['ambiguous']===false,"$name no resolvió por CIF exacto: ".json_encode($result));
+    }
+});
+$test('Fase 5 — CIF: variantes de formato normalizan igual (mayúsculas/guiones/puntos)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $facsaId=$insertSupplier($db,'FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','A12000022');
+    $yolimpioId=$insertSupplier($db,'YOLIMPIO','RAFAEL GUIJARRO PRADES','18965195Q');
+    $adrianId=$insertSupplier($db,'ADRIAN TURCU','ADRIAN TURCU','X4153497L');
+    $classifier=new Salvest\Classifier($db);
+    foreach(['A-12000022','A12000022','a12000022'] as $variant){
+        $r=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$variant],'facturas@x.example');
+        $assert((int)($r['supplier']['id']??0)===$facsaId,"variante $variant debe resolver FACSA: ".json_encode($r));
+    }
+    foreach(['18.965.195-Q','18965195Q'] as $variant){
+        $r=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$variant],'facturas@x.example');
+        $assert((int)($r['supplier']['id']??0)===$yolimpioId,"variante $variant debe resolver YOLIMPIO: ".json_encode($r));
+    }
+    foreach(['X-4153497-L','X4153497L'] as $variant){
+        $r=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$variant],'facturas@x.example');
+        $assert((int)($r['supplier']['id']??0)===$adrianId,"variante $variant debe resolver ADRIAN TURCU: ".json_encode($r));
+    }
+});
+$test('Fase 5 — aliases reales: PRO FOC/ZARDOYA OTIS/TK ELEVADORES/EXTNCAS/LIMPIEZAS ADRIÁN/MANTENIMIENTOS MB/YO LIMPIO resuelven por alias exacto',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias):void{
+    $db=$sqliteDb($classifierSchema);
+    $profoc=$insertSupplier($db,'PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',null);$insertAlias($db,$profoc,'PRO FOC');
+    $otis=$insertSupplier($db,'OTIS','OTIS MOBILITY, S.A.',null);$insertAlias($db,$otis,'ZARDOYA OTIS');
+    $thyssen=$insertSupplier($db,'THYSSEN','TK ELEVADORES ESPAÑA, S.L.U.',null);$insertAlias($db,$thyssen,'TK ELEVADORES');
+    $extincas=$insertSupplier($db,'EXTINCAS','EXTINTORES CASTELLÓN, S.L.',null);$insertAlias($db,$extincas,'EXTNCAS');
+    $adrian=$insertSupplier($db,'ADRIAN TURCU','ADRIAN TURCU',null);$insertAlias($db,$adrian,'LIMPIEZAS ADRIÁN');
+    $mb=$insertSupplier($db,'MB','MANTENIMIENTOS MANUEL BASTIDA S.L.U.',null);$insertAlias($db,$mb,'MANTENIMIENTOS MB');
+    $yolimpio=$insertSupplier($db,'YOLIMPIO','RAFAEL GUIJARRO PRADES',null);$insertAlias($db,$yolimpio,'YO LIMPIO');
+    $classifier=new Salvest\Classifier($db);
+    foreach([['PRO FOC',$profoc],['ZARDOYA OTIS',$otis],['TK ELEVADORES',$thyssen],['EXTNCAS',$extincas],['LIMPIEZAS ADRIÁN',$adrian],['MANTENIMIENTOS MB',$mb],['YO LIMPIO',$yolimpio]] as[$alias,$expectedId]){
+        $r=$classifier->resolveSupplier(['proveedor'=>$alias,'proveedor_cif'=>''],'facturas@x.example');
+        $assert((int)($r['supplier']['id']??0)===$expectedId && $r['evidence']['type']==='alias' && $r['ambiguous']===false,"\"$alias\" debe resolver por alias exacto: ".json_encode($r));
+    }
+});
+$test('Fase 5 — nombres reales: FACSA/GARCÍA MARÍN CONSULTORES S.L./H2O PLUS S.L./TK ELEVADORES ESPAÑA S.L.U. resuelven por name u official_name exacto',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $facsa=$insertSupplier($db,'FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.',null);
+    $profoc=$insertSupplier($db,'PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',null);
+    $inmecas=$insertSupplier($db,'INMECAS','H2O PLUS, S.L.',null);
+    $thyssen=$insertSupplier($db,'THYSSEN','TK ELEVADORES ESPAÑA, S.L.U.',null);
+    $classifier=new Salvest\Classifier($db);
+    $r1=$classifier->resolveSupplier(['proveedor'=>'FACSA','proveedor_cif'=>''],'facturas@x.example');
+    $assert((int)($r1['supplier']['id']??0)===$facsa && $r1['evidence']['type']==='supplier_name_exact',json_encode($r1));
+    $r2=$classifier->resolveSupplier(['proveedor'=>'GARCÍA MARÍN CONSULTORES S.L.','proveedor_cif'=>''],'facturas@x.example');
+    $assert((int)($r2['supplier']['id']??0)===$profoc && $r2['evidence']['type']==='supplier_official_name_exact',json_encode($r2));
+    $r3=$classifier->resolveSupplier(['proveedor'=>'H2O PLUS S.L.','proveedor_cif'=>''],'facturas@x.example');
+    $assert((int)($r3['supplier']['id']??0)===$inmecas && $r3['evidence']['type']==='supplier_official_name_exact',json_encode($r3));
+    $r4=$classifier->resolveSupplier(['proveedor'=>'TK ELEVADORES ESPAÑA S.L.U.','proveedor_cif'=>''],'facturas@x.example');
+    $assert((int)($r4['supplier']['id']??0)===$thyssen && $r4['evidence']['type']==='supplier_official_name_exact',json_encode($r4));
+});
+
+// -- 14. Ambigüedad sintética obligatoria --
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo CIF normalizado -> ambiguous, supplier=null (resolveSupplier global)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'PROV A','PROVEEDOR A, S.L.','B12345678');
+    $insertSupplier($db,'PROV B','PROVEEDOR B, S.L.','B-12345678'); // mismo CIF normalizado, formato distinto
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'B12345678'],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===true,'un maestro corrupto con CIF duplicado no debe adivinar: '.json_encode($r));
+});
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo alias normalizado -> ambiguous',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias):void{
+    $db=$sqliteDb($classifierSchema);
+    $a=$insertSupplier($db,'PROV A','PROVEEDOR A, S.L.',null);$insertAlias($db,$a,'MARCA COMPARTIDA');
+    $b=$insertSupplier($db,'PROV B','PROVEEDOR B, S.L.',null);$insertAlias($db,$b,'MARCA COMPARTIDA');
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'MARCA COMPARTIDA','proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===true,json_encode($r));
+});
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo name normalizado -> ambiguous, no se intenta desempatar con fuzzy',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'DUPLICADO','RAZÓN SOCIAL UNO, S.L.',null);
+    $insertSupplier($db,'DUPLICADO','RAZÓN SOCIAL DOS, S.L.',null);
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'DUPLICADO','proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===true,json_encode($r));
+});
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo official_name normalizado -> ambiguous',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'NOMBRE UNO','RAZÓN SOCIAL COMPARTIDA, S.L.',null);
+    $insertSupplier($db,'NOMBRE DOS','RAZÓN SOCIAL COMPARTIDA, S.L.',null);
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'RAZÓN SOCIAL COMPARTIDA, S.L.','proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===true,json_encode($r));
+});
+$test('Fase 5 — ambigüedad: dos suppliers empatan en el mejor score fuzzy (>=92) -> ambiguous',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    // Ninguna de las dos razones sociales coincide por exact/containment/token con la consulta —
+    // solo el tier fuzzy puede alcanzarlas, y ambas empatan exactamente en 92.89.
+    $insertSupplier($db,'LARA','SOCIEDAD LARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
+    $insertSupplier($db,'MARA','SOCIEDAD MARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
+    $query='SOCIEDAD SARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.';
+    $scoreLara=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD LARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
+    $scoreMara=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD MARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
+    $assert($scoreLara===$scoreMara && $scoreLara>=92,"precondición del test: empate exacto por encima del umbral (LARA=$scoreLara MARA=$scoreMara)");
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>$query,'proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===true,'empate exacto en el mejor score fuzzy debe ser ambiguo, nunca elegir el primero: '.json_encode($r).' scores='.$scoreLara.'/'.$scoreMara);
+});
+$test('Fase 5 — NO ambigüedad: un candidato con score claramente mayor gana sin ambigüedad',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $winnerId=$insertSupplier($db,'SARAA','SOCIEDAD SARAA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
+    $insertSupplier($db,'GAMA','SOCIEDAD GAMA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
+    $query='SOCIEDAD SARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.';
+    $scoreWinner=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD SARAA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
+    $scoreLoser=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD GAMA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
+    $assert($scoreWinner>$scoreLoser && $scoreWinner>=92,"precondición del test: scores deben diferir y superar 92 (winner=$scoreWinner loser=$scoreLoser)");
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>$query,'proveedor_cif'=>''],'facturas@x.example');
+    $assert((int)($r['supplier']['id']??0)===$winnerId && $r['ambiguous']===false,'debe ganar el score claramente mayor, sin ambigüedad: '.json_encode($r));
+});
+$test('Fase 5 — ambigüedad: 0 candidatos válidos -> supplier=null, ambiguous=false (no confundir "no encontrado" con "ambiguo")',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'ALGUIEN','ALGUIEN, S.L.',null);
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'NADIE QUE COINCIDA CON NADA','proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===false,json_encode($r));
+});
+
+// -- 15. Suppliers inactivos nunca resuelven (fusiones EXTNCAS/ENERVIA) --
+$test('Fase 5 — inactivos: un supplier active=0 nunca resuelve por CIF, aunque el CIF sea único en la tabla',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'FANTASMA','FANTASMA, S.L.','B99999999',0);
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'B99999999'],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===false,'un supplier inactivo no debe resolver nunca, ni siquiera de forma no-ambigua: '.json_encode($r));
+});
+$test('Fase 5 — inactivos: alias EXTNCAS resuelve al target activo EXTINCAS, nunca al id inactivo, ni siquiera si el inactivo tuviera un alias residual con el mismo valor',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias):void{
+    $db=$sqliteDb($classifierSchema);
+    $extincasActivo=$insertSupplier($db,'EXTINCAS','EXTINTORES CASTELLÓN, S.L.','B12433314',1);
+    $insertAlias($db,$extincasActivo,'EXTNCAS');
+    $extncasInactivo=$insertSupplier($db,'EXTNCAS','EXTNCAS',null,0); // simula el source ya fusionado, active=0
+    $insertAlias($db,$extncasInactivo,'ALIAS RESIDUAL'); // alias residual que no debería ni poder colisionar
+    $classifier=new Salvest\Classifier($db);
+    $r=$classifier->resolveSupplier(['proveedor'=>'EXTNCAS','proveedor_cif'=>''],'facturas@x.example');
+    $assert((int)($r['supplier']['id']??0)===$extincasActivo && $r['ambiguous']===false,'debe resolver al target activo por alias, nunca al inactivo: '.json_encode($r));
+});
+$test('Fase 5 — inactivos: name/official_name de un supplier active=0 nunca resuelve',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'ENERVIA','ENERVIA',null,0); // simula el id 48 antiguo ya fusionado
+    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'ENERVIA','proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null,'un supplier inactivo nunca debe resolver por name/official_name: '.json_encode($r));
+});
+$test('Fase 5 — inactivos: resolveSupplierInCommunity() tampoco ofrece un supplier active=0 como candidato de esa comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES ('F5','CP Fase 5','cp fase 5','x',1)");
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $inactiveId=$insertSupplier($db,'EXTNCAS','EXTNCAS',null,0);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$inactiveId,'Extintores']);
+    $r=(new Salvest\Classifier($db))->resolveSupplierInCommunity($communityId,['proveedor'=>'EXTNCAS','proveedor_cif'=>''],'facturas@x.example');
+    $assert($r['supplier']===null && $r['ambiguous']===false,'un supplier inactivo enlazado a la comunidad no debe ofrecerse como candidato: '.json_encode($r));
+});
+
+// -- 16. Segunda llamada restringida: candidatos ya excluyen inactivos --
+$test('Fase 5 — suppliersForCommunity() (candidatos de la segunda llamada restringida) ya excluye suppliers inactivos — comportamiento preexistente, confirmado con test',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES ('F5B','CP Fase 5 B','cp fase 5 b','x',1)");
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $activeId=$insertSupplier($db,'ACTIVO','ACTIVO, S.L.',null,1);
+    $inactiveId=$insertSupplier($db,'INACTIVO','INACTIVO, S.L.',null,0);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$activeId,'Limpieza']);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$inactiveId,'Limpieza']);
+    $candidates=(new Salvest\Classifier($db))->suppliersForCommunity($communityId);
+    $ids=array_column($candidates,'id');
+    $assert(in_array($activeId,$ids,true) && !in_array($inactiveId,$ids,true),'los candidatos de la llamada restringida no deben incluir suppliers inactivos: '.json_encode($candidates));
+});
+
+// -- Trace: comportamiento ambiguo debe quedar explicable en la traza --
+$test('Fase 5 — trace: cuando resolveSupplier() global es ambiguo, la traza registra el tier y el resultado ambiguous, sin infraestructura nueva',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $insertSupplier($db,'DOBLE','RAZÓN UNO, S.L.',null);
+    $insertSupplier($db,'DOBLE','RAZÓN DOS, S.L.',null);
+    $trace=[];
+    (new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'DOBLE','proveedor_cif'=>''],'facturas@x.example',
+        function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
+    $ambiguousStep=null;foreach($trace as $step)if($step[0]==='supplier_exact_name'&&$step[1]==='ambiguous')$ambiguousStep=$step;
+    $assert($ambiguousStep!==null,'la traza debe mostrar explícitamente qué tier detectó la ambigüedad: '.json_encode($trace));
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

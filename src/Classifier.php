@@ -85,53 +85,99 @@ final class Classifier
     }
 
     /**
-     * Supplier precedence: emitter/supplier CIF exact -> name exact (>=threshold) -> alias
-     * (name/CIF/sender domain). This is the global "which supplier is this" lookup, scoped
-     * to no particular community — InvoiceRouter checks separately whether the resolved
-     * supplier is actually linked to the resolved community.
-     * @param array<string,mixed> $invoice @return array{supplier:?array,evidence:?array}
+     * Fase 5: the global "which supplier is this" lookup — scoped to no particular community,
+     * used today only informatively by InvoiceRouter (never as a final decision; that activation
+     * is a later phase) — now carries the exact same rigor as resolveSupplierInCommunity(): CIF
+     * exact -> name exact -> official_name exact -> alias exact (name/CIF/sender domain) ->
+     * whole-word containment -> token overlap -> fuzzy (best score between name/official_name,
+     * never penalised for having two very different representations). There is no
+     * community+service tier here — there is no community to compare against.
+     *
+     * Every tier fails safe: more than one active supplier matching the same tier at the same
+     * priority stops immediately with ambiguous=true, never falls through to a lower tier to
+     * "break the tie" and never returns an arbitrary first match. This holds even for tiers a
+     * clean master should never produce duplicates in (CIF, alias) — the master is real data
+     * now, not a fixture, so this must be robust to it being wrong, not just to it being right.
+     * @param array<string,mixed> $invoice @param (callable(string,string,array<string,mixed>):void)|null $trace
+     *   Same observer contract as classify()/resolveSupplierInCommunity() — never affects control flow.
+     * @return array{supplier:?array,evidence:?array,ambiguous:bool}
      */
-    public function resolveSupplier(array $invoice, string $sender): array
+    public function resolveSupplier(array $invoice, string $sender, ?callable $trace = null): array
     {
-        $name = Text::normalize((string)($invoice['proveedor'] ?? ''));
-        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? '')); // for alias lookups below, which store their own normalized_value the same way
-        $cifIdentifier = Text::normalizeIdentifier((string)($invoice['proveedor_cif'] ?? '')); // for the real suppliers.cif column, dashes/spaces and all
-        $domain = Text::normalize(substr(strrchr($sender, '@') ?: '', 1));
+        $none = ['supplier'=>null,'evidence'=>null,'ambiguous'=>false];
         $suppliers = $this->db->all('SELECT s.*,st.name service_type_name FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id WHERE s.active=1');
+        if (!$suppliers) return $none;
+
+        $cifIdentifier = Text::normalizeIdentifier((string)($invoice['proveedor_cif'] ?? ''));
         if ($cifIdentifier !== '') {
-            foreach ($suppliers as $supplier) {
-                if (Text::normalizeIdentifier((string)$supplier['cif']) === $cifIdentifier) {
-                    return ['supplier'=>$supplier,'evidence'=>['field'=>'supplier_cif','type'=>'exact']];
-                }
+            $found = self::uniqueMatch($suppliers, static fn(array $r): bool => (string)($r['cif'] ?? '') !== '' && Text::normalizeIdentifier((string)$r['cif']) === $cifIdentifier);
+            if($trace)$trace('supplier_cif',$found===false?'ambiguous':($found?'match':'none'),['cif_normalizado'=>$cifIdentifier]);
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'supplier_cif','type'=>'exact'],'ambiguous'=>false];
+        }
+
+        $providerName = Text::normalizeCompanyName((string)($invoice['proveedor'] ?? ''));
+        if ($providerName !== '') {
+            $found = self::uniqueMatch($suppliers, static fn(array $r): bool => in_array($providerName, self::candidateNames($r), true));
+            if($trace)$trace('supplier_exact_name',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
+            if ($found !== null) {
+                if ($found === false) return ['supplier'=>null,'evidence'=>null,'ambiguous'=>true];
+                $matchedShortName = (string)($found['name'] ?? '') !== '' && Text::normalizeCompanyName((string)$found['name']) === $providerName;
+                return ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>$matchedShortName ? 'supplier_name_exact' : 'supplier_official_name_exact'],'ambiguous'=>false];
             }
         }
-        if ($name !== '') {
-            // Same compatibility shim as resolveSupplierInCommunity(): compares against both
-            // name and official_name so a bare short-name extraction ("FACSA") still scores high
-            // even once official_name becomes the (much longer) legal name post-Fase-3. Uses its
-            // own normalizeCompanyName()'d copy of the provider name (candidateNames() already
-            // strips legal forms from official_name/name) rather than reusing $name — $name stays
-            // normalize()-based on purpose, because the alias-tier below still compares against
-            // it and this phase deliberately leaves alias normalization untouched. Still first-
-            // match-wins, exactly as before — no tie/ambiguity detection added here.
-            $fuzzyProviderName = Text::normalizeCompanyName((string)($invoice['proveedor'] ?? ''));
-            foreach ($suppliers as $supplier) {
-                if (self::bestNameScore($fuzzyProviderName, '', $supplier) >= 92) {
-                    return ['supplier'=>$supplier,'evidence'=>['field'=>'proveedor','type'=>'fuzzy']];
-                }
+
+        $domain = Text::normalize(substr(strrchr($sender, '@') ?: '', 1));
+        $cif = Text::normalize((string)($invoice['proveedor_cif'] ?? '')); // aliases store normalized_value via normalize(), not normalizeIdentifier()
+        $candidateValues = array_filter([$providerName, $cif, $domain], static fn(string $v): bool => $v !== '');
+        if ($candidateValues) {
+            // Restricted to currently-active suppliers explicitly, not just by relying on the
+            // lookup below silently finding nothing for a stale alias on an inactive/merged
+            // supplier (e.g. EXTNCAS, id 13, merged into EXTINCAS) — fails safe either way, but
+            // this makes the guarantee explicit rather than incidental.
+            $activeIds = array_flip(array_map(static fn(array $r): int => (int)$r['id'], $suppliers));
+            $matchedIds = [];
+            foreach ($this->db->all('SELECT * FROM supplier_aliases WHERE active=1') as $alias) {
+                if (!in_array((string)$alias['normalized_value'], $candidateValues, true)) continue;
+                $supplierId = (int)$alias['supplier_id'];
+                if (isset($activeIds[$supplierId])) $matchedIds[$supplierId] = $alias;
             }
-        }
-        foreach ($this->db->all('SELECT * FROM supplier_aliases WHERE active=1') as $alias) {
-            if (in_array((string)$alias['normalized_value'], [$name,$cif,$domain], true)) {
+            if($trace)$trace('supplier_alias',count($matchedIds)>1?'ambiguous':(count($matchedIds)===1?'match':'none'),['candidatos'=>array_values($candidateValues)]);
+            if (count($matchedIds) > 1) return ['supplier'=>null,'evidence'=>null,'ambiguous'=>true];
+            if (count($matchedIds) === 1) {
+                $id = array_key_first($matchedIds);
+                $alias = $matchedIds[$id];
                 foreach ($suppliers as $supplier) {
-                    if ((int)$supplier['id'] === (int)$alias['supplier_id']) {
+                    if ((int)$supplier['id'] === $id) {
                         $field = $alias['normalized_value']===$cif&&$cif!=='' ? 'supplier_cif' : ($alias['normalized_value']===$domain&&$domain!=='' ? 'sender_domain' : 'alias');
-                        return ['supplier'=>$supplier,'evidence'=>['field'=>$field,'type'=>'alias']];
+                        return ['supplier'=>$supplier,'evidence'=>['field'=>$field,'type'=>'alias'],'ambiguous'=>false];
                     }
                 }
             }
+        } elseif ($trace) { $trace('supplier_alias','skipped',[]); }
+
+        if ($providerName !== '') {
+            $found = self::uniqueMatch($suppliers, static fn(array $r): bool => self::anyContainsWholeWords($providerName, $r));
+            if($trace)$trace('supplier_containment',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'name_containment'],'ambiguous'=>false];
+
+            $found = self::uniqueMatch($suppliers, static fn(array $r): bool => self::anyContainsAllWords($providerName, $r));
+            if($trace)$trace('supplier_token',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
+            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'token_match'],'ambiguous'=>false];
         }
-        return ['supplier'=>null,'evidence'=>null];
+
+        $best = null; $bestScore = 0.0; $tied = 0;
+        foreach ($suppliers as $supplier) {
+            $score = self::bestNameScore($providerName, $domain, $supplier);
+            if ($trace && $score > 0.0) $trace('supplier_fuzzy','candidate',['proveedor'=>$supplier['official_name'],'score'=>$score]);
+            if ($score > $bestScore) { $bestScore = $score; $best = $supplier; $tied = 1; }
+            elseif ($score === $bestScore && $score > 0.0) { $tied++; }
+        }
+        if ($bestScore >= $this->threshold) {
+            if($trace)$trace('supplier_fuzzy',$tied>1?'ambiguous':'match',['best'=>$best['official_name']??null,'score'=>$bestScore]);
+            return $tied > 1 ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$best,'evidence'=>['field'=>'proveedor','type'=>'fuzzy'],'ambiguous'=>false];
+        }
+        if($trace)$trace('supplier_fuzzy','none',['best'=>$best['official_name']??null,'score'=>$bestScore,'threshold'=>$this->threshold]);
+        return $none;
     }
 
     /**

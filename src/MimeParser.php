@@ -67,9 +67,16 @@ final class MimeParser
             }
         }
         $mime = trim(explode(';', $type, 2)[0]);
-        $supported = $mime === 'application/pdf' || str_starts_with($mime, 'image/') || preg_match('/\.(pdf|jpe?g|png|tiff?|webp)$/i', $filename);
+        // Fase 4 (PDF-only): image/* (incluidas las imágenes inline con filename — logos,
+        // firmas, tracking pixels) ya no cuenta como documento procesable. Un adjunto se
+        // considera "posible PDF" por declaración (MIME o extensión) O por contenido real
+        // (firma %PDF- literal) — este último cubre el caso de un PDF real mal etiquetado con
+        // un MIME o extensión de imagen; el contenido manda por encima de ambos. DocumentValidator
+        // hace después la comprobación real y definitiva — esto solo decide qué partes MIME
+        // merece la pena mirar más de cerca, sigue recorriendo el árbol completo del correo igual.
+        $supported = $mime === 'application/pdf' || preg_match('/\.pdf$/i', $filename) || str_starts_with($decodedBody, '%PDF-');
         if ($supported && ($filename !== '' || str_contains($disposition, 'attachment'))) {
-            $extension = $mime === 'application/pdf' ? '.pdf' : '.jpg';
+            $extension = '.pdf';
             $original = $this->decode($filename ?: "adjunto-sin-nombre-$index$extension");
             $attachments[] = ['original_filename'=>$original,'safe_filename'=>Text::safeFilename($original,$index,$extension),
                 'mime_type'=>$mime,'payload'=>$decodedBody,'sha256'=>hash('sha256',$decodedBody),'size'=>strlen($decodedBody)];

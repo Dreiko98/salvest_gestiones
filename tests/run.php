@@ -205,7 +205,7 @@ $test('validación rechaza un falso pdf',static function()use($assert):void{
     try{
         Salvest\DocumentValidator::validate(['payload'=>'esto no es un PDF','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);
         $assert(false,'debería rechazar el documento');
-    }catch(RuntimeException $error){$assert(str_contains($error->getMessage(),'firma PDF'));}
+    }catch(Salvest\NotPdfException $error){$assert(str_contains($error->getMessage(),'no es un PDF real'));}
 });
 $test('validación acepta un pdf',static function()use($assert):void{
     Salvest\DocumentValidator::validate(['payload'=>'%PDF-1.4 demo','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);
@@ -2364,6 +2364,219 @@ $test('/Revisar caso legacy: provider="FACSA" con name=NULL/official_name=FACSA 
     $html=$requestWebApp($webApp,'GET','reviews');
     $assert(str_contains($html,'>FACSA</option>'),'caso legacy: debe mostrarse "FACSA": '.$html);
     $assert((bool)preg_match('/<option value="'.$id.'" selected>FACSA<\/option>/',$html),'caso legacy: la opción "FACSA" debe seguir preseleccionándose: '.$html);
+});
+
+// ---- Fase 4: PDF-only — magic bytes reales, MimeParser ya no considera image/* documento,
+// DocumentValidator decide solo por contenido, Worker excluye no-PDF sin fallar el correo entero ----
+$pdfBytes="%PDF-1.4\n%fake pdf content for tests\n";
+$pngBytes="\x89PNG\r\n\x1a\n"."fake png data after signature";
+$jpegBytes="\xFF\xD8\xFF\xE0"."fake jpeg data after signature";
+$gifBytes="GIF89a"."fake gif data after signature";
+
+/** Construye un email multipart/mixed crudo a partir de una lista de partes
+ * [mime,filename?,payload,disposition?,content_id?]. */
+$buildEmail=static function(array $parts):string{
+    $boundary='test-boundary-'.bin2hex(random_bytes(4));
+    $raw="From: Demo <demo@example.com>\r\nSubject: Test\r\nContent-Type: multipart/mixed; boundary=\"$boundary\"\r\n\r\n";
+    foreach($parts as $part){
+        $mime=$part['mime'];$filename=$part['filename']??null;$disposition=$part['disposition']??'attachment';$contentId=$part['content_id']??null;
+        $raw.="--$boundary\r\nContent-Type: $mime".($filename!==null?"; name=\"$filename\"":'')."\r\n";
+        $raw.="Content-Disposition: $disposition".($filename!==null?"; filename=\"$filename\"":'')."\r\n";
+        if($contentId!==null)$raw.="Content-ID: <$contentId>\r\n";
+        $raw.="Content-Transfer-Encoding: base64\r\n\r\n".base64_encode($part['payload'])."\r\n";
+    }
+    return $raw."--$boundary--\r\n";
+};
+
+// -- Caso 1: un PDF real, comportamiento normal --
+$test('PDF-only caso 1: email con 1 PDF real -> 1 adjunto procesable',static function()use($assert,$buildEmail,$pdfBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'application/pdf','filename'=>'factura.pdf','payload'=>$pdfBytes]]));
+    $assert(count($message['attachments'])===1);
+    $assert($message['attachments'][0]['payload']===$pdfBytes);
+});
+// -- Caso 2: PDF + GIF -> solo PDF --
+$test('PDF-only caso 2: PDF + GIF -> solo el PDF es procesable',static function()use($assert,$buildEmail,$pdfBytes,$gifBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([
+        ['mime'=>'application/pdf','filename'=>'factura.pdf','payload'=>$pdfBytes],
+        ['mime'=>'image/gif','filename'=>'tracking.gif','payload'=>$gifBytes],
+    ]));
+    $assert(count($message['attachments'])===1,json_encode($message['attachments']));
+    $assert($message['attachments'][0]['original_filename']==='factura.pdf');
+});
+// -- Caso 3: PDF + PNG + JPG -> solo PDF --
+$test('PDF-only caso 3: PDF + PNG + JPG -> solo el PDF es procesable',static function()use($assert,$buildEmail,$pdfBytes,$pngBytes,$jpegBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([
+        ['mime'=>'application/pdf','filename'=>'factura.pdf','payload'=>$pdfBytes],
+        ['mime'=>'image/png','filename'=>'logo.png','payload'=>$pngBytes],
+        ['mime'=>'image/jpeg','filename'=>'firma.jpg','payload'=>$jpegBytes],
+    ]));
+    $assert(count($message['attachments'])===1,json_encode($message['attachments']));
+    $assert($message['attachments'][0]['original_filename']==='factura.pdf');
+});
+// -- Caso 4: solo GIF -> 0 adjuntos procesables --
+$test('PDF-only caso 4: solo GIF -> 0 adjuntos procesables (el correo quedará ignored)',static function()use($assert,$buildEmail,$gifBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'image/gif','filename'=>'tracking.gif','payload'=>$gifBytes]]));
+    $assert(count($message['attachments'])===0,json_encode($message['attachments']));
+});
+// -- Caso 5: solo PNG/JPG -> 0 adjuntos procesables --
+$test('PDF-only caso 5: solo PNG/JPG -> 0 adjuntos procesables',static function()use($assert,$buildEmail,$pngBytes,$jpegBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([
+        ['mime'=>'image/png','filename'=>'logo.png','payload'=>$pngBytes],
+        ['mime'=>'image/jpeg','filename'=>'firma.jpg','payload'=>$jpegBytes],
+    ]));
+    $assert(count($message['attachments'])===0,json_encode($message['attachments']));
+});
+// -- Caso 6: sin adjuntos -- (ya cubierto por 'mime sin documentos' existente; confirmamos explícitamente aquí)
+$test('PDF-only caso 6: email sin adjuntos -> 0 adjuntos procesables',static function()use($assert):void{
+    $raw="From: demo@example.com\r\nSubject: Sin adjuntos\r\nContent-Type: text/plain\r\n\r\nSolo texto.";
+    $message=(new Salvest\MimeParser())->parse($raw);
+    $assert(count($message['attachments'])===0);
+});
+// -- Caso 7: filename .pdf pero contenido PNG -> MimeParser lo incluye (decide por extensión),
+// DocumentValidator lo rechaza después (defensa en profundidad) --
+$test('PDF-only caso 7: filename .pdf con contenido PNG real -> MimeParser lo deja pasar por extensión, DocumentValidator lo rechaza por contenido',static function()use($assert,$buildEmail,$pngBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'application/octet-stream','filename'=>'factura.pdf','payload'=>$pngBytes]]));
+    $assert(count($message['attachments'])===1,'MimeParser decide por extensión, no abre el contenido: '.json_encode($message['attachments']));
+    try{
+        Salvest\DocumentValidator::validate($message['attachments'][0],26214400);
+        $assert(false,'DocumentValidator debe rechazar el contenido PNG pese al nombre .pdf');
+    }catch(Salvest\NotPdfException $e){$assert(true);}
+});
+// -- Caso 8: filename .jpg pero contenido PDF real -> se procesa como PDF real (preferencia explícita) --
+$test('PDF-only caso 8: filename .jpg con contenido PDF real -> se incluye y se valida como PDF real',static function()use($assert,$buildEmail,$pdfBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'image/jpeg','filename'=>'factura.jpg','payload'=>$pdfBytes]]));
+    $assert(count($message['attachments'])===1,'el contenido real (%PDF-) debe ganar sobre el MIME/extensión de imagen: '.json_encode($message['attachments']));
+    Salvest\DocumentValidator::validate($message['attachments'][0],26214400); // no debe lanzar
+    $assert(true);
+});
+// -- Caso 9: mime application/pdf pero contenido no-PDF -> reject --
+$test('PDF-only caso 9: mime application/pdf con contenido no-PDF -> DocumentValidator rechaza',static function()use($assert,$buildEmail,$pngBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'application/pdf','filename'=>'factura.pdf','payload'=>$pngBytes]]));
+    $assert(count($message['attachments'])===1); // MimeParser lo incluye (mime declarado pdf)
+    try{Salvest\DocumentValidator::validate($message['attachments'][0],26214400);$assert(false,'debe rechazar contenido no-PDF pese al MIME correcto');}
+    catch(Salvest\NotPdfException $e){$assert(true);}
+});
+// -- Caso 10: mime image/png pero contenido PDF real -> el contenido manda, se acepta --
+$test('PDF-only caso 10: mime image/png con contenido PDF real -> el contenido manda, se incluye y se acepta (decisión documentada)',static function()use($assert,$buildEmail,$pdfBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'image/png','filename'=>'factura.png','payload'=>$pdfBytes]]));
+    $assert(count($message['attachments'])===1,'MimeParser debe incluirlo por la firma %PDF- real, pese al MIME image/png declarado: '.json_encode($message['attachments']));
+    Salvest\DocumentValidator::validate($message['attachments'][0],26214400); // no debe lanzar
+    $assert(true);
+});
+// -- Caso 11: PDF con extensión en mayúsculas --
+$test('PDF-only caso 11: filename FACTURA.PDF (mayúsculas) -> se acepta',static function()use($assert,$buildEmail,$pdfBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'application/octet-stream','filename'=>'FACTURA.PDF','payload'=>$pdfBytes]]));
+    $assert(count($message['attachments'])===1);
+    Salvest\DocumentValidator::validate($message['attachments'][0],26214400);
+    $assert(true);
+});
+// -- Caso 12: PDF sin extensión, mime correcto --
+$test('PDF-only caso 12: sin extensión de archivo, mime application/pdf, magic bytes correctos -> se acepta',static function()use($assert,$buildEmail,$pdfBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([['mime'=>'application/pdf','filename'=>null,'payload'=>$pdfBytes,'disposition'=>'attachment']]));
+    $assert(count($message['attachments'])===1,'sin filename pero con Content-Disposition: attachment y mime pdf, debe incluirse: '.json_encode($message['attachments']));
+    Salvest\DocumentValidator::validate($message['attachments'][0],26214400);
+    $assert(true);
+});
+// -- Caso 13: imagen inline con Content-ID -> se ignora siempre --
+$test('PDF-only caso 13: imagen inline con Content-ID (logo de firma) -> ignorada, no cuenta como adjunto',static function()use($assert,$buildEmail,$pngBytes,$pdfBytes):void{
+    $message=(new Salvest\MimeParser())->parse($buildEmail([
+        ['mime'=>'application/pdf','filename'=>'factura.pdf','payload'=>$pdfBytes],
+        ['mime'=>'image/png','filename'=>'logo.png','payload'=>$pngBytes,'disposition'=>'inline','content_id'=>'logo123@example.com'],
+    ]));
+    $assert(count($message['attachments'])===1,'el logo inline con Content-ID nunca debe contarse como documento: '.json_encode($message['attachments']));
+    $assert($message['attachments'][0]['original_filename']==='factura.pdf');
+});
+
+// ---- DocumentValidator: defensa en profundidad, solo contenido decide ----
+$test('DocumentValidator: PDF real (mime/filename/contenido coherentes) -> acepta',static function()use($assert,$pdfBytes):void{
+    Salvest\DocumentValidator::validate(['payload'=>$pdfBytes,'mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],26214400);
+    $assert(true);
+});
+$test('DocumentValidator: filename=factura.pdf, mime=image/png, contenido PNG -> reject',static function()use($assert,$pngBytes):void{
+    try{Salvest\DocumentValidator::validate(['payload'=>$pngBytes,'mime_type'=>'image/png','original_filename'=>'factura.pdf'],26214400);$assert(false);}
+    catch(Salvest\NotPdfException $e){$assert(true);}
+});
+$test('DocumentValidator: filename=factura.jpg, mime=application/pdf, contenido JPG -> reject (el contenido manda, no el MIME declarado)',static function()use($assert,$jpegBytes):void{
+    try{Salvest\DocumentValidator::validate(['payload'=>$jpegBytes,'mime_type'=>'application/pdf','original_filename'=>'factura.jpg'],26214400);$assert(false);}
+    catch(Salvest\NotPdfException $e){$assert(true);}
+});
+$test('DocumentValidator: sin extensión, mime=application/pdf, contenido %PDF- -> accept',static function()use($assert,$pdfBytes):void{
+    Salvest\DocumentValidator::validate(['payload'=>$pdfBytes,'mime_type'=>'application/pdf','original_filename'=>'sin_extension'],26214400);
+    $assert(true);
+});
+$test('DocumentValidator: factura.PDF (mayúsculas), mime=application/octet-stream, contenido %PDF- -> accept (contenido > MIME > extensión)',static function()use($assert,$pdfBytes):void{
+    Salvest\DocumentValidator::validate(['payload'=>$pdfBytes,'mime_type'=>'application/octet-stream','original_filename'=>'factura.PDF'],26214400);
+    $assert(true);
+});
+$test('DocumentValidator: payload vacío -> RuntimeException genérico, NO NotPdfException (son problemas distintos)',static function()use($assert):void{
+    try{Salvest\DocumentValidator::validate(['payload'=>'','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],26214400);$assert(false);}
+    catch(Salvest\NotPdfException $e){$assert(false,'un adjunto vacío no es "no es un PDF", es un problema distinto');}
+    catch(RuntimeException $e){$assert(str_contains($e->getMessage(),'vacío'));}
+});
+$test('DocumentValidator: payload demasiado grande -> RuntimeException genérico, NO NotPdfException',static function()use($assert,$pdfBytes):void{
+    try{Salvest\DocumentValidator::validate(['payload'=>$pdfBytes,'mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],3);$assert(false);}
+    catch(Salvest\NotPdfException $e){$assert(false,'demasiado grande no es "no es un PDF"');}
+    catch(RuntimeException $e){$assert(str_contains($e->getMessage(),'grande'));}
+});
+$test('DocumentValidator: PDF con firma correcta pero contenido corrupto después -> ACEPTA (Fase 4 no oculta PDFs reales problemáticos, solo filtra lo que claramente no es PDF)',static function()use($assert):void{
+    Salvest\DocumentValidator::validate(['payload'=>"%PDF-1.4\n%%EOF-truncado-a-mitad-de-nada-coherente",'mime_type'=>'application/pdf','original_filename'=>'factura-corrupta.pdf'],26214400);
+    $assert(true,'un PDF con firma real pero corrupto debe pasar la validación básica — el fallo (si lo hay) pertenece a OpenAI/al pipeline existente, no a este filtro');
+});
+
+// ---- Worker: garantías estructurales de que non-PDF nunca llega a OpenAI / processed_attachments ----
+$test('Worker: la exclusión de un adjunto no-PDF ocurre ANTES de llamar a processAttachment() — non-PDF nunca puede alcanzar OpenAIExtractor ni crear processed_attachments (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $validatePos=strpos($source,'DocumentValidator::validate($attachment,');
+    $catchNotPdfPos=strpos($source,'catch (NotPdfException)');
+    $continuePos=strpos($source,'// Fase 4 (PDF-only): not a real PDF, however it was labeled');
+    $processAttachmentCallPos=strpos($source,'$outcomes[] = $this->processAttachment(');
+    $assert($validatePos!==false&&$catchNotPdfPos!==false&&$continuePos!==false&&$processAttachmentCallPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
+    $assert($validatePos<$catchNotPdfPos,'la validación debe ocurrir antes de decidir si se excluye');
+    $assert($catchNotPdfPos<$processAttachmentCallPos,'el catch de NotPdfException (con su continue) debe preceder textualmente a la llamada a processAttachment() dentro del mismo bucle — así un adjunto no-PDF nunca puede alcanzarla');
+});
+$test('Worker: cuando todos los adjuntos de un correo quedan excluidos, se usa exactamente el mismo saveMessage(...\'ignored\',0,null) que el caso "sin adjuntos" — sin destino, sin IMAP move (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $noAttachmentsSave=strpos($source,"\$this->saveMessage(\$mailbox,\$client,\$uid,\$message,'ignored',0,null);");
+    $emptyOutcomesCheckPos=strpos($source,'if (!$outcomes) {');
+    $assert($noAttachmentsSave!==false,'debe existir la llamada a saveMessage(...,\'ignored\',0,null)');
+    $assert($emptyOutcomesCheckPos!==false,'debe existir la comprobación de $outcomes vacío');
+    // Debe aparecer DOS veces exactamente el mismo patrón de llamada: una para "sin adjuntos" y
+    // otra para "todos los adjuntos excluidos" — mismo tratamiento, ninguna con destino/IMAP move.
+    $occurrences=substr_count($source,"'ignored',0,null);");
+    $assert($occurrences===2,'deben existir exactamente 2 llamadas idénticas a saveMessage(...,\'ignored\',0,null) — sin adjuntos, y todos excluidos: encontradas '.$occurrences);
+    $moveCallsBetween=substr_count(substr($source,$emptyOutcomesCheckPos,200),'$client->move(');
+    $assert($moveCallsBetween===0,'no debe haber ningún $client->move() en la rama de "todos excluidos"');
+});
+$test('Worker: la lista de dedupe de processed_messages sigue incluyendo \'ignored\' — un mensaje ya ignorado no se vuelve a procesar en el siguiente ciclo (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert(str_contains($source,"in_array(\$existing['status'],['completed','ignored','needs_review','error'],true)"),'\'ignored\' debe seguir en la lista de estados que impiden reprocesar un UID ya visto');
+});
+$test('Worker: la normalización de mime_type a application/pdf ocurre justo después de validar y antes de procesar — corrige el caso "PDF real mal etiquetado" para OpenAIExtractor sin tocar ese fichero',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $normalizePos=strpos($source,"\$attachment['mime_type'] = 'application/pdf';");
+    $processAttachmentCallPos=strpos($source,'$outcomes[] = $this->processAttachment(');
+    $assert($normalizePos!==false&&$processAttachmentCallPos!==false&&$normalizePos<$processAttachmentCallPos,'el mime_type debe normalizarse antes de procesar, para que OpenAIExtractor::documentInput() nunca reciba un image/* con bytes de PDF real dentro');
+});
+
+// ---- Dedupe funcional de 'ignored' (no solo la guarda de código anterior) ----
+$test('processed_messages: un UID ya guardado como \'ignored\' se reconoce en la misma consulta de dedupe que usa Worker (no vuelve a considerarse candidato)',static function()use($assert,$sqliteDbWithLock,$workerConfig):void{
+    $db=$sqliteDbWithLock('always-free');
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','x','INBOX']);
+    $mailboxId=(int)$db->pdo()->lastInsertId();
+    $db->execute("INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,message_id_header,sender,subject,received_at,status,document_count,imap_destination,imap_move_status,processed_at) VALUES (?,?,?,?,?,?,?,'ignored',0,NULL,'not_required',?)",
+        [$mailboxId,'1001','777','<msg-777@example.com>','proveedor@example.com','Solo un logo',date('Y-m-d H:i:s'),date('Y-m-d H:i:s')]);
+    $existing=$db->one('SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',[$mailboxId,'1001','777']);
+    $assert($existing!==null && $existing['status']==='ignored');
+    $assert(in_array($existing['status'],['completed','ignored','needs_review','error'],true),'exactamente la misma condición que Worker::processMailbox() usa para saltarse un UID ya visto');
+});
+
+// ---- Dedupe SHA-256 de PDFs: confirmamos que Fase 4 no lo ha tocado ----
+$test('PDF-only: el dedupe por SHA-256 de adjuntos PDF sigue exactamente igual que antes de Fase 4',static function()use($assert,$sqliteDbWithLock,$seedRequeueFixture):void{
+    $db=$sqliteDbWithLock('always-free');
+    $fixture=$seedRequeueFixture($db,['needs_review']);
+    $prior=$db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate') ORDER BY id LIMIT 1",['sha-0']);
+    $assert($prior!==null && (int)$prior['id']===$fixture['attachmentIds'][0],'la consulta de dedupe por SHA-256 (sin relación con Fase 4) sigue encontrando el original');
 });
 
 $failed=0;

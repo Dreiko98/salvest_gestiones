@@ -103,13 +103,35 @@ final class Worker
                 $outcomes = [];
                 try {
                     foreach ($message['attachments'] as $attachment) {
-                        DocumentValidator::validate($attachment,(int)$this->config['processing']['max_attachment_bytes']);
+                        try {
+                            DocumentValidator::validate($attachment,(int)$this->config['processing']['max_attachment_bytes']);
+                        } catch (NotPdfException) {
+                            // Fase 4 (PDF-only): not a real PDF, however it was labeled — silently
+                            // excluded from processing. Never counted, never reaches OpenAI, never
+                            // becomes a processed_attachments row, never fails the whole email.
+                            // MimeParser already keeps most of these out of $attachments entirely;
+                            // this is the defense-in-depth backstop for whatever still gets here.
+                            continue;
+                        }
                         $counts['documents']++;
+                        // Content already confirmed real PDF above — the declared MIME (possibly
+                        // wrong, e.g. "image/jpeg" on a mislabeled real PDF) must never reach
+                        // OpenAIExtractor, which picks its request shape from this exact string.
+                        $attachment['mime_type'] = 'application/pdf';
                         try { $outcomes[] = $this->processAttachment($mailbox,$client,$uid,$message,$attachment,$counts); }
                         catch (\Throwable $attachmentError) {
                             $this->insertAttachment($mailbox,$client,$uid,$attachment,'error',['error_message'=>$attachmentError->getMessage()]);
                             throw $attachmentError;
                         }
+                    }
+                    if (!$outcomes) {
+                        // Every attachment this email had turned out not to be a real PDF (or
+                        // there simply weren't any left after MimeParser's own filtering) — same
+                        // outcome as an email with zero attachments: 'ignored', no processed_
+                        // attachments row, no IMAP move, the email stays in INBOX untouched.
+                        error_log('mailbox_id='.$mailbox['id'].' uid='.$uid.' status=ignored reason=no_processable_pdf');
+                        $this->saveMessage($mailbox,$client,$uid,$message,'ignored',0,null);
+                        continue;
                     }
                     $communityIds = array_values(array_unique(array_filter(array_column($outcomes,'community_id'))));
                     $allClassified = !array_filter($outcomes,static fn(array $item): bool => !in_array($item['status'],['classified','duplicate'],true));

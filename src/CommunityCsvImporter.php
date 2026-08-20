@@ -19,9 +19,44 @@ final class CommunityCsvImporter
 
     public function __construct(private Database $db){}
 
+    /**
+     * FROZEN — DO NOT RUN AFTER SUPPLIER MASTER MIGRATION.
+     *
+     * replaceFrom() below deletes and rebuilds `suppliers`/`supplier_aliases`/
+     * `supplier_service_types` from the CSV, writing them with the pre-Fase-3 model
+     * (official_name = short commercial name, `name` never touched). Once the Fase 3 data
+     * migration has run, that would silently destroy every CIF, razón social, alias and the two
+     * supplier merges it wrote — with no way back from inside the database itself.
+     *
+     * This is a deliberate fail-fast, not a full adaptation of the importer (that's a later,
+     * separate task): if any active supplier already has a non-empty `name`, the master is
+     * considered migrated and this throws before the transaction opens — before the very first
+     * DELETE. No bypass flag exists on purpose; the real fix is making the importer merge into
+     * the new model instead of replacing it, not making this check easier to skip.
+     *
+     * A pre-Fase-2 database (the `name` column doesn't exist yet) or a post-Fase-2-but-
+     * pre-Fase-3 one (the column exists but is NULL for every row) both pass through unchanged —
+     * this only blocks the state that would actually be destroyed.
+     */
+    private function guardAgainstMigratedSupplierMaster(): void
+    {
+        $columnExists=$this->db->one("SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='suppliers' AND column_name='name'");
+        if(!$columnExists)return;
+        $migrated=$this->db->one("SELECT COUNT(*) n FROM suppliers WHERE active=1 AND name IS NOT NULL AND name<>''");
+        if($migrated&&(int)$migrated['n']>0){
+            throw new \RuntimeException(
+                'ABORTADO: el maestro de proveedores ya está migrado ('.$migrated['n'].' supplier(s) activo(s) con suppliers.name relleno). '.
+                'CommunityCsvImporter::replaceFrom() borraría y reconstruiría suppliers/supplier_aliases con el modelo antiguo, destruyendo CIF, '.
+                'razón social, aliases y fusiones ya migrados. No hay ningún flag para saltarse esta protección — la adaptación completa del '.
+                'importador al nuevo maestro de proveedores queda pendiente para una fase posterior. Ninguna fila se ha modificado.'
+            );
+        }
+    }
+
     /** @return array{communities:int,suppliers:int,relations:int} */
     public function replaceFrom(string $path):array
     {
+        $this->guardAgainstMigratedSupplierMaster();
         $rows=$this->read($path);
         if(count($rows)!==65)throw new \RuntimeException('El CSV definitivo debe contener exactamente 65 comunidades; contiene '.count($rows));
         $codes=[];

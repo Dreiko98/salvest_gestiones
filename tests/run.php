@@ -43,7 +43,7 @@ CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,acti
 CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,requeued_at TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT,UNIQUE(mailbox_id,uidvalidity,message_uid,attachment_sha256));
 CREATE TABLE processed_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,message_id_header TEXT,sender TEXT,subject TEXT,received_at TEXT,status TEXT,document_count INTEGER DEFAULT 0,imap_destination TEXT,imap_move_status TEXT,error_message TEXT,processed_at TEXT);
 CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
-CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
+CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,official_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
 SQL;
 /** @param 'always-free'|'always-busy'|'free-then-busy' $lockBehavior */
@@ -334,7 +334,7 @@ $test('ocultar campos: los valores existentes de comunidad viajan ocultos y no s
     $still=(new Salvest\Classifier($db))->classify(['cups'=>'ES0021000000000001JN']);
     $assert($still['community']!==null && (int)$still['community']['id']===$id,'el identificador ocultado en la UI debe seguir siendo utilizable por el Classifier');
 });
-$test('ocultar campos: los valores existentes de proveedor viajan ocultos y no se borran',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('/Proveedores: el CIF ahora es visible/editable (cambio deliberado de esta mini-fase); los aliases siguen ocultos y no se borran',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
         ['Iberdrola Comercializacion',Salvest\Text::normalize('Iberdrola Comercializacion'),'A12345678',null]);
@@ -350,11 +350,11 @@ $test('ocultar campos: los valores existentes de proveedor viajan ocultos y no s
     $_SERVER['REQUEST_METHOD']='GET';$_GET=['edit'=>(string)$id];
     $method=new ReflectionMethod(Salvest\WebApp::class,'suppliers');$method->setAccessible(true);
     ob_start();$method->invoke($webApp);$html=ob_get_clean();restore_error_handler();
-    $assert(str_contains($html,'<input type="hidden" name="cif" value="A12345678">'),'el CIF existente debe seguir viajando en el formulario, oculto');
-    $assert(str_contains($html,'<input type="hidden" name="aliases" value="iberdrola.es">'),'el alias existente debe seguir viajando en el formulario, oculto');
-    $assert(!str_contains($html,'name="cif" required') && !preg_match('/<label>CIF<input/',$html),'el CIF ya no debe ser editable en el alta/edición cotidiana');
-    $assert(!str_contains($html,'<textarea name="aliases"'),'el campo ya no debe ser editable en el alta/edición cotidiana');
-    $assert(!str_contains($html,'Otros nombres o dominios conocidos'),'la etiqueta visible debe haber desaparecido');
+    $assert(str_contains($html,'name="cif" value="A12345678"'),'el CIF existente debe precargarse en el campo visible: '.$html);
+    $assert(preg_match('/<label>CIF \/ NIF \/ NIE<input/',$html)===1,'el CIF ya debe ser editable en el alta/edición, con su propia etiqueta');
+    $assert(str_contains($html,'<input type="hidden" name="aliases" value="iberdrola.es">'),'el alias existente debe seguir viajando oculto (Fase 5, no esta mini-fase)');
+    $assert(!str_contains($html,'<textarea name="aliases"'),'los aliases siguen sin ser editables en el alta/edición cotidiana');
+    $assert(!str_contains($html,'Otros nombres o dominios conocidos'),'la etiqueta visible de aliases sigue sin aparecer');
     $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'A12345678'],'facturas@otra-cosa.example');
     $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id,'el CIF ocultado en la UI debe seguir siendo utilizable por el Classifier');
     $resolvedByAlias=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'Nombre distinto','proveedor_cif'=>''],'facturas@iberdrola.es');
@@ -710,7 +710,7 @@ $test('resolución contextual: formas societarias distintas (maestro S.L., factu
     $invoice=['proveedor'=>'AGUAS DEL LEVANTE, S.A.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
     $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@aguaslevante.es');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],'S.L. en el maestro y S.A. en la factura deben considerarse el mismo nombre comercial: '.json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='exact_name','tras quitar la forma societaria ambos nombres deben quedar idénticos, no solo contenidos');
+    $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact','tras quitar la forma societaria ambos nombres deben quedar idénticos, no solo contenidos');
 });
 $test('resolución contextual: mayúsculas, tildes y puntuación no impiden la coincidencia exacta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
     $db=$sqliteDb($classifierSchema);
@@ -803,7 +803,7 @@ $test('inferencia comunidad+servicio: un proveedor identificado explícitamente 
     $invoice=['proveedor'=>'LIMPIEZAS NORTE','proveedor_cif'=>null,'comunidad_cif'=>'H32000000','tipo_servicio'=>'limpieza'];
     $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@limpiezasnorte.example');
     $assert($route['status']==='classified','la coincidencia de nombre explícita debe primar sobre la inferencia comunidad+servicio: '.json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='exact_name','no debe usarse la señal comunidad+servicio cuando el nombre ya resolvió el proveedor: '.json_encode($route['evidence']['supplier']));
+    $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact','no debe usarse la señal comunidad+servicio cuando el nombre ya resolvió el proveedor: '.json_encode($route['evidence']['supplier']));
 });
 $test('inferencia comunidad+servicio: proveedor confirmado por nombre pero con servicio erróneo de OpenAI — gana el servicio configurado en BD',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
     $db=$sqliteDb($classifierSchema);
@@ -812,7 +812,7 @@ $test('inferencia comunidad+servicio: proveedor confirmado por nombre pero con s
     $invoice=['proveedor'=>'CRISLA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
     $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='exact_name','el proveedor se resolvió por nombre, no por la señal comunidad+servicio');
+    $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact','el proveedor se resolvió por nombre, no por la señal comunidad+servicio');
     $assert($route['service']==='LIMPIEZA','el servicio configurado del proveedor en BD debe corregir el "agua" erróneo de OpenAI: '.$route['service']);
     $assert($route['evidence']['service']['field']==='supplier_main_service_type');
 });
@@ -1740,6 +1740,630 @@ $test('compatibilidad: Classifier::resolveSupplierInCommunity() da el mismo resu
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$supplierId,'Extintores']);
     $found=(new Salvest\Classifier($db))->resolveSupplierInCommunity($communityId,['proveedor'=>'PROFOC','proveedor_cif'=>''],'facturas@example.com');
     $assert($found['supplier']!==null && (int)$found['supplier']['id']===$supplierId && $found['ambiguous']===false,'debe resolver exactamente igual que antes de Fase 2 — sin ningún tier nuevo todavía');
+});
+
+// ---- Fase 3 del maestro de proveedores: bin/migrate-supplier-master.php, contra MySQL real ----
+// Se ejecuta el script real (no una reimplementación) como subproceso contra el mismo MySQL de
+// desarrollo/tests que ya usa config/config.php — nunca contra producción. Los suppliers de
+// prueba se insertan con los MISMOS official_name que el script trae hardcodeados (son los
+// reales de producción, ya públicos desde la Fase 1), así el dry-run/apply ejercita exactamente
+// el mapping real. Todo lo insertado se borra al final (DELETE FROM suppliers -> CASCADE se
+// lleva aliases y community_suppliers), pase o falle el test.
+$supplierMigrationFixture=static function(array $ctx)use($assert):array{
+    $db=$ctx['db'];
+    // Los 37 nombres restantes del mapping (los que no llevan lógica especial en este test, pero
+    // TIENEN que existir para que el script no reporte "No encontrado" en ellos y el exit code
+    // se mantenga en 0 — el fixture completo replica los 41 suppliers reales de producción).
+    $genericNames=['IBERDROLA','FACSA','FAIN','RUIZ','CRISMAN','EXTINPLAN','OTIS','THYSSEN','ORONA','MALLASEN','EMBARBA','LA BRUJA','SCHINDLER','ENINTER','SUMINISTROS SANZ','GYFSA','PROPODA','POOLTERMIA','PROFOC','DOSDA','INMECAS','ENDESA','JARDIGRUP','JARDITEC','MESNET','LIMBUR','JOMASAN','MB','CALIN IGNAT','ALINA - PROPIETARIA','LAURA - PROPIETARIO'];
+    $names=array_merge(['PERTOR','CRISLA','CONSTANTIN - PROPIETARIO','ADRIAN TURCU','SERGIO RAUL','YOLIMPIO','EXTNCAS','EXTINCAS','ENERVIA','ENERVIA SOLUCIONES ENERGETICAS'],$genericNames);
+    // Limpieza defensiva de una ejecución anterior que no hubiera terminado de limpiar.
+    $placeholders=implode(',',array_fill(0,count($names),'?'));
+    $db->execute("DELETE FROM suppliers WHERE official_name IN ($placeholders)",$names);
+
+    $db->execute("INSERT IGNORE INTO service_types(name,normalized_name) VALUES ('Extintores Fase3 Test','extintores fase3 test')");
+    $extService=(int)$db->one("SELECT id FROM service_types WHERE normalized_name='extintores fase3 test'")['id'];
+    $db->execute("INSERT IGNORE INTO service_types(name,normalized_name) VALUES ('Electricidad Fase3 Test','electricidad fase3 test')");
+    $elecService=(int)$db->one("SELECT id FROM service_types WHERE normalized_name='electricidad fase3 test'")['id'];
+    $db->execute("INSERT IGNORE INTO service_types(name,normalized_name) VALUES ('Otros Fase3 Test','otros fase3 test')");
+    $otrosService=(int)$db->one("SELECT id FROM service_types WHERE normalized_name='otros fase3 test'")['id'];
+    $db->execute("INSERT IGNORE INTO service_types(name,normalized_name) VALUES ('Limpieza Fase3 Test','limpieza fase3 test')");
+    $limpiezaService=(int)$db->one("SELECT id FROM service_types WHERE normalized_name='limpieza fase3 test'")['id'];
+    $db->execute("INSERT IGNORE INTO service_types(name,normalized_name) VALUES ('Ascensor Fase3 Test','ascensor fase3 test')");
+    $ascensorService=(int)$db->one("SELECT id FROM service_types WHERE normalized_name='ascensor fase3 test'")['id'];
+    $db->execute("INSERT IGNORE INTO service_types(name,normalized_name) VALUES ('Jardineria Fase3 Test','jardineria fase3 test')");
+    $jardineriaService=(int)$db->one("SELECT id FROM service_types WHERE normalized_name='jardineria fase3 test'")['id'];
+
+    // Limpieza ampliada: barre también cualquier fila ya renombrada por una ejecución previa que
+    // no hubiera terminado de limpiar (name/official_name YA en su forma final tras --apply) —
+    // el cleanup por id de más abajo es la vía principal, esto es solo una red de seguridad.
+    $finalNames=['ASCENSORES PERTOR, S.L.','CRISLA LIMPIEZAS Y CRISTALIZADOS, S.L.','CONSTANTIN FRATILA','X4153497L','SERGIO RAUL MARIN RUIZ','RAFAEL GUIJARRO PRADES','EXTINTORES CASTELLÓN, S.L.','ENERVIA SOLUCIONES ENERGETICAS S.L.'];
+    $finalPlaceholders=implode(',',array_fill(0,count($finalNames),'?'));
+    $db->execute("DELETE FROM suppliers WHERE official_name IN ($finalPlaceholders)",$finalNames);
+
+    $allIds=[];
+    $insert=static function(string $officialName,?int $serviceId)use($db,&$allIds):int{
+        $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
+            [$officialName,Salvest\Text::normalize($officialName),null,$serviceId]);
+        $id=(int)$db->pdo()->lastInsertId();
+        $allIds[]=$id;
+        return $id;
+    };
+    // Actualizaciones normales — cubren CIF de empresa, NIE, NIF personal y cif=NULL forzado.
+    $pertorId=$insert('PERTOR',$ascensorService);
+    $crislaId=$insert('CRISLA',$limpiezaService);
+    $constantinId=$insert('CONSTANTIN - PROPIETARIO',$limpiezaService);
+    $adrianId=$insert('ADRIAN TURCU',$limpiezaService);
+    $sergioId=$insert('SERGIO RAUL',$jardineriaService);
+    $yolimpioId=$insert('YOLIMPIO',$limpiezaService);
+    // Fusión EXTNCAS/EXTINCAS — con una comunidad EXCLUSIVA de cada uno y una comunidad
+    // deliberadamente EN COMÚN (misma community_id+category en ambos) para forzar el camino de
+    // deduplicación de relaciones, algo que no ocurre hoy en producción pero que el código debe
+    // soportar de todas formas.
+    $extncasId=$insert('EXTNCAS',$extService);
+    $extincasId=$insert('EXTINCAS',$extService);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES (?,?,?,?,1)',['F3A','CP Fase3 Exclusiva Source',Salvest\Text::normalize('CP Fase3 Exclusiva Source'),'Calle Test 1']);
+    $communityExclusiveSource=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES (?,?,?,?,1)',['F3B','CP Fase3 Exclusiva Target',Salvest\Text::normalize('CP Fase3 Exclusiva Target'),'Calle Test 2']);
+    $communityExclusiveTarget=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES (?,?,?,?,1)',['F3C','CP Fase3 Comun',Salvest\Text::normalize('CP Fase3 Comun'),'Calle Test 3']);
+    $communityShared=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityExclusiveSource,$extncasId,'EXTINTORES','EXTINTORES','EXTNCAS']);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityExclusiveTarget,$extincasId,'EXTINTORES','EXTINTORES','EXTINCAS']);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityShared,$extncasId,'EXTINTORES','EXTINTORES','EXTNCAS']);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityShared,$extincasId,'EXTINTORES','EXTINTORES','EXTINCAS']);
+    // Fusión ENERVIA — exactamente como en producción: ambos con cif='' y 0 relaciones.
+    $enerviaId=$insert('ENERVIA',$otrosService);
+    $db->execute('UPDATE suppliers SET cif=? WHERE id=?',['',$enerviaId]);
+    $enerviaSolId=$insert('ENERVIA SOLUCIONES ENERGETICAS',$elecService);
+    $db->execute('UPDATE suppliers SET cif=? WHERE id=?',['',$enerviaSolId]);
+    // El resto del mapping (sin lógica especial en estos tests) — con cualquier servicio, no se
+    // comprueba aquí, solo tiene que EXISTIR para que el script no reporte "No encontrado".
+    foreach($genericNames as $genericName)$insert($genericName,null);
+
+    return compact('pertorId','crislaId','constantinId','adrianId','sergioId','yolimpioId','extncasId','extincasId','enerviaId','enerviaSolId','communityExclusiveSource','communityExclusiveTarget','communityShared','names','elecService','allIds');
+};
+$supplierMigrationCleanup=static function(array $ctx,array $fixture)use($assert):void{
+    $db=$ctx['db'];
+    // Por id, no por nombre: tras --apply el official_name de un supplier YA NO ES el que se
+    // insertó (name/official_name cambian a su forma final) — limpiar por nombre original se
+    // dejaría atrás justo las filas que el test acaba de migrar, contaminando el siguiente test.
+    $idPlaceholders=implode(',',array_fill(0,count($fixture['allIds']),'?'));
+    $db->execute("DELETE FROM suppliers WHERE id IN ($idPlaceholders)",$fixture['allIds']);
+    foreach(['communityExclusiveSource','communityExclusiveTarget','communityShared'] as $key){
+        $db->execute('DELETE FROM communities WHERE id=?',[$fixture[$key]]);
+    }
+};
+$runMigrationScript=static function(array $extraArgs=[]):array{
+    $script=dirname(__DIR__).'/bin/migrate-supplier-master.php';
+    $cmd=escapeshellarg(PHP_BINARY).' '.escapeshellarg($script).' '.implode(' ',array_map('escapeshellarg',$extraArgs)).' 2>&1';
+    exec($cmd,$outputLines,$exitCode);
+    return ['output'=>implode("\n",$outputLines),'exit'=>$exitCode];
+};
+
+$test('bin/migrate-supplier-master.php --dry-run: no modifica la BD (comportamiento por defecto)',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $before=$db->one('SELECT name,official_name,cif FROM suppliers WHERE id=?',[$fixture['pertorId']]);
+        $result=$runMigrationScript([]); // sin --apply
+        $assert($result['exit']===0,'dry-run debe salir con código 0: '.$result['output']);
+        $assert(str_contains($result['output'],'DRY-RUN'),'debe anunciarse como dry-run');
+        $after=$db->one('SELECT name,official_name,cif FROM suppliers WHERE id=?',[$fixture['pertorId']]);
+        $assert($before===$after,'ni una fila debe cambiar sin --apply');
+        $aliasCount=$db->one('SELECT COUNT(*) n FROM supplier_aliases WHERE supplier_id=?',[$fixture['pertorId']])['n'];
+        $assert((int)$aliasCount===0,'dry-run no debe insertar ningún alias');
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php --apply: actualiza name/official_name/normalized_name/normalized_official_name/cif exactamente como se espera (CIF empresa, NIE, NIF personal, cif=NULL forzado)',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $result=$runMigrationScript(['--apply']);
+        $assert($result['exit']===0,'apply no debe reportar errores: '.$result['output']);
+
+        $pertor=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['pertorId']]);
+        $assert($pertor['name']==='PERTOR' && $pertor['official_name']==='ASCENSORES PERTOR, S.L.' && $pertor['cif']==='B46699864','PERTOR (CIF de empresa) mal migrado: '.json_encode($pertor));
+        $assert($pertor['normalized_name']===Salvest\Text::normalizeCompanyName('PERTOR'),'normalized_name debe usar normalizeCompanyName() sobre el name corto');
+        $assert($pertor['normalized_official_name']===Salvest\Text::normalizeCompanyName('ASCENSORES PERTOR, S.L.'),'normalized_official_name debe usar normalizeCompanyName() sobre la razón social');
+
+        $adrian=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['adrianId']]);
+        $assert($adrian['cif']==='X4153497L','NIE mal migrado (esperado X4153497L, sin guiones): '.$adrian['cif']);
+
+        $sergio=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['sergioId']]);
+        $assert($sergio['cif']==='53376935F','NIF personal mal migrado: '.$sergio['cif']);
+
+        $yolimpio=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['yolimpioId']]);
+        $assert($yolimpio['cif']==='18965195Q','NIF personal (YOLIMPIO) mal migrado: '.$yolimpio['cif']);
+
+        $constantin=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['constantinId']]);
+        $assert($constantin['cif']===null,'CONSTANTIN debe quedar cif=NULL explícito, nunca inventado: '.var_export($constantin['cif'],true));
+        $assert($constantin['official_name']==='CONSTANTIN FRATILA','official_name de CONSTANTIN debe actualizarse a la razón social confirmada');
+
+        $crisla=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['crislaId']]);
+        $assert($crisla['cif']==='B12534228','CRISLA mal migrado');
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php --apply: aliases se insertan sin duplicar variantes equivalentes al name/official_name, y una alias distinto sí se conserva',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $runMigrationScript(['--apply']);
+        $aliases=$db->all('SELECT value,normalized_value FROM supplier_aliases WHERE supplier_id=? ORDER BY value',[$fixture['pertorId']]);
+        $values=array_column($aliases,'value');
+        // "ASCENSORES PERTOR" normaliza (vía normalizeCompanyName, que quita ", S.L.") a lo
+        // mismo que normalized_official_name de "ASCENSORES PERTOR, S.L." — es redundante y el
+        // script debe filtrarlo; "PERTOR ASCENSORES" es un orden de palabras distinto y sí debe
+        // sobrevivir como alias real.
+        $assert(in_array('PERTOR ASCENSORES',$values,true),'el alias distinto "PERTOR ASCENSORES" debe conservarse: '.json_encode($values));
+        $assert(!in_array('ASCENSORES PERTOR',$values,true),'"ASCENSORES PERTOR" es redundante con official_name tras normalizeCompanyName() y NO debe insertarse como alias: '.json_encode($values));
+        $assert(!in_array('PERTOR',$values,true),'"PERTOR" no debe insertarse como alias de sí mismo (ya lo cubre name)');
+        $normalized=array_column($aliases,'normalized_value');
+        $assert(count($normalized)===count(array_unique($normalized)),'no debe haber dos aliases con el mismo normalized_value para el mismo supplier');
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php --apply: segunda ejecución es idempotente (KEEP, sin aliases duplicados, sin tocar lo ya correcto)',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $runMigrationScript(['--apply']);
+        $afterFirst=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['pertorId']]);
+        $aliasCountFirst=$db->one('SELECT COUNT(*) n FROM supplier_aliases WHERE supplier_id=?',[$fixture['pertorId']])['n'];
+
+        $result=$runMigrationScript(['--apply']); // segunda vez
+        $assert($result['exit']===0,'la segunda ejecución no debe fallar: '.$result['output']);
+        $assert(str_contains($result['output'],'[KEEP]'),'la segunda pasada debe reportar KEEP para lo ya migrado: '.$result['output']);
+
+        $afterSecond=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['pertorId']]);
+        $assert($afterFirst===$afterSecond,'ninguna fila ya correcta debe cambiar en la segunda pasada');
+        $aliasCountSecond=$db->one('SELECT COUNT(*) n FROM supplier_aliases WHERE supplier_id=?',[$fixture['pertorId']])['n'];
+        $assert((int)$aliasCountFirst===(int)$aliasCountSecond,'la segunda pasada no debe duplicar aliases');
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php --apply: fusión EXTNCAS/EXTINCAS transfiere relaciones exclusivas, deduplica la relación común, y el target final lleva el CIF B12433314',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $result=$runMigrationScript(['--apply']);
+        $assert($result['exit']===0,'la fusión no debe fallar: '.$result['output']);
+
+        $target=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['extincasId']]);
+        $source=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['extncasId']]);
+        $assert((int)$target['active']===1,'el target (EXTINCAS) debe permanecer active=1');
+        $assert((int)$source['active']===0,'el source (EXTNCAS) debe quedar active=0, nunca borrado');
+        $assert($target['cif']==='B12433314','el target debe llevar el CIF confirmado tras la fusión: '.$target['cif']);
+        $assert($target['name']==='EXTINCAS' && $target['official_name']==='EXTINTORES CASTELLÓN, S.L.','name/official_name finales incorrectos: '.json_encode($target));
+
+        $sourceRelations=$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE supplier_id=?',[$fixture['extncasId']])['n'];
+        $assert((int)$sourceRelations===0,'el source no debe conservar ninguna relación tras la fusión');
+
+        $exclusiveSourceStillThere=$db->one('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$fixture['communityExclusiveSource'],$fixture['extincasId']]);
+        $assert($exclusiveSourceStillThere!==null,'la relación exclusiva del source debe haberse transferido al target');
+        $exclusiveTargetStillThere=$db->one('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$fixture['communityExclusiveTarget'],$fixture['extincasId']]);
+        $assert($exclusiveTargetStillThere!==null,'la relación que ya era del target no debe perderse');
+
+        $sharedRelations=$db->all('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$fixture['communityShared'],$fixture['extincasId']]);
+        $assert(count($sharedRelations)===1,'la relación común a ambos (misma community_id+category) debe quedar deduplicada a una sola fila, no '.count($sharedRelations));
+
+        $aliasValues=array_column($db->all('SELECT value FROM supplier_aliases WHERE supplier_id=?',[$fixture['extincasId']]),'value');
+        $assert(in_array('EXTNCAS',$aliasValues,true),'EXTNCAS debe quedar como alias del target fusionado');
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php --apply: fusión EXTNCAS/EXTINCAS es idempotente (segunda pasada no reactiva el source ni duplica relaciones)',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $runMigrationScript(['--apply']);
+        $relationsAfterFirst=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE supplier_id=?',[$fixture['extincasId']])['n'];
+        $result=$runMigrationScript(['--apply']);
+        $assert($result['exit']===0,'la segunda pasada de la fusión no debe fallar: '.$result['output']);
+        $source=$db->one('SELECT active FROM suppliers WHERE id=?',[$fixture['extncasId']]);
+        $assert((int)$source['active']===0,'el source fusionado no debe reactivarse en una segunda pasada');
+        $relationsAfterSecond=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE supplier_id=?',[$fixture['extincasId']])['n'];
+        $assert($relationsAfterFirst===$relationsAfterSecond,'la segunda pasada no debe duplicar ni perder relaciones del target');
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php --apply: fusión ENERVIA sin relaciones en ninguno de los dos lados — el target final lleva el CIF B98172885 y el servicio Electricidad del target original',static function()use($assert,$mysqlSchemaTest,$supplierMigrationFixture,$supplierMigrationCleanup,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $fixture=$supplierMigrationFixture($ctx);
+    try{
+        $result=$runMigrationScript(['--apply']);
+        $assert($result['exit']===0,'la fusión ENERVIA no debe fallar: '.$result['output']);
+        $target=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['enerviaSolId']]);
+        $source=$db->one('SELECT * FROM suppliers WHERE id=?',[$fixture['enerviaId']]);
+        $assert((int)$target['active']===1 && (int)$source['active']===0,'ENERVIA SOLUCIONES ENERGETICAS debe ser el target activo, ENERVIA el source inactivo');
+        $assert($target['cif']==='B98172885','el target de ENERVIA debe llevar el CIF confirmado: '.$target['cif']);
+        $assert($target['name']==='ENERVIA' && $target['official_name']==='ENERVIA SOLUCIONES ENERGETICAS S.L.','name/official_name finales de ENERVIA incorrectos: '.json_encode($target));
+        $assert((int)$target['main_service_type_id']===(int)$fixture['elecService'],'el servicio final debe ser el que ya tenía el target (Electricidad), la fusión no debe decidir uno nuevo por su cuenta');
+        // Hallazgo real, no un fallo: "ENERVIA SOLUCIONES ENERGETICAS" normaliza (vía
+        // normalizeCompanyName) exactamente igual que official_name una vez le quita ", S.L.",
+        // y "ENERVIA SOLUCIONES ENERGETICAS S.L." ES el official_name literal. Los dos "aliases
+        // mínimos" pedidos son, tras normalización, redundantes con official_name — la regla
+        // "no insertes un alias equivalente a official_name" los descarta a ambos, a propósito.
+        // Documentado explícitamente en el informe de Fase 3 para que el usuario lo confirme.
+        $aliasValues=array_column($db->all('SELECT value FROM supplier_aliases WHERE supplier_id=?',[$fixture['enerviaSolId']]),'value');
+        $assert($aliasValues===[],'ambos aliases "mínimos" de ENERVIA son redundantes con official_name tras normalizeCompanyName() y no deben insertarse: '.json_encode($aliasValues));
+    }finally{$supplierMigrationCleanup($ctx,$fixture);}
+});
+
+$test('bin/migrate-supplier-master.php: un target/source de fusión ausente reporta ERROR y sale con código 1, sin tocar el resto de suppliers (contención de fallos)',static function()use($assert,$mysqlSchemaTest,$runMigrationScript):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    // Deliberadamente NO se inserta ningún supplier — ni los normales ni los de fusión — así que
+    // TODO el script debe reportar ERROR/NOT_FOUND para las 37+2 entradas, sin lanzar ninguna
+    // excepción no controlada y sin dejar ninguna transacción a medias.
+    $result=$runMigrationScript(['--apply']);
+    $assert($result['exit']===1,'con todo ausente, el exit code debe ser 1 (hubo errores), no un crash ni un 0 silencioso');
+    $assert(str_contains($result['output'],'ERRORES:'),'debe listar los errores encontrados: '.$result['output']);
+    $assert(!str_contains($result['output'],'Fatal error') && !str_contains($result['output'],'Uncaught'),'ningún error debe escapar como excepción no controlada: '.$result['output']);
+});
+
+// ---- Compatibilidad mínima Fase 3 -> Fase 5: name/official_name en los 4 tiers de nombre ----
+// $makeCommunityWithSupplier (arriba) ya crea el estado PRE-Fase-3 (solo official_name, name
+// queda NULL). Este helper crea el estado POST-Fase-3 real: name = nombre corto, official_name
+// = razón social legal, ambos normalizados con la misma función que candidateNames() usa.
+$makePostFase3Supplier=static function(Salvest\Database $db,string $communityCode,string $communityName,string $shortName,string $legalName,string $serviceTypeName,?string $cif=null):array{
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
+        [$communityCode,$communityName,Salvest\Text::normalize($communityName),$communityCode.'-CIF','Calle '.$communityName,'46000','Valencia',$communityCode.' - '.$communityName]);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $service=$db->one('SELECT id FROM service_types WHERE name=?',[$serviceTypeName]);
+    if(!$service){$db->execute('INSERT INTO service_types(name,normalized_name,active) VALUES (?,?,1)',[$serviceTypeName,Salvest\Text::normalize($serviceTypeName)]);$serviceTypeId=(int)$db->pdo()->lastInsertId();}
+    else $serviceTypeId=(int)$service['id'];
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
+        [$shortName,$legalName,Salvest\Text::normalizeCompanyName($shortName),Salvest\Text::normalizeCompanyName($legalName),$cif,$serviceTypeId]);
+    $supplierId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,?)',[$communityId,$supplierId,$serviceTypeName,null]);
+    return['communityId'=>$communityId,'supplierId'=>$supplierId,'communityCif'=>$communityCode.'-CIF'];
+};
+// Los 7 casos pedidos explícitamente, con su name/official_name reales de la migración de Fase 3.
+$sevenCases=[
+    ['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua'],
+    ['PROFOC','GARCÍA MARÍN CONSULTORES, S.L.','Extintores'],
+    ['CRISLA','CRISLA LIMPIEZAS Y CRISTALIZADOS, S.L.','Limpieza'],
+    ['THYSSEN','TK ELEVADORES ESPAÑA, S.L.U.','Ascensor'],
+    ['INMECAS','H2O PLUS, S.L.','Descalcificador'],
+    ['MB','MANTENIMIENTOS MANUEL BASTIDA S.L.U.','Descalcificador'],
+    ['YOLIMPIO','RAFAEL GUIJARRO PRADES','Limpieza'],
+];
+
+$test('compatibilidad Fase3->5: los 7 casos pedidos (FACSA/PROFOC/CRISLA/THYSSEN/INMECAS/MB/YOLIMPIO) resuelven en PRE-Fase-3 (official_name=nombre corto, name=NULL)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$sevenCases):void{
+    foreach($sevenCases as $i=>[$short,$legal,$service]){
+        $db=$sqliteDb($classifierSchema);
+        $fixture=$makeCommunityWithSupplier($db,(string)(100+$i),'CP PRE '.$short,$short,$service);
+        $invoice=['proveedor'=>$short,'proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
+        $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@proveedor.example');
+        $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],"$short PRE-Fase-3 no resolvió: ".json_encode($route));
+        $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact',"$short PRE-Fase-3 debe resolver por exact_name sobre official_name, no fuzzy: ".json_encode($route['evidence']['supplier']));
+    }
+});
+$test('compatibilidad Fase3->5: los mismos 7 casos resuelven EXACTO (no fuzzy) en POST-Fase-3 (name=nombre corto, official_name=razón social)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$sevenCases):void{
+    foreach($sevenCases as $i=>[$short,$legal,$service]){
+        $db=$sqliteDb($classifierSchema);
+        $fixture=$makePostFase3Supplier($db,(string)(200+$i),'CP POST '.$short,$short,$legal,$service);
+        $invoice=['proveedor'=>$short,'proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
+        $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@proveedor.example');
+        $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],"$short POST-Fase-3 no resolvió: ".json_encode($route));
+        $assert($route['evidence']['supplier']['type']==='supplier_name_exact',"$short POST-Fase-3 debe resolver por exact_name sobre name (determinista), no por fuzzy: ".json_encode($route['evidence']['supplier']));
+    }
+});
+$test('compatibilidad Fase3->5: "FACSA, Suministro de Agua" resuelve por contención tanto PRE como POST-Fase-3 (regresión demostrada en la auditoría, ahora corregida)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$makePostFase3Supplier):void{
+    $dbPre=$sqliteDb($classifierSchema);
+    $fixturePre=$makeCommunityWithSupplier($dbPre,'301','CP PRE FACSA RUIDO','FACSA','Agua');
+    $routePre=(new Salvest\InvoiceRouter(new Salvest\Classifier($dbPre)))->route(['proveedor'=>'FACSA, Suministro de Agua','proveedor_cif'=>null,'comunidad_cif'=>$fixturePre['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $assert($routePre['status']==='classified' && (int)$routePre['supplier']['id']===$fixturePre['supplierId'],'PRE-Fase-3 debe seguir resolviendo por contención: '.json_encode($routePre));
+    $assert($routePre['evidence']['supplier']['type']==='name_containment');
+
+    $dbPost=$sqliteDb($classifierSchema);
+    $fixturePost=$makePostFase3Supplier($dbPost,'302','CP POST FACSA RUIDO','FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua');
+    $routePost=(new Salvest\InvoiceRouter(new Salvest\Classifier($dbPost)))->route(['proveedor'=>'FACSA, Suministro de Agua','proveedor_cif'=>null,'comunidad_cif'=>$fixturePost['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $assert($routePost['status']==='classified' && (int)$routePost['supplier']['id']===$fixturePost['supplierId'],'POST-Fase-3: la regresión demostrada en la auditoría debe quedar corregida: '.json_encode($routePost));
+    $assert($routePost['evidence']['supplier']['type']==='name_containment','debe seguir resolviendo por contención (ahora contra suppliers.name, no official_name): '.json_encode($routePost['evidence']['supplier']));
+});
+$test('compatibilidad Fase3->5: exact por name (POST-Fase-3, texto = razón social no coincide, solo name)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makePostFase3Supplier($db,'303','CP EXACT NAME','PROFOC','GARCÍA MARÍN CONSULTORES, S.L.','Extintores');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'PROFOC','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@profoc.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='supplier_name_exact',json_encode($route));
+});
+$test('compatibilidad Fase3->5: exact por official_name (POST-Fase-3, texto = razón social completa)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makePostFase3Supplier($db,'304','CP EXACT OFFICIAL','PROFOC','GARCÍA MARÍN CONSULTORES, S.L.','Extintores');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES, S.L.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@profoc.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='supplier_official_name_exact',json_encode($route));
+});
+$test('compatibilidad Fase3->5: containment por name (texto trae el name dentro de una frase más larga)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makePostFase3Supplier($db,'305','CP CONT NAME','INMECAS','H2O PLUS, S.L.','Descalcificador');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'Factura de INMECAS','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@inmecas.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='name_containment',json_encode($route));
+});
+$test('compatibilidad Fase3->5: containment por official_name (texto trae la razón social dentro de una frase más larga)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makePostFase3Supplier($db,'306','CP CONT OFFICIAL','INMECAS','H2O PLUS, S.L.','Descalcificador');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'Recibo de H2O PLUS, S.L. correspondiente a este mes','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@inmecas.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='name_containment',json_encode($route));
+});
+$test('compatibilidad Fase3->5: token matching por name (mismas palabras del name, orden distinto)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makePostFase3Supplier($db,'307','CP TOKEN NAME','LA BRUJA','LIMPIEZAS Y CRISTALIZADOS LA BRUJA, S.L.','Limpieza');
+    // "LA BRUJA" tal cual ya sería exact_name; se fuerza token forzando un orden que ni el exacto
+    // ni la contención (que exige orden contiguo) resolverían: "BRUJA LA".
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'BRUJA LA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@labruja.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='token_match',json_encode($route));
+});
+$test('compatibilidad Fase3->5: token matching por official_name (mismas palabras de la razón social, orden distinto)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makePostFase3Supplier($db,'308','CP TOKEN OFFICIAL','MB','MANTENIMIENTOS MANUEL BASTIDA S.L.U.','Descalcificador');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'BASTIDA MANUEL MANTENIMIENTOS','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@mb.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='token_match',json_encode($route));
+});
+$test('compatibilidad Fase3->5: el tier fuzzy no penaliza a un supplier por tener dos representaciones muy distintas (name corto vs official_name largo) — resuelve por la que de verdad se parece al texto ruidoso',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+    $db=$sqliteDb($classifierSchema);
+    // name="FACSA" (muy distinto del texto) y official_name con un typo respecto a la extracción
+    // (92.24 de similitud, por encima del umbral) — ni containment ni token pueden resolverlo
+    // (el texto no contiene "facsa" como palabra ni todas las palabras de ningún candidato), así
+    // que solo el fuzzy puede, y debe ganar por official_name sin que el name corto le reste puntos.
+    $fixture=$makePostFase3Supplier($db,'309','CP FUZZY NAME','FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'SOCIEDAD DE FOMENTO AGRICOLA CASTELLONENSSE','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='fuzzy',json_encode($route));
+});
+$test('compatibilidad Fase3->5: fuzzy contra official_name sigue funcionando cuando no hay name (proveedor global, sin comunidad)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,active) VALUES (?,?,NULL,1)',['SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.',Salvest\Text::normalize('SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.')]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'SOCIEDAD DE FOMENTO AGRICOLA CASTELLONENSSE','proveedor_cif'=>''],'facturas@facsa.example');
+    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id && $resolved['evidence']['type']==='fuzzy','fuzzy global contra official_name (sin name) debe seguir funcionando: '.json_encode($resolved));
+});
+$test('compatibilidad Fase3->5: name=NULL no rompe ningún tier (estado PRE-Fase-3 puro, los 4 tiers siguen dando el mismo resultado que antes)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'310','CP NAME NULL','ASCENSORES DEL SUR','Ascensor');
+    $row=$db->one('SELECT name FROM suppliers WHERE id=?',[$fixture['supplierId']]);
+    $assert($row['name']===null,'precondición: name debe seguir NULL en este fixture');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'ASCENSORES DEL SUR','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@sur.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='supplier_official_name_exact',json_encode($route));
+});
+$test('compatibilidad Fase3->5: normalized_official_name=NULL no rompe el tier fuzzy (candidateNames() ignora candidatos vacíos/NULL sin lanzar)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'311','CP NOFF NULL','MANTENIMIENTOS RAPIDOS INTEGRALES DEL LEVANTE','Mantenimiento');
+    $row=$db->one('SELECT normalized_official_name FROM suppliers WHERE id=?',[$fixture['supplierId']]);
+    $assert($row['normalized_official_name']===null,'precondición: normalized_official_name debe seguir NULL en este fixture');
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'MANTENIMIENTOS RAPIDOS INTEGRALES DEL LEVANTES','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@rapidos.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='fuzzy','no debe lanzar ni fallar por normalized_official_name=NULL: '.json_encode($route));
+});
+
+// ---- Última mini-fase antes de Fase 3: /Proveedores, compatibilidad legacy, importador ----
+$callCanonicalCif=static function(?string $raw):?string{
+    $method=new ReflectionMethod(Salvest\WebApp::class,'canonicalSupplierCif');$method->setAccessible(true);
+    return$method->invoke(null,$raw);
+};
+$callSupplierUpsertValues=static function(array $post):array{
+    $method=new ReflectionMethod(Salvest\WebApp::class,'supplierUpsertValues');$method->setAccessible(true);
+    return$method->invoke(null,$post);
+};
+
+$test('/Proveedores: canonicalSupplierCif() — NIE con guiones',static function()use($assert,$callCanonicalCif):void{
+    $assert($callCanonicalCif('X-4153497-L')==='X4153497L');
+});
+$test('/Proveedores: canonicalSupplierCif() — NIF con puntos y guion',static function()use($assert,$callCanonicalCif):void{
+    $assert($callCanonicalCif('18.965.195-Q')==='18965195Q');
+});
+$test('/Proveedores: canonicalSupplierCif() — cadena vacía se convierte en NULL, nunca se guarda \'\'',static function()use($assert,$callCanonicalCif):void{
+    $assert($callCanonicalCif('')===null);
+    $assert($callCanonicalCif('   ')===null);
+});
+$test('/Proveedores: canonicalSupplierCif() — "Pendiente" (y variantes de mayúsculas) se convierte en NULL',static function()use($assert,$callCanonicalCif):void{
+    $assert($callCanonicalCif('Pendiente')===null);
+    $assert($callCanonicalCif('PENDIENTE')===null);
+});
+$test('/Proveedores: canonicalSupplierCif() — un CIF de empresa ya limpio pasa intacto',static function()use($assert,$callCanonicalCif):void{
+    $assert($callCanonicalCif('A12000022')==='A12000022');
+});
+
+$test('/Proveedores: alta nueva post-Fase-3 (name+official_name+cif) calcula normalized_name/normalized_official_name/cif exactamente como se espera',static function()use($assert,$callSupplierUpsertValues):void{
+    [$name,$officialName,$normalizedName,$normalizedOfficialName,$cif,$serviceId]=$callSupplierUpsertValues([
+        'name'=>'FACSA','official_name'=>'SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','cif'=>'A12000022','service_id'=>'7',
+    ]);
+    $assert($name==='FACSA' && $officialName==='SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.');
+    $assert($normalizedName===Salvest\Text::normalizeCompanyName('FACSA'));
+    $assert($normalizedOfficialName===Salvest\Text::normalizeCompanyName('SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.'));
+    $assert($cif==='A12000022' && $serviceId===7);
+});
+$test('/Proveedores: alta nueva con official_name vacío usa name como respaldo — nunca se inventa una razón social',static function()use($assert,$callSupplierUpsertValues):void{
+    [$name,$officialName]=$callSupplierUpsertValues(['name'=>'PROFOC','official_name'=>'','cif'=>null,'service_id'=>'1']);
+    $assert($name==='PROFOC' && $officialName==='PROFOC','sin razón social introducida, official_name debe caer al nombre comercial, nunca quedar vacío (NOT NULL): '.json_encode([$name,$officialName]));
+});
+
+$test('/Proveedores: compatibilidad legacy — abrir y guardar una fila con name=NULL, official_name=FACSA no destruye el registro (name pasa a valer FACSA, official_name no cambia)',static function()use($assert,$sqliteDb,$classifierSchema,$callSupplierUpsertValues):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',['FACSA',Salvest\Text::normalize('FACSA'),null,null]);
+    $id=(int)$db->pdo()->lastInsertId();
+    $row=$db->one('SELECT * FROM suppliers WHERE id=?',[$id]);
+    $assert($row['name']===null,'precondición: fila legacy real, name debe ser NULL');
+    // El GET de edición precarga "Nombre comercial" con supplierDisplayName() = name ?: official_name.
+    $reflectionMethod=new ReflectionMethod(Salvest\WebApp::class,'supplierDisplayName');$reflectionMethod->setAccessible(true);
+    $config=['app'=>['base_url'=>'http://127.0.0.1','timezone'=>'Europe/Madrid','session_name'=>'salvest_test_'.bin2hex(random_bytes(4)),
+        'secret_key'=>'test-secret','encryption_key'=>Salvest\Crypto::generateKey(),'cron_token'=>'test','cookie_secure'=>false]];
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $webApp=new Salvest\WebApp($db,$config);
+    restore_error_handler();
+    $prefilledName=$reflectionMethod->invoke($webApp,$row);
+    $assert($prefilledName==='FACSA','el campo "Nombre comercial" debe precargarse con official_name cuando name es NULL: '.$prefilledName);
+    // Simula "guardar sin tocar nada": el formulario habría enviado name=FACSA (precargado) y
+    // official_name=FACSA (tal cual). Debe quedar name=FACSA, official_name=FACSA — nada perdido.
+    [$name,$officialName]=$callSupplierUpsertValues(['name'=>$prefilledName,'official_name'=>$row['official_name'],'cif'=>$row['cif']??'','service_id'=>'']);
+    $assert($name==='FACSA' && $officialName==='FACSA','guardar una fila legacy sin cambios no debe perder información, solo completar name: '.json_encode([$name,$officialName]));
+});
+
+$test('/Proveedores: edición post-migración mantiene name/official_name sincronizados con sus columnas normalizadas tras un UPDATE real',static function()use($assert,$sqliteDb,$classifierSchema,$callSupplierUpsertValues):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
+        ['PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',Salvest\Text::normalizeCompanyName('PROFOC'),Salvest\Text::normalizeCompanyName('GARCÍA MARÍN CONSULTORES, S.L.'),'B12802971',null]);
+    $id=(int)$db->pdo()->lastInsertId();
+    // El admin corrige un typo en la razón social.
+    [$name,$officialName,$normalizedName,$normalizedOfficialName,$cif,$serviceId]=$callSupplierUpsertValues(['name'=>'PROFOC','official_name'=>'GARCIA MARIN CONSULTORES, S.L.U.','cif'=>'B12802971','service_id'=>'']);
+    $db->execute('UPDATE suppliers SET name=?,official_name=?,normalized_name=?,normalized_official_name=?,cif=?,main_service_type_id=? WHERE id=?',[$name,$officialName,$normalizedName,$normalizedOfficialName,$cif,$serviceId,$id]);
+    $row=$db->one('SELECT * FROM suppliers WHERE id=?',[$id]);
+    $assert($row['official_name']==='GARCIA MARIN CONSULTORES, S.L.U.');
+    $assert($row['normalized_official_name']===Salvest\Text::normalizeCompanyName('GARCIA MARIN CONSULTORES, S.L.U.'),'normalized_official_name debe quedar sincronizado con el official_name nuevo tras la edición');
+    $assert($row['normalized_name']===Salvest\Text::normalizeCompanyName('PROFOC'),'normalized_name debe seguir sincronizado con name');
+});
+
+$test('/Revisar: el selector manual de proveedor muestra el nombre comercial (name), no la razón social, para un supplier ya migrado',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO suppliers(name,official_name,active) VALUES (?,?,1)',['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.']);
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,original_filename) VALUES (?,?,?)',['needs_review',date('Y-m-d H:i:s'),'factura.pdf']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'>FACSA</option>'),'el <option> debe mostrar el nombre comercial "FACSA": '.$html);
+    $assert(!str_contains($html,'SOCIEDAD DE FOMENTO'),'no debe mostrarse la razón social larga como label del selector');
+});
+
+// ---- CommunityCsvImporter: protección FROZEN, verificada contra MySQL real ----
+$test('CommunityCsvImporter: en estado legacy (name NULL o columna inexistente) el importador NO aborta — comportamiento actual preservado',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $method=new ReflectionMethod(Salvest\CommunityCsvImporter::class,'guardAgainstMigratedSupplierMaster');$method->setAccessible(true);
+    $importer=new Salvest\CommunityCsvImporter($db);
+    $threw=false;
+    try{$method->invoke($importer);}catch(Throwable $error){$threw=true;}
+    $assert(!$threw,'con suppliers.name NULL (o tabla vacía) el guard no debe bloquear el comportamiento legacy actual');
+    $mysqlSchemaCleanup($ctx);
+});
+$test('CommunityCsvImporter: en estado de maestro ya migrado, replaceFrom() ABORTA antes del primer DELETE, con mensaje claro y sin flag de bypass',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];$pdo=$ctx['pdo'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $pdo->beginTransaction();
+    try{
+        $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['FACSA TEST GUARD','SOCIEDAD DE FOMENTO TEST GUARD','facsa test guard',null]);
+        $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('GUARD1','CP GUARD TEST','cp guard test','GUARD-CIF','x',1)");
+        $before=[
+            'suppliers'=>$db->one('SELECT COUNT(*) n FROM suppliers')['n'],
+            'aliases'=>$db->one('SELECT COUNT(*) n FROM supplier_aliases')['n'],
+            'communities'=>$db->one('SELECT COUNT(*) n FROM communities')['n'],
+            'community_suppliers'=>$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'],
+        ];
+        $importer=new Salvest\CommunityCsvImporter($db);
+        $threw=false;$message='';
+        try{$importer->replaceFrom('/ruta/inexistente-a-proposito.csv');}
+        catch(\RuntimeException $error){$threw=true;$message=$error->getMessage();}
+        $assert($threw,'replaceFrom() debe abortar con excepción cuando el maestro ya está migrado, no seguir adelante');
+        $assert(str_contains($message,'ABORTADO') && str_contains($message,'migrado'),'el mensaje debe ser claro sobre el motivo: '.$message);
+        $assert(!str_contains($message,'--force') && !str_contains(strtolower($message),'force'),'no debe insinuar ningún flag de bypass');
+        $after=[
+            'suppliers'=>$db->one('SELECT COUNT(*) n FROM suppliers')['n'],
+            'aliases'=>$db->one('SELECT COUNT(*) n FROM supplier_aliases')['n'],
+            'communities'=>$db->one('SELECT COUNT(*) n FROM communities')['n'],
+            'community_suppliers'=>$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'],
+        ];
+        $assert($before===$after,'ninguna tabla debe cambiar — el guard debe disparar antes de leer siquiera el CSV, no solo antes del DELETE: '.json_encode(['before'=>$before,'after'=>$after]));
+    }finally{$pdo->rollBack();$mysqlSchemaCleanup($ctx);}
+});
+
+// ---- Cierre pre-Fase-3: aliases de /Proveedores normalizados con normalizeCompanyName(), sin
+// reescritura innecesaria; preselección del selector de /Revisar aceptando name u official_name ----
+$callReplaceSupplierAliases=static function(Salvest\Database $db,int $supplierId,string $input):void{
+    $config=['app'=>['base_url'=>'http://127.0.0.1','timezone'=>'Europe/Madrid','session_name'=>'salvest_test_'.bin2hex(random_bytes(4)),
+        'secret_key'=>'test-secret','encryption_key'=>Salvest\Crypto::generateKey(),'cron_token'=>'test','cookie_secure'=>false]];
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $webApp=new Salvest\WebApp($db,$config);
+    restore_error_handler();
+    $method=new ReflectionMethod(Salvest\WebApp::class,'replaceSupplierAliases');$method->setAccessible(true);
+    $method->invoke($webApp,$supplierId,$input);
+};
+
+$test('/Proveedores: alias con forma legal se normaliza con Text::normalizeCompanyName(), igual que el tier de alias del Classifier y el script de migración',static function()use($assert,$sqliteDb,$classifierSchema,$callReplaceSupplierAliases):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['OTIS','OTIS MOBILITY, S.A.','otis']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $callReplaceSupplierAliases($db,$id,"ZARDOYA OTIS, S.A.\nBURISLIM SL\nH2O PLUS S.L.");
+    $rows=$db->all('SELECT value,normalized_value FROM supplier_aliases WHERE supplier_id=? ORDER BY value',[$id]);
+    $byValue=[];foreach($rows as $r)$byValue[$r['value']]=$r['normalized_value'];
+    $assert($byValue['ZARDOYA OTIS, S.A.']===Salvest\Text::normalizeCompanyName('ZARDOYA OTIS, S.A.'),'ZARDOYA OTIS, S.A. mal normalizado: '.json_encode($byValue));
+    $assert($byValue['BURISLIM SL']===Salvest\Text::normalizeCompanyName('BURISLIM SL'),'BURISLIM SL mal normalizado: '.json_encode($byValue));
+    $assert($byValue['H2O PLUS S.L.']===Salvest\Text::normalizeCompanyName('H2O PLUS S.L.'),'H2O PLUS S.L. mal normalizado: '.json_encode($byValue));
+    // Con Text::normalize() (la normalización antigua) los tres darían un normalized_value
+    // distinto al que el tier de alias del Classifier compara — lo confirmamos explícitamente.
+    $assert($byValue['ZARDOYA OTIS, S.A.']!==Salvest\Text::normalize('ZARDOYA OTIS, S.A.'),'debe diferir de la normalización antigua para probar que el fix es real');
+    $assert($byValue['BURISLIM SL']!==Salvest\Text::normalize('BURISLIM SL'),'debe diferir de la normalización antigua para probar que el fix es real');
+    $assert($byValue['H2O PLUS S.L.']!==Salvest\Text::normalize('H2O PLUS S.L.'),'debe diferir de la normalización antigua para probar que el fix es real');
+});
+$test('/Proveedores: guardar un supplier sin cambiar sus aliases NO hace DELETE+INSERT — filas, ids, valores y normalized_value quedan idénticos',static function()use($assert,$sqliteDb,$classifierSchema,$callReplaceSupplierAliases):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','facsa']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $callReplaceSupplierAliases($db,$id,"FOMENTO AGRÍCOLA CASTELLONENSE");
+    $before=$db->all('SELECT id,value,normalized_value FROM supplier_aliases WHERE supplier_id=? ORDER BY id',[$id]);
+    // Simula "editar solo el CIF y guardar": el textarea oculto de aliases viaja con el mismo
+    // contenido de siempre (relatedText() lo precarga tal cual), así que el input es idéntico.
+    $callReplaceSupplierAliases($db,$id,"FOMENTO AGRÍCOLA CASTELLONENSE");
+    $after=$db->all('SELECT id,value,normalized_value FROM supplier_aliases WHERE supplier_id=? ORDER BY id',[$id]);
+    $assert($before===$after,'guardar sin cambios reales en los aliases debe dejar las filas exactamente iguales (mismos ids incluidos, prueba de que no hubo DELETE+INSERT): '.json_encode(['before'=>$before,'after'=>$after]));
+    $assert(count($before)===1,'precondición: debe haber exactamente 1 alias');
+});
+$test('/Proveedores: modificar aliases (añadir uno, quitar otro) sí reconcilia el conjunto correctamente',static function()use($assert,$sqliteDb,$classifierSchema,$callReplaceSupplierAliases):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['THYSSEN','TK ELEVADORES ESPAÑA, S.L.U.','thyssen']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $callReplaceSupplierAliases($db,$id,"THYSSENKRUPP\nTK ELEVADORES");
+    $firstIds=array_column($db->all('SELECT id FROM supplier_aliases WHERE supplier_id=? ORDER BY id',[$id]),'id');
+    $assert(count($firstIds)===2);
+    // Quita "THYSSENKRUPP", añade "TK ELEVATOR" — el conjunto normalizado cambia de verdad.
+    $callReplaceSupplierAliases($db,$id,"TK ELEVADORES\nTK ELEVATOR");
+    $rows=$db->all('SELECT value,normalized_value FROM supplier_aliases WHERE supplier_id=? ORDER BY value',[$id]);
+    $values=array_column($rows,'value');
+    $assert(count($rows)===2 && in_array('TK ELEVADORES',$values,true) && in_array('TK ELEVATOR',$values,true) && !in_array('THYSSENKRUPP',$values,true),'el conjunto debe reflejar exactamente lo enviado: '.json_encode($values));
+    $normalizedValues=array_column($rows,'normalized_value');
+    $assert(count($normalizedValues)===count(array_unique($normalizedValues)),'sin duplicados de normalized_value para el mismo supplier (compatible con la UNIQUE de Fase 2)');
+});
+
+$test('/Revisar POST-Fase-3: provider="FACSA" con name=FACSA/official_name=razón social muestra Y preselecciona la opción "FACSA"',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO suppliers(name,official_name,active) VALUES (?,?,1)',['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,original_filename,provider) VALUES (?,?,?,?)',['needs_review',date('Y-m-d H:i:s'),'facsa.pdf','FACSA']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'>FACSA</option>'),'debe mostrarse "FACSA" como label: '.$html);
+    $assert((bool)preg_match('/<option value="'.$id.'" selected>FACSA<\/option>/',$html),'la opción "FACSA" debe quedar preseleccionada (no solo listada): '.$html);
+});
+$test('/Revisar caso legacy: provider="FACSA" con name=NULL/official_name=FACSA sigue mostrando Y preseleccionando "FACSA"',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute('INSERT INTO suppliers(official_name,active) VALUES (?,1)',['FACSA']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO processed_attachments(status,processed_at,original_filename,provider) VALUES (?,?,?,?)',['needs_review',date('Y-m-d H:i:s'),'facsa-legacy.pdf','FACSA']);
+    $html=$requestWebApp($webApp,'GET','reviews');
+    $assert(str_contains($html,'>FACSA</option>'),'caso legacy: debe mostrarse "FACSA": '.$html);
+    $assert((bool)preg_match('/<option value="'.$id.'" selected>FACSA<\/option>/',$html),'caso legacy: la opción "FACSA" debe seguir preseleccionándose: '.$html);
 });
 
 $failed=0;

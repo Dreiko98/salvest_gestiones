@@ -216,16 +216,59 @@ final class WebApp
         $this->page('Comunidades','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Comunidades</h1><p>Consulta las comunidades dadas de alta y modifica solo cuando haga falta.</p></div><span class="count-badge">'.count($rows).' registradas</span></div>'.$panel.'<section class="card list-card">'.$list.'</section>');
     }
 
+    /** Nombre corto para mostrar/listar: el comercial si ya está migrado (Fase 3), si no la
+     * razón social (que en una fila legacy ES el nombre corto, todavía no la razón social real).
+     * Única fuente de esta regla — reutilizada por el listado, el formulario y el selector de
+     * /Revisar, para que los tres queden consistentes sin duplicar la condición. */
+    private function supplierDisplayName(array $row): string
+    {
+        $name=trim((string)($row['name']??''));
+        return $name!==''?$name:(string)($row['official_name']??'');
+    }
+
+    /** Identificador fiscal canónico: mayúsculas, sin espacios/puntos/guiones; "Pendiente" o
+     * vacío -> NULL. Nunca se guarda cadena vacía. Misma lógica que canonicalCif() en
+     * bin/migrate-supplier-master.php — deliberadamente duplicada en vez de compartida vía
+     * Text.php: es una regla de saneamiento de formulario, no de matching, y esta fase no toca
+     * Text.php. Si diverge de la del script en el futuro, revisar ambas juntas. */
+    private static function canonicalSupplierCif(?string $raw): ?string
+    {
+        $raw=trim((string)$raw);
+        if($raw===''||strcasecmp($raw,'pendiente')===0)return null;
+        $clean=strtoupper((string)preg_replace('/[^A-Za-z0-9]/','',$raw));
+        return $clean===''?null:$clean;
+    }
+
+    /** Pure computation of the 6 columns suppliers.* gets upserted with — pulled out of
+     * suppliers() so it's directly testable without going through the POST cycle (redirect()
+     * calls exit(), which would kill the test runner on a successful save).
+     * @param array<string,mixed> $post @return array{0:string,1:string,2:string,3:string,4:?string,5:?int} */
+    private static function supplierUpsertValues(array $post): array
+    {
+        $name=trim((string)($post['name']??''));
+        // official_name sigue siendo NOT NULL en el esquema; si el alta manual lo deja vacío, se
+        // usa el nombre comercial como respaldo — nunca se inventa una razón social.
+        $officialNameInput=trim((string)($post['official_name']??''));
+        $officialName=$officialNameInput!==''?$officialNameInput:$name;
+        return [$name,$officialName,Text::normalizeCompanyName($name),Text::normalizeCompanyName($officialName),
+            self::canonicalSupplierCif($post['cif']??''),(int)($post['service_id']??0)?:null];
+    }
+
     private function suppliers(): void
     {
         if ($_SERVER['REQUEST_METHOD']==='POST') {
             if(($_POST['action']??'')==='archive'){$id=(int)$_POST['id'];$this->db->execute('UPDATE suppliers SET active=0 WHERE id=?',[$id]);$this->audit('archive','supplier',$id);$this->redirect('/?route=suppliers');}
             if(($_POST['action']??'')==='delete'){$this->requireDeleteConfirmation();$id=(int)$_POST['id'];$row=$this->db->one('SELECT official_name FROM suppliers WHERE id=?',[$id]);if(!$row)throw new \RuntimeException('Proveedor no encontrado');$pdo=$this->db->pdo();$pdo->beginTransaction();try{$this->audit('delete','supplier',$id,$row);$this->db->execute('DELETE FROM suppliers WHERE id=?',[$id]);$pdo->commit();}catch(\Throwable$error){if($pdo->inTransaction())$pdo->rollBack();throw$error;}$this->redirect('/?route=suppliers');}
-            $id=(int)($_POST['id']??0);$values=[trim((string)$_POST['official_name']),Text::normalize((string)$_POST['official_name']),trim((string)($_POST['cif']??'')),(int)$_POST['service_id']?:null];
-            if($id)$this->db->execute('UPDATE suppliers SET official_name=?,normalized_name=?,cif=?,main_service_type_id=?,active=1 WHERE id=?',[...$values,$id]);
-            else{$this->db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',$values);$id=(int)$this->db->pdo()->lastInsertId();}
+            $id=(int)($_POST['id']??0);
+            $values=self::supplierUpsertValues($_POST);
+            if($id)$this->db->execute('UPDATE suppliers SET name=?,official_name=?,normalized_name=?,normalized_official_name=?,cif=?,main_service_type_id=?,active=1 WHERE id=?',[...$values,$id]);
+            else{$this->db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',$values);$id=(int)$this->db->pdo()->lastInsertId();}
             $this->db->execute('DELETE FROM supplier_service_types WHERE supplier_id=?',[$id]);if((int)$_POST['service_id'])$this->db->execute('INSERT INTO supplier_service_types(supplier_id,service_type_id) VALUES (?,?)',[$id,(int)$_POST['service_id']]);
-            $this->replaceRelated('supplier_aliases','supplier_id',$id,'name',(string)($_POST['aliases']??''));
+            // Sigue siendo un reemplazo incondicional (ver informe de esta fase): el textarea de
+            // aliases viaja oculto con su contenido actual, así que esto no borra aliases al
+            // guardar salvo que el propio contenido cambie — pero si el admin edita esa sección sí
+            // los reescribe con Text::normalize(), inconsistencia ya conocida y pendiente de Fase 5.
+            $this->replaceSupplierAliases($id,(string)($_POST['aliases']??''));
             $this->audit(isset($_POST['id'])&&$_POST['id']?'update':'create','supplier',$id);
             $this->redirect('/?route=suppliers');
         }
@@ -234,15 +277,23 @@ final class WebApp
         $rows=$this->db->all('SELECT s.*,st.name service FROM suppliers s LEFT JOIN service_types st ON st.id=s.main_service_type_id ORDER BY s.active DESC,s.official_name'); $table='';
         foreach($rows as $row){
             $detailId='supplier-detail-'.$row['id'];
-            $table.='<tr class="row-summary"><td>'.RowDetail::toggle($detailId,'<strong>'.$this->e($row['official_name']).'</strong>').'</td><td><span class="badge neutral">'.$this->e($row['service']?:'Sin asignar').'</span></td><td><span class="badge '.($row['active']?'success':'neutral').'">'.($row['active']?'Activo':'Desactivado').'</span></td><td class="actions"><a href="/?route=suppliers&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=suppliers"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('suppliers',(int)$row['id'],'el proveedor «'.(string)$row['official_name'].'»').'</td></tr>';
+            $displayName=$this->supplierDisplayName($row);
+            $table.='<tr class="row-summary"><td>'.RowDetail::toggle($detailId,'<strong>'.$this->e($displayName).'</strong>').'</td><td><span class="badge neutral">'.$this->e($row['service']?:'Sin asignar').'</span></td><td><span class="badge '.($row['active']?'success':'neutral').'">'.($row['active']?'Activo':'Desactivado').'</span></td><td class="actions"><a href="/?route=suppliers&edit='.$row['id'].'">Editar</a>'.($row['active']?'<form class="inline" method="post" action="/?route=suppliers"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="archive"><input type="hidden" name="id" value="'.$row['id'].'"><button class="button-quiet">Desactivar</button></form>':'').$this->deleteForm('suppliers',(int)$row['id'],'el proveedor «'.$displayName.'»').'</td></tr>';
             $table.=RowDetail::row($detailId,[
-                ['Nombre oficial',(string)($row['official_name']??'')],
+                ['Nombre comercial',(string)($row['name']??'')!==''?(string)$row['name']:'Sin definir (todavía sin migrar)'],
+                ['Razón social',(string)($row['official_name']??'')],
+                ['CIF/NIF/NIE',(string)($row['cif']??'')?:'Sin definir'],
                 ['Servicio',(string)($row['service']??'Sin asignar')],
                 ['Estado',$row['active']?'Activo':'Desactivado'],
             ],4);
         }
         $aliases=$edit?$this->relatedText('supplier_aliases','supplier_id',(int)$edit['id']):'';
-        $form='<form method="post" action="/?route=suppliers" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><input type="hidden" name="cif" value="'.$this->e($edit['cif']??'').'"><input type="hidden" name="aliases" value="'.$this->e($aliases).'"><div class="form-heading wide"><span class="eyebrow">Directorio</span><h2>'.($edit?'Editar proveedor':'Nuevo proveedor').'</h2></div><label>Nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" required></label><label>Servicio<select name="service_id" required><option value="">Seleccionar</option>'.$options.'</select></label><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=suppliers">Cancelar</a></div></form>';
+        // Compatibilidad pre-Fase-3: si el proveedor aún no está migrado (name=NULL), el campo
+        // "Nombre comercial" se rellena con official_name (hoy es el nombre corto real) para que
+        // abrir y guardar una fila legacy sin tocar nada no la deje con name vacío — y
+        // official_name siempre muestra su valor tal cual está, migrado o no.
+        $nameValue=$edit?$this->supplierDisplayName($edit):'';
+        $form='<form method="post" action="/?route=suppliers" class="card grid form-card"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="id" value="'.$this->e($edit['id']??'').'"><input type="hidden" name="aliases" value="'.$this->e($aliases).'"><div class="form-heading wide"><span class="eyebrow">Directorio</span><h2>'.($edit?'Editar proveedor':'Nuevo proveedor').'</h2></div><label>Nombre comercial / corto<input name="name" value="'.$this->e($nameValue).'" required placeholder="Ej. FACSA"></label><label>Razón social / nombre oficial<input name="official_name" value="'.$this->e($edit['official_name']??'').'" placeholder="Si se deja en blanco, se usa el nombre comercial"></label><label>CIF / NIF / NIE<input class="mono" name="cif" value="'.$this->e($edit['cif']??'').'" placeholder="Opcional"></label><label>Servicio<select name="service_id" required><option value="">Seleccionar</option>'.$options.'</select></label><div class="form-actions wide"><button>Guardar cambios</button><a class="button button-secondary" href="/?route=suppliers">Cancelar</a></div></form>';
         $list=$table!==''?'<div class="table-wrap"><table><thead><tr><th>Proveedor</th><th>Servicio</th><th>Estado</th><th><span class="sr-only">Acciones</span></th></tr></thead><tbody>'.$table.'</tbody></table></div>':'<section class="empty-state"><span class="empty-ring"><i></i></span><h2>Todavía no hay proveedores</h2><p>Añade el primero para vincularlo a sus comunidades.</p></section>';
         $panel=$this->disclosurePanel($edit?'+ Editar proveedor':'+ Nuevo proveedor',$form,(bool)$edit);
         $this->page('Proveedores','<div class="page-heading"><div><span class="eyebrow">Configuración</span><h1>Proveedores</h1><p>Consulta proveedores, servicios y estados sin formularios permanentes.</p></div><span class="count-badge">'.count($rows).' registrados</span></div>'.$panel.'<section class="card list-card">'.$list.'</section>');
@@ -404,7 +455,7 @@ final class WebApp
             $this->redirect('/?route=reviews');
         }
         $rows=$this->db->all("SELECT pa.*,c.official_name FROM processed_attachments pa LEFT JOIN communities c ON c.id=pa.community_id WHERE pa.status IN ('unclassified','needs_review','error') ORDER BY pa.processed_at DESC LIMIT 200");
-        $communities=$this->db->all('SELECT id,official_name FROM communities WHERE active=1 ORDER BY official_name');$suppliers=$this->db->all('SELECT id,official_name FROM suppliers WHERE active=1 ORDER BY official_name');$services=$this->db->all('SELECT normalized_name,name FROM service_types WHERE active=1 ORDER BY name');
+        $communities=$this->db->all('SELECT id,official_name FROM communities WHERE active=1 ORDER BY official_name');$suppliers=$this->db->all('SELECT id,name,official_name FROM suppliers WHERE active=1 ORDER BY official_name');$services=$this->db->all('SELECT normalized_name,name FROM service_types WHERE active=1 ORDER BY name');
         $banner='';
         if(($_GET['requeued']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Factura devuelta a la bandeja de entrada</strong><small>Se procesará de nuevo en la próxima ejecución del bot.</small></span></section>';
         elseif(($_GET['requeue_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo volver a procesar</strong><small>'.$this->e((string)$_GET['requeue_error']).'</small></span></section>';
@@ -421,7 +472,16 @@ final class WebApp
             // processed_attachments has no supplier_id column, only the free-text provider name
             // saved at classification time — pre-select only on an unambiguous exact match.
             $providerNormalized=Text::normalizeCompanyName((string)($row['provider']??''));
-            $supplierOptions='';foreach($suppliers as $item)$supplierOptions.='<option value="'.$item['id'].'"'.($providerNormalized!==''&&Text::normalizeCompanyName((string)$item['official_name'])===$providerNormalized?' selected':'').'>'.$this->e($item['official_name']).'</option>';
+            // El label visible es name ?: official_name; la preselección acepta un match exacto
+            // contra CUALQUIERA de los dos (misma filosofía que Classifier::candidateNames()) —
+            // si no, un supplier ya migrado (provider="FACSA", official_name=razón social larga)
+            // se mostraría correctamente como "FACSA" pero sin quedar preseleccionado.
+            $supplierOptions='';foreach($suppliers as $item){
+                $matchesShortName=(string)($item['name']??'')!==''&&Text::normalizeCompanyName((string)$item['name'])===$providerNormalized;
+                $matchesOfficialName=Text::normalizeCompanyName((string)$item['official_name'])===$providerNormalized;
+                $selected=$providerNormalized!==''&&($matchesShortName||$matchesOfficialName);
+                $supplierOptions.='<option value="'.$item['id'].'"'.($selected?' selected':'').'>'.$this->e($this->supplierDisplayName($item)).'</option>';
+            }
             $serviceNormalized=Text::normalize((string)($row['service_type']??''));
             $serviceOptions='';foreach($services as $item)$serviceOptions.='<option value="'.$this->e($item['normalized_name']).'"'.($serviceNormalized!==''&&$item['normalized_name']===$serviceNormalized?' selected':'').'>'.$this->e($item['name']).'</option>';
             // A supplier is only ever a confirmed row from suppliers — never OpenAI's raw text.
@@ -639,6 +699,43 @@ final class WebApp
         $this->db->execute("DELETE FROM $table WHERE $owner=?",[$id]);
         foreach(array_unique(array_filter(array_map('trim',preg_split('/\R/u',$input)?:[])))as$value){
             $this->db->execute("INSERT INTO $table($owner,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)",[$id,$type,$value,Text::normalize($value)]);
+        }
+    }
+
+    /**
+     * Deliberately NOT folded into replaceRelated() above: that generic helper is shared with
+     * community_aliases, whose matching (Classifier::classify()'s address/name fuzzy step) never
+     * strips legal forms and rightly keeps Text::normalize() — same normalization gap exists
+     * there too, out of scope for this round. For SUPPLIER aliases specifically, the alias tier
+     * (Classifier::resolveSupplierInCommunity()/resolveSupplier()) compares against
+     * Text::normalizeCompanyName($invoice['proveedor']), and Fase 3's migration script
+     * (bin/migrate-supplier-master.php) already inserts alias rows normalized the same way — so
+     * this must match both, or a supplier edited here after Fase 3 could silently stop matching
+     * by alias. The two are semantically identical (same function) but not code-shared: a bin/
+     * script isn't a class WebApp can require, and duplicating one small canonicalization
+     * function is a much smaller liability than coupling this class to a CLI script. If they
+     * ever diverge, review both together.
+     *
+     * Also, unlike replaceRelated(), this skips the DELETE+INSERT entirely when the submitted
+     * set of aliases normalizes to exactly the existing set — editing CIF/service/name (or
+     * saving the hidden aliases textarea back unchanged, which happens on every save today)
+     * must never silently touch/re-normalize aliases that didn't actually change.
+     */
+    private function replaceSupplierAliases(int $supplierId,string $input):void
+    {
+        $desired=[];
+        foreach(array_filter(array_map('trim',preg_split('/\R/u',$input)?:[]))as$value){
+            $normalized=Text::normalizeCompanyName($value);
+            if($normalized===''||isset($desired[$normalized]))continue; // primera variante gana si dos líneas normalizan igual
+            $desired[$normalized]=$value;
+        }
+        $existing=array_column($this->db->all('SELECT normalized_value FROM supplier_aliases WHERE supplier_id=? ORDER BY id',[$supplierId]),'normalized_value');
+        $existingSet=$existing;sort($existingSet);
+        $desiredSet=array_keys($desired);sort($desiredSet);
+        if($existingSet===$desiredSet)return; // conjunto idéntico: ni DELETE ni INSERT, filas intactas
+        $this->db->execute('DELETE FROM supplier_aliases WHERE supplier_id=?',[$supplierId]);
+        foreach($desired as$normalized=>$value){
+            $this->db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$supplierId,'name',$value,$normalized]);
         }
     }
     private function identifierText(int $id):string

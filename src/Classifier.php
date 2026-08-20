@@ -106,8 +106,17 @@ final class Classifier
             }
         }
         if ($name !== '') {
+            // Same compatibility shim as resolveSupplierInCommunity(): compares against both
+            // name and official_name so a bare short-name extraction ("FACSA") still scores high
+            // even once official_name becomes the (much longer) legal name post-Fase-3. Uses its
+            // own normalizeCompanyName()'d copy of the provider name (candidateNames() already
+            // strips legal forms from official_name/name) rather than reusing $name — $name stays
+            // normalize()-based on purpose, because the alias-tier below still compares against
+            // it and this phase deliberately leaves alias normalization untouched. Still first-
+            // match-wins, exactly as before — no tie/ambiguity detection added here.
+            $fuzzyProviderName = Text::normalizeCompanyName((string)($invoice['proveedor'] ?? ''));
             foreach ($suppliers as $supplier) {
-                if (Text::similarity($name, (string)$supplier['normalized_name']) >= 92) {
+                if (self::bestNameScore($fuzzyProviderName, '', $supplier) >= 92) {
                     return ['supplier'=>$supplier,'evidence'=>['field'=>'proveedor','type'=>'fuzzy']];
                 }
             }
@@ -172,9 +181,13 @@ final class Classifier
 
         $providerName = Text::normalizeCompanyName((string)($invoice['proveedor'] ?? ''));
         if ($providerName !== '') {
-            $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::normalizeCompanyName((string)$r['official_name']) === $providerName);
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => in_array($providerName, self::candidateNames($r), true));
             if($trace)$trace('supplier_exact_name',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
-            if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'exact_name'],'ambiguous'=>false];
+            if ($found !== null) {
+                if ($found === false) return ['supplier'=>null,'evidence'=>null,'ambiguous'=>true];
+                $matchedShortName = (string)($found['name'] ?? '') !== '' && Text::normalizeCompanyName((string)$found['name']) === $providerName;
+                return ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>$matchedShortName ? 'supplier_name_exact' : 'supplier_official_name_exact'],'ambiguous'=>false];
+            }
         }
 
         $domain = Text::normalize(substr(strrchr($sender, '@') ?: '', 1));
@@ -197,19 +210,18 @@ final class Classifier
         } elseif ($trace) { $trace('supplier_alias','skipped',[]); }
 
         if ($providerName !== '') {
-            $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::containsWholeWords($providerName, Text::normalizeCompanyName((string)$r['official_name'])));
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => self::anyContainsWholeWords($providerName, $r));
             if($trace)$trace('supplier_containment',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'name_containment'],'ambiguous'=>false];
 
-            $found = self::uniqueMatch($rows, static fn(array $r): bool => Text::containsAllWords($providerName, Text::normalizeCompanyName((string)$r['official_name'])));
+            $found = self::uniqueMatch($rows, static fn(array $r): bool => self::anyContainsAllWords($providerName, $r));
             if($trace)$trace('supplier_token',$found===false?'ambiguous':($found?'match':'none'),['proveedor_normalizado'=>$providerName]);
             if ($found !== null) return $found === false ? ['supplier'=>null,'evidence'=>null,'ambiguous'=>true] : ['supplier'=>$found,'evidence'=>['field'=>'proveedor','type'=>'token_match'],'ambiguous'=>false];
         }
 
         $best = null; $bestScore = 0.0; $tied = 0;
         foreach ($rows as $row) {
-            $name = (string)$row['normalized_name'];
-            $score = max($providerName !== '' ? Text::similarity($providerName, $name) : 0.0, $domain !== '' ? Text::similarity($domain, $name) : 0.0);
+            $score = self::bestNameScore($providerName, $domain, $row);
             if ($trace && $score > 0.0) $trace('supplier_fuzzy','candidate',['proveedor'=>$row['official_name'],'score'=>$score]);
             if ($score > $bestScore) { $bestScore = $score; $best = $row; $tied = 1; }
             elseif ($score === $bestScore && $score > 0.0) { $tied++; }
@@ -250,6 +262,58 @@ final class Classifier
         $matches = array_values(array_filter($rows, $predicate));
         if (count($matches) > 1) return false;
         return $matches[0] ?? null;
+    }
+
+    /**
+     * Fase 3->5 compatibility shim: a supplier's name/exact/containment/token/fuzzy tiers must
+     * keep working whether `suppliers.name` is still NULL (pre-Fase-3 data, official_name IS the
+     * short commercial name) or already populated (post-Fase-3, official_name is the legal
+     * razón social). Every tier below compares against BOTH candidates instead of official_name
+     * alone; this is the single source of that candidate list, so all four tiers stay
+     * consistent and a value that normalizes identically under both fields (the common
+     * pre-Fase-3 case, or any supplier whose short/legal names coincide) is never compared
+     * twice.
+     * @param array<string,mixed> $r @return list<string> */
+    private static function candidateNames(array $r): array
+    {
+        $candidates = [];
+        foreach ([$r['name'] ?? null, $r['official_name'] ?? null] as $raw) {
+            if ($raw === null || (string)$raw === '') continue;
+            $normalized = Text::normalizeCompanyName((string)$raw);
+            if ($normalized !== '' && !in_array($normalized, $candidates, true)) $candidates[] = $normalized;
+        }
+        return $candidates;
+    }
+
+    private static function anyContainsWholeWords(string $providerName, array $r): bool
+    {
+        foreach (self::candidateNames($r) as $candidate) {
+            if (Text::containsWholeWords($providerName, $candidate)) return true;
+        }
+        return false;
+    }
+
+    private static function anyContainsAllWords(string $providerName, array $r): bool
+    {
+        foreach (self::candidateNames($r) as $candidate) {
+            if (Text::containsAllWords($providerName, $candidate)) return true;
+        }
+        return false;
+    }
+
+    /** Best fuzzy score for a supplier row against the extracted provider name and/or sender
+     * domain, taken over every valid candidate (short name, legal name) so a supplier is never
+     * penalised just because one of its two representations is very different from the other —
+     * e.g. providerName="FACSA" must score against name="FACSA" (100), not get dragged down by
+     * comparing only against the much longer official_name. */
+    private static function bestNameScore(string $providerName, string $domain, array $r): float
+    {
+        $score = 0.0;
+        foreach (self::candidateNames($r) as $candidate) {
+            if ($providerName !== '') $score = max($score, Text::similarity($providerName, $candidate));
+            if ($domain !== '') $score = max($score, Text::similarity($domain, $candidate));
+        }
+        return $score;
     }
 
     /**

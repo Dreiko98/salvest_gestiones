@@ -3447,6 +3447,59 @@ $test('Fase 9 — sin contención NI fuzzy suficiente, sigue sin resolver comuni
     $assert(in_array(['tier'=>'community_fuzzy','outcome'=>'none'],$trace,true),'el fuzzy también se sigue intentando después, como siempre');
 });
 
+// ============================================================================================
+// Fase 9.1 — el contexto del correo (asunto/cuerpo) nunca debe pesar más que los propios campos
+// extraídos de la factura al resolver comunidad por fuzzy. Caso real: una factura de una
+// comunidad, enviada en un correo cuyo asunto/cuerpo mencionaba OTRA comunidad -> el sistema
+// archivó la factura en la comunidad equivocada porque el contexto competía en igualdad con los
+// campos de la propia factura en la misma pasada.
+// ============================================================================================
+
+$test('Fase 9.1 — LA FACTURA GANA: el contexto del correo menciona una comunidad distinta con score más alto (100) que el propio nombre_comunidad de la factura (93.3) -> debe ganar la factura, nunca el contexto (regresión del bug real reportado)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',
+        ['RESIDENCIAL LOS PINOS ALTOS DEL NORTE',Salvest\Text::normalize('RESIDENCIAL LOS PINOS ALTOS DEL NORTE'),'Calle Pinos 1']);
+    $correctId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['TORRE DEL PUERTO',Salvest\Text::normalize('TORRE DEL PUERTO'),'Calle Puerto 1']);
+    // nombre_comunidad de la factura: 93.3 de similitud con la comunidad correcta (typo real,
+    // sin contención exacta) -> supera el umbral 92 por sí solo.
+    // contexto del correo: coincide EXACTO (100) con una comunidad totalmente distinta.
+    // Antes de este fix, el contexto (100 > 93.3) ganaba la comparación global. Ahora, los campos
+    // de la propia factura se prueban en su propia pasada, con prioridad, antes de mirar el
+    // contexto siquiera.
+    $trace=[];
+    $result=(new Salvest\Classifier($db))->classify(
+        ['nombre_comunidad'=>'RESIDENCIAL LOS PINOS ALTOS DEL NORTES','direccion'=>''],
+        'TORRE DEL PUERTO',
+        function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome];}
+    );
+    $assert($result['community']!==null && (int)$result['community']['id']===$correctId,'debe ganar la comunidad de la propia factura, no la mencionada en el correo: '.json_encode($result));
+    $assert(!in_array('community_fuzzy_context',array_column($trace,'tier'),true),'ni siquiera debe llegar a probar el contexto: los campos de la factura ya resolvieron');
+});
+
+$test('Fase 9.1 — el contexto SIGUE funcionando como último recurso cuando la propia factura no aporta nada usable (regresión: no se ha eliminado la capacidad, solo se ha reordenado la prioridad)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['TORRE DEL PUERTO',Salvest\Text::normalize('TORRE DEL PUERTO'),'Calle Puerto 1']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $trace=[];
+    $result=(new Salvest\Classifier($db))->classify(
+        ['nombre_comunidad'=>'','direccion'=>''],
+        'TORRE DEL PUERTO',
+        function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome];}
+    );
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'sin nada en la propia factura, el contexto debe seguir pudiendo resolverlo: '.json_encode($result));
+    $assert($result['evidence']['field']==='context',json_encode($result['evidence']));
+    $assert(in_array(['tier'=>'community_fuzzy_context','outcome'=>'match'],$trace,true),'debe quedar constancia de que se resolvió por el contexto, en su propio paso de traza');
+});
+
+$test('Fase 9.1 — los prompts de extracción (Claude y OpenAI) instruyen explícitamente a leer los campos de comunidad SOLO del documento, nunca del contexto del correo (guarda de regresión de código)',static function()use($assert):void{
+    foreach(['src/ClaudeExtractor.php','src/OpenAIExtractor.php'] as $file){
+        $source=file_get_contents(__DIR__.'/../'.$file);
+        $assert(str_contains($source,'nunca del contexto del correo'),"$file debe instruir explícitamente a no tomar los datos de comunidad del contexto del correo");
+        $assert(str_contains($source,'nombre_comunidad, direccion, comunidad_cif, codigo_comunidad, codigo_postal'),"$file debe enumerar explícitamente los campos de comunidad afectados");
+    }
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

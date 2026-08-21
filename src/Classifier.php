@@ -86,18 +86,48 @@ final class Classifier
         if(count($containmentMatches)===1)return['community'=>reset($containmentMatches),'confidence'=>100.0,'evidence'=>['field'=>'nombre_comunidad','type'=>'name_containment']];
         if(count($containmentMatches)>1)return['community'=>null,'confidence'=>0.0,'evidence'=>['field'=>'nombre_comunidad','type'=>'ambiguous_containment']];
 
-        $queries=['address'=>array_filter([(string)($invoice['direccion']??''),$context]),'name'=>array_filter([(string)($invoice['nombre_comunidad']??''),$context])];
-        $best = null; $bestScore = 0.0;
-        foreach ($candidates as $candidate) {
-            foreach ($queries[$candidate['kind']] as $query) {
-                $score = Text::similarity($query, (string)$candidate['value']);
-                if ($trace && $score > 0.0) $trace('community_fuzzy','candidate',['comunidad'=>$candidate['community']['official_name']??null,'kind'=>$candidate['kind'],'score'=>$score]);
-                if ($score > $bestScore) { $best = $candidate['community']; $bestScore = $score; }
+        // Fase 9.1: the invoice's OWN extracted fields (nombre_comunidad/direccion — read off the
+        // actual PDF) must always outrank the raw email context (subject/body — someone else's
+        // free text, which can legitimately mention a different community in passing, e.g. a
+        // forwarded/CC'd thread, or an unrelated line in a long email body). Real case that
+        // exposed this: a PDF genuinely for community A, sent in an email whose subject/body
+        // named community B — the old single-pass query (invoice fields and $context mixed
+        // together, best score wins regardless of source) let B's mention outscore A's own
+        // correct match and archived the invoice under the wrong community. Fixed by running the
+        // invoice's own fields as their own, higher-priority pass first; $context is only ever
+        // consulted in a second pass, and only when the invoice's own fields didn't resolve
+        // anything on their own.
+        $invoiceQueries=['address'=>array_filter([(string)($invoice['direccion']??'')]),'name'=>array_filter([(string)($invoice['nombre_comunidad']??'')])];
+        $invoiceFuzzy=self::bestFuzzyMatch($candidates,$invoiceQueries,$trace);
+        if($trace)$trace('community_fuzzy',$invoiceFuzzy['score']>=$this->threshold?'match':'none',
+            ['best'=>$invoiceFuzzy['best']['official_name']??null,'score'=>$invoiceFuzzy['score'],'threshold'=>$this->threshold]);
+        if($invoiceFuzzy['score']>=$this->threshold){
+            return['community'=>$invoiceFuzzy['best'],'confidence'=>$invoiceFuzzy['score'],
+                'evidence'=>['field'=>'address','type'=>'fuzzy','score'=>$invoiceFuzzy['score']/100]];
+        }
+
+        $contextQueries=['address'=>array_filter([$context]),'name'=>array_filter([$context])];
+        $contextFuzzy=self::bestFuzzyMatch($candidates,$contextQueries,$trace,'community_fuzzy_context');
+        if($trace)$trace('community_fuzzy_context',$contextFuzzy['score']>=$this->threshold?'match':'none',
+            ['best'=>$contextFuzzy['best']['official_name']??null,'score'=>$contextFuzzy['score'],'threshold'=>$this->threshold]);
+        return['community'=>$contextFuzzy['score']>=$this->threshold?$contextFuzzy['best']:null,'confidence'=>$contextFuzzy['score'],
+            'evidence'=>['field'=>'context','type'=>'fuzzy','score'=>$contextFuzzy['score']/100]];
+    }
+
+    /** @param list<array{community:array,value:mixed,kind:string}> $candidates
+     * @param array{address:list<string>,name:list<string>} $queries
+     * @return array{best:?array,score:float} */
+    private static function bestFuzzyMatch(array $candidates,array $queries,?callable $trace,string $traceTier='community_fuzzy'):array
+    {
+        $best=null;$bestScore=0.0;
+        foreach($candidates as $candidate){
+            foreach($queries[$candidate['kind']] as $query){
+                $score=Text::similarity($query,(string)$candidate['value']);
+                if($trace && $score>0.0)$trace($traceTier,'candidate',['comunidad'=>$candidate['community']['official_name']??null,'kind'=>$candidate['kind'],'score'=>$score]);
+                if($score>$bestScore){$best=$candidate['community'];$bestScore=$score;}
             }
         }
-        if($trace)$trace('community_fuzzy',$bestScore>=$this->threshold?'match':'none',['best'=>$best['official_name']??null,'score'=>$bestScore,'threshold'=>$this->threshold]);
-        return ['community'=>$bestScore >= $this->threshold ? $best : null,'confidence'=>$bestScore,
-            'evidence'=>['field'=>'address','type'=>'fuzzy','score'=>$bestScore / 100]];
+        return['best'=>$best,'score'=>$bestScore];
     }
 
     /** community.cif is stored as typed — dashes, spaces, case all vary in practice (real

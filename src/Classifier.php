@@ -59,6 +59,33 @@ final class Classifier
             $candidates[] = ['community'=>['id'=>$alias['community_id'],'official_name'=>$alias['official_name'],
                 'main_address'=>$alias['main_address'],'cif'=>$alias['cif']],'value'=>$alias['value'],'kind'=>'address'];
         }
+        // Fase 9: containment safety net — exact whole-word match, no numeric threshold. Same
+        // philosophy resolveSupplier() already uses for suppliers (its own supplier_containment
+        // tier), which never existed for communities until now. Checked after every exact-
+        // identifier tier above and before the fuzzy score below: catches cases like extracted
+        // nombre_comunidad "LLOMBAI 11 ESCALERA" containing a community's official_name
+        // "LLOMBAI 11" verbatim — real case that only scored 72.83/100 on the fuzzy tier (below
+        // the 92 threshold) because the extra word diluted the token-overlap component, even
+        // though the master's name is unambiguously present. Deliberately narrower than the
+        // fuzzy tier's own query list below: only the extracted nombre_comunidad/direccion
+        // fields are checked, never $context (the raw email body/subject) — containment has no
+        // numeric margin to absorb an unrelated community's name mentioned in passing there.
+        $containmentQueries=['address'=>array_filter([(string)($invoice['direccion']??'')]),'name'=>array_filter([(string)($invoice['nombre_comunidad']??'')])];
+        $containmentMatches=[];
+        foreach ($candidates as $candidate) {
+            $candidateValue=Text::normalize((string)$candidate['value']);
+            if ($candidateValue==='') continue;
+            foreach ($containmentQueries[$candidate['kind']] as $query) {
+                if (Text::containsWholeWords(Text::normalize((string)$query),$candidateValue)) {
+                    $containmentMatches[$candidate['community']['id']]=$candidate['community'];
+                    break;
+                }
+            }
+        }
+        if($trace)$trace('community_containment',count($containmentMatches)>1?'ambiguous':(count($containmentMatches)===1?'match':'none'),['matches'=>count($containmentMatches)]);
+        if(count($containmentMatches)===1)return['community'=>reset($containmentMatches),'confidence'=>100.0,'evidence'=>['field'=>'nombre_comunidad','type'=>'name_containment']];
+        if(count($containmentMatches)>1)return['community'=>null,'confidence'=>0.0,'evidence'=>['field'=>'nombre_comunidad','type'=>'ambiguous_containment']];
+
         $queries=['address'=>array_filter([(string)($invoice['direccion']??''),$context]),'name'=>array_filter([(string)($invoice['nombre_comunidad']??''),$context])];
         $best = null; $bestScore = 0.0;
         foreach ($candidates as $candidate) {

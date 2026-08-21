@@ -3385,6 +3385,68 @@ $test('Fase 8 — processed_attachments.extractor_version refleja el proveedor r
     $assert(str_contains($source,'$extractorVersion=$this->extractor->version()'),'debe capturar version() justo después de la llamada real a extract()');
 });
 
+// ============================================================================================
+// Fase 9 — contención de palabras completas para comunidad (safety net previo al fuzzy, mismo
+// principio que resolveSupplier() ya usa para proveedores).
+// ============================================================================================
+
+$test('Fase 9 — LLOMBAI 11: nombre_comunidad extraído "LLOMBAI 11 ESCALERA" contiene el official_name "LLOMBAI 11" -> match por contención, nunca llega a probar el fuzzy (caso real de producción)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
+        ['55','LLOMBAI 11',Salvest\Text::normalize('LLOMBAI 11'),'H12460788','AVDA. LLOMBAI 11']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $trace=[];
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'LLOMBAI 11 ESCALERA','direccion'=>'C/Llombai 11, BURRIANA'],'',function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome,'details'=>$details];});
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver a LLOMBAI 11: '.json_encode($result));
+    $assert($result['confidence']===100.0,'la contención es una coincidencia exacta, no una puntuación difusa');
+    $assert($result['evidence']===['field'=>'nombre_comunidad','type'=>'name_containment'],json_encode($result['evidence']));
+    $fuzzySteps=array_filter($trace,fn($t)=>$t['tier']==='community_fuzzy');
+    $assert(count($fuzzySteps)===0,'la contención debe resolverlo ANTES de llegar siquiera a probar el tier fuzzy');
+    $containmentSteps=array_values(array_filter($trace,fn($t)=>$t['tier']==='community_containment'));
+    $assert(count($containmentSteps)===1 && $containmentSteps[0]['outcome']==='match','debe quedar constancia en la traza');
+});
+
+$test('Fase 9 — ambigüedad: dos comunidades cuyo official_name aparece completo dentro del mismo nombre_comunidad extraído -> ambiguo, ninguna se elige arbitrariamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['EDIFICIO NORTE',Salvest\Text::normalize('EDIFICIO NORTE'),'Calle Norte 1']);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['EDIFICIO SUR',Salvest\Text::normalize('EDIFICIO SUR'),'Calle Sur 1']);
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'EDIFICIO NORTE EDIFICIO SUR','direccion'=>''],'');
+    $assert($result['community']===null,'ambiguo -> no debe elegir ninguna comunidad arbitrariamente: '.json_encode($result));
+    $assert($result['evidence']['type']==='ambiguous_containment',json_encode($result['evidence']));
+});
+
+$test('Fase 9 — contención también aplica vía alias de dirección (no solo official_name)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['CP ALIAS',Salvest\Text::normalize('CP ALIAS'),'Avenida Principal 9']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
+        [$communityId,'address','Calle Secundaria 42',Salvest\Text::normalize('Calle Secundaria 42')]);
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'','direccion'=>'Calle Secundaria 42, bajo'],'');
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver vía el alias de dirección: '.json_encode($result));
+    $assert($result['evidence']['type']==='name_containment');
+});
+
+$test('Fase 9 — el contexto del correo (asunto/cuerpo) NUNCA se usa para la contención, solo nombre_comunidad/direccion — a diferencia del tier fuzzy que sí lo usa',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['MENCIONADA EN CONTEXTO',Salvest\Text::normalize('MENCIONADA EN CONTEXTO'),'Calle X 1']);
+    // El nombre de la comunidad solo aparece en el contexto (cuerpo del correo), nunca en los
+    // campos extraídos nombre_comunidad/direccion -> la contención no debe dispararse.
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'','direccion'=>''],'Aviso: factura de la comunidad MENCIONADA EN CONTEXTO adjunta');
+    $assert($result['community']===null,'la contención no debe usar el contexto libre del correo: '.json_encode($result));
+});
+
+$test('Fase 9 — sin contención NI fuzzy suficiente, sigue sin resolver comunidad exactamente como antes (regresión: la contención no inventa coincidencias donde no las hay)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['RESIDENCIAL EL PINAR',Salvest\Text::normalize('RESIDENCIAL EL PINAR'),'Calle Y 1']);
+    $trace=[];
+    // Mismas palabras, orden distinto: ni contención (no es una frase contigua) ni fuzzy (score
+    // real 70.75, muy por debajo del umbral 92) -> debe seguir sin resolverse, igual que siempre.
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'EL PINAR RESIDENCIAL','direccion'=>''],'',function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome];});
+    $assert($result['community']===null,'no debe inventar una coincidencia: '.json_encode($result));
+    $assert(in_array(['tier'=>'community_containment','outcome'=>'none'],$trace,true),'la contención debe haberse intentado y no encontrado nada');
+    $assert(in_array(['tier'=>'community_fuzzy','outcome'=>'none'],$trace,true),'el fuzzy también se sigue intentando después, como siempre');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

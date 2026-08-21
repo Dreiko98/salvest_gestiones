@@ -30,7 +30,7 @@ CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,official_n
 CREATE TABLE supplier_aliases(id INTEGER PRIMARY KEY AUTOINCREMENT,supplier_id INTEGER,alias_type TEXT,value TEXT,normalized_value TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE service_types(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,normalized_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE supplier_service_types(supplier_id INTEGER,service_type_id INTEGER);
-CREATE TABLE community_suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,community_id INTEGER,supplier_id INTEGER,category TEXT,contract_reference TEXT);
+CREATE TABLE community_suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,community_id INTEGER,supplier_id INTEGER,category TEXT,contract_reference TEXT,source_column TEXT,raw_provider_name TEXT,created_at TEXT);
 SQL;
 
 // Same in-memory Database helper, but for the manual "run-worker" route: it also
@@ -2938,13 +2938,332 @@ $test('Fase 6 — 0 escrituras en community_suppliers: recuento idéntico antes/
     $assert($before===0 && $after===0,'ningún escenario de fallback global (resuelto, resuelto, no resuelto) debe escribir community_suppliers: antes='.$before.' después='.$after);
 });
 
-$test('Fase 6 — decision_json: la evidencia del supplier lleva source=global cuando vino del fallback, ausente cuando vino de la comunidad (sin auto_link todavía)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6/7 — decision_json: la evidencia del supplier lleva source=global y auto_link explícito (false, sin autoLinker conectado) cuando vino del fallback, ausentes cuando vino de la comunidad',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6K','CP DECISION','cp decision','H12121212','x',1)");
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['GLOBAL','GLOBAL SUPPLIER, S.L.',Salvest\Text::normalizeCompanyName('GLOBAL'),'B12121213']);
     $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B12121213','comunidad_cif'=>'H12121212','tipo_servicio'=>''],'facturas@x.example');
     $assert($route['evidence']['supplier']['source']==='global');
-    $assert(!isset($route['evidence']['supplier']['auto_link']),'esta fase NO debe añadir ningún campo de auto_link — eso es Fase 7');
+    $assert(isset($route['evidence']['supplier']['auto_link']) && $route['evidence']['supplier']['auto_link']===false,'auto_link debe quedar explícito (false) cuando el source es global, nunca ausente: '.json_encode($route['evidence']['supplier']));
+});
+
+// ---- Fase 7: autolink de community_suppliers — contra MySQL real (INSERT ... ON DUPLICATE KEY
+// UPDATE es sintaxis MySQL, no SQLite; CommunitySupplierAutoLinker solo se prueba aquí) ----
+$f7InsertCommunity=static function(Salvest\Database $db,string $code,string $cif):int{
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
+        [$code,'CP FASE7 '.$code,Salvest\Text::normalize('CP FASE7 '.$code),$cif,'x']);
+    return (int)$db->pdo()->lastInsertId();
+};
+$f7InsertSupplier=static function(Salvest\Database $db,string $name,?string $official,?int $serviceId,?string $cif,int $active=1):int{
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,?)',
+        [$name,$official??$name,Salvest\Text::normalizeCompanyName($name),Salvest\Text::normalizeCompanyName($official??$name),$cif,$serviceId,$active]);
+    return (int)$db->pdo()->lastInsertId();
+};
+$f7Cleanup=static function(Salvest\Database $db,array $communityIds,array $supplierIds):void{
+    foreach($supplierIds as $id)$db->execute('DELETE FROM suppliers WHERE id=?',[$id]); // cascada: aliases + community_suppliers
+    foreach($communityIds as $id)$db->execute('DELETE FROM communities WHERE id=?',[$id]);
+};
+$f7Service=static function(Salvest\Database $db,string $name):int{
+    $db->execute('INSERT IGNORE INTO service_types(name,normalized_name) VALUES (?,?)',[$name.' Fase7',Salvest\Text::normalize($name.' Fase7')]);
+    return (int)$db->one('SELECT id FROM service_types WHERE normalized_name=?',[Salvest\Text::normalize($name.' Fase7')])['id'];
+};
+
+$test('Fase 7 — FACSA: fallback global + autolink -> INSERT community_suppliers(category=Agua), auto_link=true; segunda ejecución NO duplica',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Agua');
+    $communityId=$f7InsertCommunity($db,'F7FACSA','H70000001');
+    $supplierId=$f7InsertSupplier($db,'FACSA TEST F7','SOCIEDAD FACSA TEST F7, S.A.U.',$serviceId,'A70000001');
+    try{
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'FACSA TEST F7','proveedor_cif'=>'A70000001','comunidad_cif'=>'H70000001','tipo_servicio'=>''],'facturas@facsa.example');
+        $assert($route['status']==='classified' && $route['evidence']['supplier']['source']==='global' && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $rows=$db->all('SELECT * FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
+        $assert(count($rows)===1 && $rows[0]['category']==='AGUA FASE7' && $rows[0]['contract_reference']===null && $rows[0]['source_column']==='auto_global_resolution' && $rows[0]['raw_provider_name']==='FACSA TEST F7',json_encode($rows));
+        // Segunda ejecución de la misma factura/ruta: 0 relaciones nuevas.
+        $route2=$router->route(['proveedor'=>'FACSA TEST F7','proveedor_cif'=>'A70000001','comunidad_cif'=>'H70000001','tipo_servicio'=>''],'facturas@facsa.example');
+        $assert($route2['status']==='classified','la segunda vez debe resolver EN COMUNIDAD (ya enlazado), no por fallback global');
+        $assert(!isset($route2['evidence']['supplier']['source']),'ya no debe venir de "global" — la relación ya existe: '.json_encode($route2['evidence']['supplier']));
+        $rowsAfter=$db->all('SELECT * FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
+        $assert(count($rowsAfter)===1,'no debe duplicarse: '.count($rowsAfter));
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — PROFOC: razón social completa -> global -> autolink con category=Extintores',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Extintores');
+    $communityId=$f7InsertCommunity($db,'F7PROFOC','H70000002');
+    $supplierId=$f7InsertSupplier($db,'PROFOC TEST F7','GARCÍA MARÍN CONSULTORES TEST F7, S.L.',$serviceId,'B70000002');
+    try{
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES TEST F7 S.L.','proveedor_cif'=>'B70000002','comunidad_cif'=>'H70000002','tipo_servicio'=>''],'facturas@profoc.example');
+        $assert($route['status']==='classified' && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $rows=$db->all('SELECT category FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
+        $assert(count($rows)===1 && $rows[0]['category']==='EXTINTORES FASE7',json_encode($rows));
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — EXTNCAS: alias global resuelve al target activo, autolink SIEMPRE al target, nunca al source inactivo',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Extintores2');
+    $communityId=$f7InsertCommunity($db,'F7EXTINCAS','H70000003');
+    $activeId=$f7InsertSupplier($db,'EXTINCAS TEST F7','EXTINTORES CASTELLÓN TEST F7, S.L.',$serviceId,'B70000003');
+    $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$activeId,'name','EXTNCAS TEST F7',Salvest\Text::normalizeCompanyName('EXTNCAS TEST F7')]);
+    $inactiveId=$f7InsertSupplier($db,'EXTNCAS TEST F7',null,null,null,0);
+    try{
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'EXTNCAS TEST F7','proveedor_cif'=>'','comunidad_cif'=>'H70000003','tipo_servicio'=>''],'facturas@extincas.example');
+        $assert($route['status']==='classified' && (int)$route['supplier']['id']===$activeId && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $linkedToActive=$db->one('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$activeId]);
+        $linkedToInactive=$db->one('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$inactiveId]);
+        $assert($linkedToActive!==null && $linkedToInactive===null,'la relación debe crearse con el target activo, jamás con el inactivo');
+    }finally{$f7Cleanup($db,[$communityId],[$activeId,$inactiveId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — ADRIAN TURCU: CIF global -> autolink con category=Limpieza',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Limpieza2');
+    $communityId=$f7InsertCommunity($db,'F7ADRIAN','H70000004');
+    $supplierId=$f7InsertSupplier($db,'ADRIAN TURCU TEST F7',null,$serviceId,'X4153498M');
+    try{
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'','proveedor_cif'=>'X4153498M','comunidad_cif'=>'H70000004','tipo_servicio'=>''],'facturas@adrian.example');
+        $assert($route['status']==='classified' && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $rows=$db->all('SELECT category FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
+        $assert(count($rows)===1 && $rows[0]['category']==='LIMPIEZA2 FASE7',json_encode($rows));
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — ambigüedad global: 0 INSERT, auto_link=false, needs_review',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Ambiguo');
+    $communityId=$f7InsertCommunity($db,'F7AMBIGUO','H70000005');
+    $s1=$f7InsertSupplier($db,'DUP F7',null,$serviceId,null);
+    $s2=$f7InsertSupplier($db,'DUP F7',null,$serviceId,null);
+    try{
+        $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'DUP F7','proveedor_cif'=>'','comunidad_cif'=>'H70000005','tipo_servicio'=>''],'facturas@dup.example');
+        $assert($route['status']==='needs_review' && $route['supplier']===null && $route['supplier_ambiguous']===true,json_encode($route));
+        $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+        $assert($before===$after,'ambigüedad global no debe crear ninguna relación');
+    }finally{$f7Cleanup($db,[$communityId],[$s1,$s2]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — sin servicio maestro: 0 INSERT aunque un hint de OpenAI permita clasificar; auto_link=false',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $communityId=$f7InsertCommunity($db,'F7NOSVC','H70000006');
+    $supplierId=$f7InsertSupplier($db,'SIN SERVICIO F7',null,null,'B70000006'); // main_service_type_id NULL
+    try{
+        $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'','proveedor_cif'=>'B70000006','comunidad_cif'=>'H70000006','tipo_servicio'=>'jardineria'],'facturas@x.example');
+        $assert($route['status']==='classified','con hint de OpenAI, Fase 6 sigue permitiendo clasificar');
+        $assert($route['evidence']['supplier']['auto_link']===false,'sin main_service_type_id, NUNCA debe autolinkear, aunque clasifique por el hint puntual: '.json_encode($route['evidence']['supplier']));
+        $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+        $assert($before===$after,'0 relaciones nuevas sin servicio maestro');
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — prioridad: relación ya existente -> el fallback global ni se ejecuta, 0 INSERT nuevo',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'YaExiste');
+    $communityId=$f7InsertCommunity($db,'F7EXISTS','H70000007');
+    $supplierId=$f7InsertSupplier($db,'YA ENLAZADO F7',null,$serviceId,'B70000007');
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityId,$supplierId,'Ya Existe Fase7','manual','YA ENLAZADO F7']);
+    try{
+        $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'YA ENLAZADO F7','proveedor_cif'=>'B70000007','comunidad_cif'=>'H70000007','tipo_servicio'=>''],'facturas@x.example');
+        $assert($route['status']==='classified' && !isset($route['evidence']['supplier']['source']),'debe resolver por resolveSupplierInCommunity(), el fallback global ni se ejecuta: '.json_encode($route));
+        $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
+        $assert($before===1 && $after===1,'no debe crear una segunda relación');
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — CommunitySupplierAutoLinker::linkIfMissing() es idempotente/resistente a carrera: dos llamadas seguidas -> 1 sola relación',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Race');
+    $communityId=$f7InsertCommunity($db,'F7RACE','H70000008');
+    $supplierId=$f7InsertSupplier($db,'RACE F7',null,$serviceId,'B70000008');
+    try{
+        $linker=new Salvest\CommunitySupplierAutoLinker($db);
+        $r1=$linker->linkIfMissing($communityId,$supplierId,'Race Fase7','RACE F7');
+        $r2=$linker->linkIfMissing($communityId,$supplierId,'Race Fase7','RACE F7');
+        $assert($r1['inserted']===true && $r1['reason']==='missing_relation',json_encode($r1));
+        $assert($r2['inserted']===false && $r2['reason']==='relation_already_exists',json_encode($r2));
+        $count=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
+        $assert($count===1,'exactamente una relación tras dos llamadas seguidas: '.$count);
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — categorías múltiples para el mismo par: el UNIQUE(community_id,supplier_id) nuevo ahora lo impide estructuralmente para CUALQUIER escritor, no solo para el autolink',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $communityId=$f7InsertCommunity($db,'F7MULTI','H70000009');
+    $supplierId=$f7InsertSupplier($db,'MULTI CAT F7',null,null,'B70000009');
+    try{
+        $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityId,$supplierId,'Categoria Uno','manual','x']);
+        $violated=false;
+        try{$db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityId,$supplierId,'Categoria Dos','manual','x']);}
+        catch(\PDOException $e){$violated=str_contains($e->getMessage(),'uq_community_supplier_pair');}
+        $assert($violated,'una segunda categoría para el mismo par ya no debe poder insertarse en absoluto, por ningún camino: la constraint debe rechazarla');
+        $count=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
+        $assert($count===1,'solo debe quedar la primera fila: '.$count);
+        // El código de 'multiple_existing_categories' en CommunitySupplierAutoLinker se conserva
+        // como defensa histórica (p. ej. un entorno donde esta migración de esquema aún no se
+        // haya aplicado) pero, con la constraint puesta, ya no es un estado alcanzable — no hay
+        // forma de construir el fixture sin desactivar la propia protección que se está probando.
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — fallo real de DB (violación de FK): rollback completo, inserted=false, reason=insert_failed, error visible, sin excepción escapando',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $linker=new Salvest\CommunitySupplierAutoLinker($db);
+    $result=$linker->linkIfMissing(999999999,999999999,'Fase7 Test','x'); // ids inexistentes -> viola fk_cs_community/fk_cs_supplier
+    $assert($result['inserted']===false && $result['reason']==='insert_failed' && $result['error']!==null,'debe reportar el fallo real, nunca ocultarlo: '.json_encode($result));
+    $mysqlSchemaCleanup($ctx);
+});
+
+$test('Fase 7 — traza community_supplier_auto_link: incluida cuando se inserta, con community_id/supplier_id/category/inserted/reason',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Trace');
+    $communityId=$f7InsertCommunity($db,'F7TRACE','H70000010');
+    $supplierId=$f7InsertSupplier($db,'TRACE F7',null,$serviceId,'B70000010');
+    try{
+        $trace=[];
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router->route(['proveedor'=>'TRACE F7','proveedor_cif'=>'B70000010','comunidad_cif'=>'H70000010','tipo_servicio'=>''],'facturas@x.example','',null,
+            function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
+        $step=null;foreach($trace as $s)if($s[0]==='community_supplier_auto_link')$step=$s;
+        $assert($step!==null,'debe existir el evento de traza community_supplier_auto_link: '.json_encode($trace));
+        $assert($step[1]==='inserted' && $step[2]['community_id']===$communityId && $step[2]['supplier_id']===$supplierId && $step[2]['inserted']===true && $step[2]['reason']==='missing_relation',json_encode($step));
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — no autolink desde el camino comunitario: si resolveSupplierInCommunity() resuelve directamente, auto_link no aparece en absoluto en la evidencia',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'YaComunidad');
+    $communityId=$f7InsertCommunity($db,'F7COM','H70000011');
+    $supplierId=$f7InsertSupplier($db,'YA EN COMUNIDAD F7',null,$serviceId,null);
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityId,$supplierId,'X','manual','x']);
+    try{
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $route=$router->route(['proveedor'=>'YA EN COMUNIDAD F7','proveedor_cif'=>'','comunidad_cif'=>'H70000011','tipo_servicio'=>''],'facturas@x.example');
+        $assert(!isset($route['evidence']['supplier']['auto_link']),'auto_link solo debe aparecer en la rama global — un supplier resuelto en comunidad no debe llevarlo: '.json_encode($route['evidence']['supplier']));
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — no crea suppliers ni communities: recuentos idénticos antes/después de todo el flujo de autolink',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'NoCrea');
+    $communityId=$f7InsertCommunity($db,'F7NOCREA','H70000012');
+    $supplierId=$f7InsertSupplier($db,'NO CREA F7',null,$serviceId,'B70000012');
+    try{
+        $suppliersBefore=(int)$db->one('SELECT COUNT(*) n FROM suppliers')['n'];
+        $communitiesBefore=(int)$db->one('SELECT COUNT(*) n FROM communities')['n'];
+        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router->route(['proveedor'=>'NO CREA F7','proveedor_cif'=>'B70000012','comunidad_cif'=>'H70000012','tipo_servicio'=>''],'facturas@x.example');
+        $assert((int)$db->one('SELECT COUNT(*) n FROM suppliers')['n']===$suppliersBefore,'autolink nunca debe crear suppliers');
+        $assert((int)$db->one('SELECT COUNT(*) n FROM communities')['n']===$communitiesBefore,'autolink nunca debe crear communities');
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — concurrencia REAL (dos procesos PHP con conexiones MySQL independientes, no dos llamadas secuenciales): estado inicial 0, dos intentos concurrentes con categorías DISTINTAS -> exactamente 1 relación final',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $serviceId=$f7Service($db,'Concurrencia');
+    $communityId=$f7InsertCommunity($db,'F7CONC','H70000099');
+    $supplierId=$f7InsertSupplier($db,'CONC F7',null,$serviceId,'B70000099');
+    try{
+        $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
+        $assert($before===0,'precondición: sin relación previa');
+
+        // Script real que un proceso PHP independiente ejecuta contra su PROPIA conexión MySQL,
+        // llamando al código de producción tal cual (Salvest\CommunitySupplierAutoLinker), no una
+        // reimplementación. Dos procesos = dos conexiones = dos transacciones reales.
+        $racerPath=sys_get_temp_dir().'/salvest-f7-racer-'.bin2hex(random_bytes(4)).'.php';
+        file_put_contents($racerPath,'<?php
+declare(strict_types=1);
+require "'.dirname(__DIR__).'/src/Database.php";
+require "'.dirname(__DIR__).'/src/CommunitySupplierAutoLinker.php";
+$db=new Salvest\Database(["host"=>"127.0.0.1","port"=>33306,"name"=>"salvest_test","user"=>"salvest","password"=>"test-password","charset"=>"utf8mb4"]);
+$linker=new Salvest\CommunitySupplierAutoLinker($db);
+$result=$linker->linkIfMissing((int)$argv[1],(int)$argv[2],$argv[3],"CONC TEST");
+echo json_encode($result);
+');
+        $spawn=static function(string $category)use($racerPath,$communityId,$supplierId):array{
+            $descriptors=[1=>['pipe','w'],2=>['pipe','w']];
+            $process=proc_open([PHP_BINARY,$racerPath,(string)$communityId,(string)$supplierId,$category],$descriptors,$pipes);
+            return ['process'=>$process,'pipes'=>$pipes];
+        };
+        // Ambos procesos se lanzan antes de leer ninguna salida, para que corran solapados de verdad.
+        $p1=$spawn('AGUA CONC');
+        $p2=$spawn('OTROS CONC');
+        $out1=stream_get_contents($p1['pipes'][1]);$err1=stream_get_contents($p1['pipes'][2]);
+        $out2=stream_get_contents($p2['pipes'][1]);$err2=stream_get_contents($p2['pipes'][2]);
+        foreach([$p1,$p2] as $p){fclose($p['pipes'][1]);fclose($p['pipes'][2]);proc_close($p['process']);}
+        @unlink($racerPath);
+
+        $r1=json_decode($out1,true);$r2=json_decode($out2,true);
+        $assert(is_array($r1) && is_array($r2),'ambos procesos deben devolver un resultado válido: out1='.$out1.' err1='.$err1.' out2='.$out2.' err2='.$err2);
+        $assert($r1['reason']!=='insert_failed' && $r2['reason']!=='insert_failed','ningún proceso debe reportar un fallo de DB bajo esta concurrencia (ver historial de fixes en el docblock de la clase): '.json_encode([$r1,$r2]));
+        $insertedCount=(int)$r1['inserted']+(int)$r2['inserted'];
+        $assert($insertedCount===1,'exactamente uno de los dos procesos debe haber insertado, el otro debe reconocer que ya existía: '.json_encode([$r1,$r2]));
+
+        $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
+        $assert($after===1,'estado final debe ser EXACTAMENTE 1 relación, nunca 2, pese a las categorías distintas: '.$after);
+    }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
+});
+
+$test('Fase 7 — el error SQL completo de un fallo de autolink nunca llega a la traza/decision_json (guarda de regresión de código): InvoiceRouter.php no referencia linkResult[\'error\'] en ningún punto',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/InvoiceRouter.php');
+    $assert(substr_count($source,"\$trace('community_supplier_auto_link'")===2,'deben existir las 2 llamadas de traza esperadas (insertado/omitido y sin servicio maestro)');
+    // $linkResult es el único lugar de todo el fichero donde el resultado de
+    // CommunitySupplierAutoLinker (que sí guarda el mensaje SQL completo, pero solo para
+    // error_log()) está disponible. Si alguna vez alguien reenvía linkResult[\'error\'] hacia el
+    // trace/decision_json, este test debe fallar.
+    $assert(!str_contains($source,"linkResult['error']") && !str_contains($source,'linkResult["error"]'),'InvoiceRouter no debe leer/reenviar linkResult[\'error\'] en ningún punto — el detalle técnico de BD se queda en error_log()');
+    $assert(str_contains($source,"\$linkResult['reason']"),'sí debe reenviar la razón (segura, sin detalle de BD)');
 });
 
 $failed=0;

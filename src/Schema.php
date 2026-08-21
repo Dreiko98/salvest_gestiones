@@ -27,6 +27,16 @@ final class Schema
         self::index($database,'processed_messages','idx_processed_messages_message_id','message_id_header');
         self::mailboxBaselineMigration($database);
         self::supplierMasterDataScaffolding($database);
+        // Fase 7: la invariante real del negocio es "una única relación lógica por
+        // (community_id, supplier_id)", pero el UNIQUE original de 3 columnas
+        // (community_id, supplier_id, category) no la garantiza — un SELECT ... FOR UPDATE sobre
+        // ese prefijo de 2 columnas no bloquea de forma fiable la inserción concurrente de dos
+        // categorías distintas para la misma pareja (verificado empíricamente: produce un
+        // deadlock real bajo carrera, no una serialización limpia). Confirmado por auditoría de
+        // solo lectura que las 292 relaciones reales de producción ya cumplen esta invariante
+        // (0 parejas con COUNT(*)>1), así que añadirla ahora es seguro. Se conserva el índice de
+        // 3 columnas ya existente (queda redundante pero inofensivo) para minimizar el cambio.
+        self::uniqueIndex($database,'community_suppliers','uq_community_supplier_pair','community_id,supplier_id');
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0002_real_drive_structure')");
     }

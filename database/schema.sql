@@ -136,6 +136,11 @@ CREATE TABLE IF NOT EXISTS community_suppliers (
   raw_provider_name VARCHAR(255) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uq_community_supplier_category (community_id,supplier_id,category),
+  -- Fase 7: la invariante real es "una relación por community_id+supplier_id", no por la
+  -- tripleta con category — ver Schema.php para el porqué (verificado empíricamente con un
+  -- test de dos conexiones concurrentes). Redundante junto al UNIQUE de 3 columnas de arriba
+  -- (toda fila que cumpla esta también cumple aquella), pero es la que de verdad protege.
+  UNIQUE KEY uq_community_supplier_pair (community_id,supplier_id),
   INDEX idx_cs_community (community_id),
   CONSTRAINT fk_cs_community FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE,
   CONSTRAINT fk_cs_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE

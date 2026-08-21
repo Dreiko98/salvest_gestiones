@@ -16,7 +16,12 @@ namespace Salvest;
  */
 final class InvoiceRouter
 {
-    public function __construct(private Classifier $classifier){}
+    /** @param ?CommunitySupplierAutoLinker $autoLinker Fase 7: optional on purpose — null (the
+     * default) keeps every existing single-argument `new InvoiceRouter($classifier)` call
+     * (every test, and any future caller that doesn't care about autolink) working exactly as
+     * before, with autolink simply never attempted. Worker.php is the only real caller that
+     * wires a real one. */
+    public function __construct(private Classifier $classifier,private ?CommunitySupplierAutoLinker $autoLinker=null){}
 
     /**
      * @param array<string,mixed> $invoice
@@ -37,7 +42,7 @@ final class InvoiceRouter
         $community=$decision['community'];
         $rawSupplierName=trim((string)($invoice['proveedor']??''));
 
-        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;$supplierAmbiguous=false;$globalSupplierNeedsService=false;
+        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;$supplierAmbiguous=false;$globalSupplierNeedsService=false;$autoLinked=false;
 
         if($community){
             $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender,$trace);
@@ -101,11 +106,35 @@ final class InvoiceRouter
                         // invoice still goes to needs_review — never a silently invented category,
                         // never "Otros".
                         $hasConfiguredService=!empty($supplier['service_type_name']);
-                        $hasOpenAiServiceHint=trim((string)($invoice['tipo_servicio']??''))!=='';
-                        if(!$hasConfiguredService&&!$hasOpenAiServiceHint){
-                            $globalSupplierNeedsService=true;
-                            $reason='Proveedor reconocido globalmente, pero no se pudo determinar un servicio seguro.';
+                        if($hasConfiguredService){
+                            // Fase 7: this is the ONLY branch autolink is ever attempted from —
+                            // global source, unambiguous (the ambiguous branch above already
+                            // returned), active supplier (Classifier never returns an inactive
+                            // one), and a real master-configured service to use as category.
+                            // Never based on OpenAI's tipo_servicio guess, on purpose.
+                            if($this->autoLinker!==null){
+                                $rawForRelation=$rawSupplierName!==''?$rawSupplierName:((string)($supplier['name']??'')?:(string)$supplier['official_name']);
+                                $linkResult=$this->autoLinker->linkIfMissing((int)$community['id'],(int)$supplier['id'],(string)$supplier['service_type_name'],$rawForRelation);
+                                $autoLinked=$linkResult['inserted'];
+                                if($trace)$trace('community_supplier_auto_link',$autoLinked?'inserted':'skipped',[
+                                    'community_id'=>(int)$community['id'],'supplier_id'=>(int)$supplier['id'],
+                                    'category'=>(string)$supplier['service_type_name'],'inserted'=>$autoLinked,'reason'=>$linkResult['reason'],
+                                ]);
+                            }
+                        }else{
+                            $hasOpenAiServiceHint=trim((string)($invoice['tipo_servicio']??''))!=='';
+                            if(!$hasOpenAiServiceHint){
+                                $globalSupplierNeedsService=true;
+                                $reason='Proveedor reconocido globalmente, pero no se pudo determinar un servicio seguro.';
+                            }
+                            // No master service configured -> never autolink, regardless of
+                            // whether an OpenAI hint let this specific invoice classify anyway.
+                            // A one-off suggestion is never promoted into a permanent relation.
+                            if($trace)$trace('community_supplier_auto_link','skipped',[
+                                'community_id'=>(int)$community['id'],'supplier_id'=>(int)$supplier['id'],'reason'=>'no_master_service',
+                            ]);
                         }
+                        $supplierEvidence['auto_link']=$autoLinked;
                     }
                     // Else: genuinely unresolved (supplier=null, ambiguous=false) — needs_review,
                     // exactly as before, no reason invented, nothing created.

@@ -17,7 +17,7 @@ final class Worker
     {
         $this->parser = new MimeParser();
         $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
-        $this->router = new InvoiceRouter($this->classifier);
+        $this->router = new InvoiceRouter($this->classifier, new CommunitySupplierAutoLinker($db));
         $this->archiver = new Archiver((string)$config['processing']['storage_root']);
         if((bool)($config['google_drive']['enabled']??false)){
             $tokens=new GoogleUserOAuthProvider((string)$config['google_drive']['oauth_client_file'],(string)$config['google_drive']['oauth_token_file']);

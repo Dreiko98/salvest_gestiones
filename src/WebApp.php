@@ -589,9 +589,9 @@ final class WebApp
         if($traceJson===null||$traceJson==='')return $unavailable;
         $steps=json_decode($traceJson,true);
         if(!is_array($steps)||!$steps)return $unavailable;
-        $labels=['document'=>'Documento recibido','openai_request'=>'1ª llamada OpenAI','openai_response'=>'Respuesta OpenAI',
+        $labels=['document'=>'Documento recibido','openai_request'=>'1ª llamada IA','openai_response'=>'Respuesta IA',
             'community_resolution'=>'Resolución de comunidad','supplier_resolution'=>'Resolución de proveedor',
-            'service_resolution'=>'Resolución de servicio','restricted_openai'=>'2ª llamada OpenAI (restringida)',
+            'service_resolution'=>'Resolución de servicio','restricted_openai'=>'2ª llamada IA (restringida)',
             'final_decision'=>'Decisión final'];
         $items='';
         foreach($steps as $step){
@@ -615,11 +615,11 @@ final class WebApp
         return match($kind){
             'document'=>$v($data['filename']??null).' · '.$v($data['mime']??null).' · '.$v($data['size_bytes']??null).' bytes',
             'openai_request'=>'modelo='.$v($data['model']??null).', reasoning='.$v($data['reasoning']??null),
-            'openai_response'=>$v($data['latency_ms']??null).' ms · '.$v($data['input_tokens']??null).' in / '.$v($data['output_tokens']??null).' out tokens',
+            'openai_response'=>$v($data['provider']??null).' · '.$v($data['latency_ms']??null).' ms · '.$v($data['input_tokens']??null).' in / '.$v($data['output_tokens']??null).' out tokens',
             'community_resolution'=>$v($data['official_name']??'sin resolver').' ('.$evidence($data['evidence']??null).')',
             'supplier_resolution'=>$v($data['supplier_name']??'sin resolver').' ('.$evidence($data['evidence']??null).'), ambiguo='.(($data['ambiguous']??false)?'sí':'no'),
             'service_resolution'=>$v($data['final_service']??null).' ('.$evidence($data['evidence']??null).')',
-            'restricted_openai'=>'supplier_id devuelto='.$v($data['chosen_supplier_id']??null).', validado='.(($data['validated']??false)?'sí':'no'),
+            'restricted_openai'=>'supplier_id devuelto='.$v($data['chosen_supplier_id']??null).', validado='.(($data['validated']??false)?'sí':'no').', proveedor='.$v($data['provider']??null),
             'final_decision'=>$v($data['status']??null).(!empty($data['reason'])?' — '.$v($data['reason']):''),
             default=>'',
         };

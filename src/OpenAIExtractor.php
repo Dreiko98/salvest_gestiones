@@ -12,7 +12,7 @@ namespace Salvest;
  * the resolved community, the model may pick one of them (or null) — it can never propose a
  * supplier outside that list.
  */
-final class OpenAIExtractor
+final class OpenAIExtractor implements ExtractorProvider
 {
     public const VERSION = 'openai-php-v1';
     public int $inputTokens = 0;
@@ -21,8 +21,16 @@ final class OpenAIExtractor
     /** @param array<string,mixed> $config */
     public function __construct(private array $config) {}
 
-    /** @return array<string,mixed> */
-    public function extract(string $path, string $mimeType, string $context): array
+    /** Fase 8: identifies this provider for FallbackExtractor/Worker — 'openai-php-v1' when
+     * OpenAI serves a call (as primary, or as the fallback behind Claude). */
+    public function version(): string { return self::VERSION; }
+
+    /** $reasoningEffort defaults to 'low' — production's actual, current behaviour, unchanged
+     * for every existing caller. The parameter exists so bin/compare-models.php can isolate the
+     * effect of raising reasoning effort from the effect of switching model, without forking
+     * this method or duplicating the prompt/schema.
+     * @return array<string,mixed> */
+    public function extract(string $path, string $mimeType, string $context, string $reasoningEffort = 'low'): array
     {
         $document = self::documentInput($path, $mimeType);
         $fields = [
@@ -37,7 +45,7 @@ final class OpenAIExtractor
         $payload = [
             'model'=>$this->config['model'],
             'instructions'=>"Extrae los datos de la factura sin inventar. El campo proveedor es el nombre tal cual aparece en el documento — no confirmes ni valides contra ningún maestro, solo transcribe lo que ves. tipo_servicio debe ser una categoría breve en minúsculas. fecha_factura usa AAAA-MM-DD. importe es el total numérico. Usa null cuando no aparezca un valor. No propongas IDs internos.",
-            'reasoning'=>['effort'=>'low'],
+            'reasoning'=>['effort'=>$reasoningEffort],
             'input'=>[['role'=>'user','content'=>[$document,['type'=>'input_text','text'=>'Extrae los campos requeridos. Contexto del correo: '.mb_substr($context,0,12000)]]]],
             'text'=>['format'=>['type'=>'json_schema','name'=>'invoice_extraction','strict'=>true,
                 'schema'=>['type'=>'object','properties'=>$properties,'required'=>$fields,'additionalProperties'=>false]]],

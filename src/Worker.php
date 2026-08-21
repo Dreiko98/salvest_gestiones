@@ -13,7 +13,7 @@ final class Worker
 
     /** @param array<string,mixed> $config */
     public function __construct(private Database $db, private Crypto $crypto,
-        private OpenAIExtractor $extractor, private array $config)
+        private ExtractorProvider $extractor, private array $config)
     {
         $this->parser = new MimeParser();
         $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
@@ -25,11 +25,17 @@ final class Worker
         }
     }
 
-    /** Builds a Worker exactly the way every entry point (cron, CLI, manual button) needs it,
-     * so none of them has to repeat the Crypto/OpenAIExtractor wiring by hand. */
+    /** Builds a Worker exactly the way every entry point (cron, CLI, manual button) needs it, so
+     * none of them has to repeat the Crypto/extractor wiring by hand — and, critically, so all
+     * three stay in sync on which extractor is actually used: this is the ONLY place that wires
+     * Claude/OpenAI, so a future extractor change never risks updating some entry points and
+     * missing others. Fase 8: Claude is the primary extractor, OpenAI the automatic fallback for
+     * any call Claude's own client throws on — see FallbackExtractor's docblock. */
     public static function create(Database $db, array $config): self
     {
-        return new self($db, new Crypto((string)$config['app']['encryption_key']), new OpenAIExtractor($config['openai']), $config);
+        $primary = new ClaudeExtractor($config['anthropic']);
+        $fallback = new OpenAIExtractor($config['openai']);
+        return new self($db, new Crypto((string)$config['app']['encryption_key']), new FallbackExtractor($primary, $fallback), $config);
     }
 
     /**
@@ -232,13 +238,14 @@ final class Worker
         $trace = new ReviewTrace();
         $trace->add('document',['filename'=>$attachment['original_filename'],'mime'=>$attachment['mime_type'],'size_bytes'=>$attachment['size'],'sha256'=>$attachment['sha256']]);
 
-        $trace->add('openai_request',['model'=>$this->config['openai']['model']??null,'reasoning'=>'low']);
+        $trace->add('openai_request',['model'=>$this->config['anthropic']['model']??null,'reasoning'=>'low']);
         $tokensBefore=['in'=>$this->extractor->inputTokens,'out'=>$this->extractor->outputTokens];
         $started=microtime(true);
         $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
+        $extractorVersion=$this->extractor->version();
         $trace->add('openai_response',['latency_ms'=>(int)round((microtime(true)-$started)*1000),
             'input_tokens'=>$this->extractor->inputTokens-$tokensBefore['in'],'output_tokens'=>$this->extractor->outputTokens-$tokensBefore['out'],
-            'response'=>$invoice]);
+            'provider'=>$extractorVersion,'response'=>$invoice]);
         $openAiServiceRaw=$invoice['tipo_servicio']??null;
 
         // Debug-only observer for Classifier's tier-by-tier reasoning — never influences the
@@ -281,8 +288,9 @@ final class Worker
         $trace->add('service_resolution',['openai_service'=>$openAiServiceRaw,'suppliers_main_service_type'=>$supplier['service_type_name']??null,
             'community_suppliers_category'=>$supplier['category']??null,'final_service'=>$route['service'],'evidence'=>$route['evidence']['service']]);
         if($restrictedCalled){
-            $trace->add('restricted_openai',['model'=>$this->config['openai']['model']??null,'reasoning'=>'medium',
+            $trace->add('restricted_openai',['model'=>$this->config['anthropic']['model']??null,'reasoning'=>'medium',
                 'candidates_sent'=>$restrictedCandidates,'response'=>$restrictedResponse,'chosen_supplier_id'=>$restrictedChosen,
+                'provider'=>$this->extractor->version(),
                 'validated'=>($route['evidence']['supplier']['type']??null)==='restricted_openai_retry']);
         }
         $blockingFactor=$status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null);
@@ -307,7 +315,7 @@ final class Worker
             'proveedor'=>$supplier?$supplier['official_name']:null,'raw_supplier_name'=>$route['raw_supplier_name'],
             'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),
             'decision_json'=>json_encode($decisionTrace,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
-            'error_message'=>$route['reason'],'debug_trace_json'=>$debugTraceJson,
+            'error_message'=>$route['reason'],'debug_trace_json'=>$debugTraceJson,'extractor_version'=>$extractorVersion,
             'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
         $counts[$status === 'needs_review' ? 'needs_review' : ($status === 'classified' ? 'classified' : 'unclassified')]++;
@@ -329,7 +337,7 @@ final class Worker
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
             $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,$data['debug_trace_json']??null,
-            $data['error_message']??null,OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
+            $data['error_message']??null,$data['extractor_version']??OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
         ]);
     }
 

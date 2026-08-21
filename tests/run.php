@@ -67,6 +67,7 @@ $sqliteDbWithLock=static function(string $lockBehavior='always-free')use($worker
 };
 $workerConfig=static fn():array=>['app'=>['base_url'=>'http://127.0.0.1','timezone'=>'Europe/Madrid','session_name'=>'salvest_test_'.bin2hex(random_bytes(4)),
     'secret_key'=>'test-secret','encryption_key'=>Salvest\Crypto::generateKey(),'cron_token'=>'test','cookie_secure'=>false],
+    'anthropic'=>['api_key'=>'test-key','model'=>'claude-test','timeout_seconds'=>5],
     'openai'=>['api_key'=>'test-key','model'=>'gpt-test','timeout_seconds'=>5],
     'imap'=>['default_host'=>'imap.ionos.es','default_port'=>993,'timeout_seconds'=>5,'max_messages_per_mailbox'=>5],
     'processing'=>['classification_threshold'=>92.0,'max_attachment_bytes'=>1000000,'storage_root'=>sys_get_temp_dir(),'incoming_root'=>sys_get_temp_dir()],
@@ -3264,6 +3265,124 @@ $test('Fase 7 — el error SQL completo de un fallo de autolink nunca llega a la
     // trace/decision_json, este test debe fallar.
     $assert(!str_contains($source,"linkResult['error']") && !str_contains($source,'linkResult["error"]'),'InvoiceRouter no debe leer/reenviar linkResult[\'error\'] en ningún punto — el detalle técnico de BD se queda en error_log()');
     $assert(str_contains($source,"\$linkResult['reason']"),'sí debe reenviar la razón (segura, sin detalle de BD)');
+});
+
+// ============================================================================================
+// Fase 8 — Claude como extractor primario, OpenAI como fallback automático.
+// ============================================================================================
+
+/** Stub mínimo de ExtractorProvider para probar FallbackExtractor sin red real — igual de
+ * inyectable que OpenAIExtractor/ClaudeExtractor porque implementa el mismo contrato. */
+$stubExtractor=static function(?string $throwMessage,array $extractReturn=[],?int $resolveReturn=null,int $inTokens=10,int $outTokens=5,string $version='stub-v1'):Salvest\ExtractorProvider{
+    return new class($throwMessage,$extractReturn,$resolveReturn,$inTokens,$outTokens,$version) implements Salvest\ExtractorProvider{
+        public int $inputTokens=0;public int $outputTokens=0;public int $extractCalls=0;public int $resolveCalls=0;
+        public function __construct(private ?string $throwMessage,private array $extractReturn,private ?int $resolveReturn,private int $inTokens,private int $outTokens,private string $ver){}
+        public function version():string{return $this->ver;}
+        public function extract(string $path,string $mimeType,string $context,string $reasoningEffort='low'):array{
+            $this->extractCalls++;
+            if($this->throwMessage!==null)throw new \RuntimeException($this->throwMessage);
+            $this->inputTokens+=$this->inTokens;$this->outputTokens+=$this->outTokens;
+            return $this->extractReturn;
+        }
+        public function resolveSupplierAmongCandidates(string $path,string $mimeType,string $context,string $communityName,array $candidates):?int{
+            $this->resolveCalls++;
+            if($this->throwMessage!==null)throw new \RuntimeException($this->throwMessage);
+            $this->inputTokens+=$this->inTokens;$this->outputTokens+=$this->outTokens;
+            return $this->resolveReturn;
+        }
+    };
+};
+
+$test('Fase 8 — FallbackExtractor: primario (Claude) responde bien -> nunca se llama al fallback (OpenAI), version() refleja el primario',static function()use($assert,$stubExtractor):void{
+    $primary=$stubExtractor(null,['proveedor'=>'FACSA'],null,100,50,'claude-sonnet-5-v1');
+    $fallback=$stubExtractor('nunca debería llamarse');
+    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
+    $invoice=$extractor->extract('/tmp/x.pdf','application/pdf','ctx');
+    $assert($invoice==['proveedor'=>'FACSA'],'debe devolver exactamente lo que devolvió el primario');
+    $assert($extractor->version()==='claude-sonnet-5-v1','version() debe ser la del primario tras un éxito');
+    $assert($extractor->inputTokens===100&&$extractor->outputTokens===50,'los tokens deben ser los del primario únicamente');
+});
+
+$test('Fase 8 — FallbackExtractor: el primario (Claude) falla -> cae automáticamente al fallback (OpenAI), version() refleja el fallback, y no se propaga la excepción del primario',static function()use($assert,$stubExtractor):void{
+    $primary=$stubExtractor('Claude respondió HTTP 529: overloaded');
+    $fallback=$stubExtractor(null,['proveedor'=>'PROFOC'],null,20,10,'openai-php-v1');
+    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
+    $invoice=$extractor->extract('/tmp/x.pdf','application/pdf','ctx');
+    $assert($invoice==['proveedor'=>'PROFOC'],'debe devolver lo que devolvió el fallback, no el error del primario');
+    $assert($extractor->version()==='openai-php-v1','version() debe reflejar el proveedor que realmente sirvió la llamada (el fallback)');
+});
+
+$test('Fase 8 — FallbackExtractor: tokens = suma de ambos proveedores tras varias llamadas con caída intermitente del primario',static function()use($assert,$stubExtractor):void{
+    // Primario falla siempre en este test -> cada llamada consume tokens SOLO del fallback (el
+    // primario nunca llega a gastar tokens porque lanza antes de acumular ninguno).
+    $primary=$stubExtractor('caído');
+    $fallback=$stubExtractor(null,['proveedor'=>'X'],null,7,3,'openai-php-v1');
+    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
+    $extractor->extract('/a.pdf','application/pdf','ctx');
+    $extractor->extract('/b.pdf','application/pdf','ctx');
+    $assert($extractor->inputTokens===14&&$extractor->outputTokens===6,'debe acumular los tokens reales del fallback en cada llamada (2x7 in, 2x3 out)');
+});
+
+$test('Fase 8 — FallbackExtractor: si AMBOS proveedores fallan, propaga la excepción del fallback (mismo modo de fallo que Worker ya maneja hoy)',static function()use($assert,$stubExtractor):void{
+    $primary=$stubExtractor('claude caído');
+    $fallback=$stubExtractor('openai también caído');
+    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
+    $threw=null;
+    try{$extractor->extract('/x.pdf','application/pdf','ctx');}catch(\Throwable $e){$threw=$e->getMessage();}
+    $assert($threw==='openai también caído','debe propagar el error del fallback (el último intento real), no el del primario');
+});
+
+$test('Fase 8 — FallbackExtractor: mismo comportamiento de caída para resolveSupplierAmongCandidates() (segunda llamada restringida)',static function()use($assert,$stubExtractor):void{
+    $primary=$stubExtractor('claude caído',[],null);
+    $fallback=$stubExtractor(null,[],42,5,2,'openai-php-v1');
+    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
+    $chosen=$extractor->resolveSupplierAmongCandidates('/x.pdf','application/pdf','ctx','Comunidad X',[['id'=>42,'official_name'=>'Y']]);
+    $assert($chosen===42,'debe devolver el id elegido por el fallback');
+    $assert($extractor->version()==='openai-php-v1','version() también debe actualizarse para la llamada restringida');
+});
+
+$test('Fase 8 — ClaudeExtractor/OpenAIExtractor: ambos implementan ExtractorProvider y version() devuelve su propia constante VERSION',static function()use($assert):void{
+    $claude=new Salvest\ClaudeExtractor(['api_key'=>'test','model'=>'claude-sonnet-5','timeout_seconds'=>5]);
+    $openai=new Salvest\OpenAIExtractor(['api_key'=>'test','model'=>'gpt-test','timeout_seconds'=>5]);
+    $assert($claude instanceof Salvest\ExtractorProvider,'ClaudeExtractor debe implementar ExtractorProvider');
+    $assert($openai instanceof Salvest\ExtractorProvider,'OpenAIExtractor debe implementar ExtractorProvider');
+    $assert($claude->version()===Salvest\ClaudeExtractor::VERSION,'version() de Claude debe ser su propia constante');
+    $assert($openai->version()===Salvest\OpenAIExtractor::VERSION,'version() de OpenAI debe ser su propia constante (comportamiento preexistente, sin cambios)');
+});
+
+$test('Fase 8 — ClaudeExtractor: llama al endpoint/modelo/esquema correctos de Anthropic (inspección de código, mismo estilo que OpenAIExtractor nunca se prueba contra red real)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/ClaudeExtractor.php');
+    $assert(str_contains($source,'https://api.anthropic.com/v1/messages'),'debe apuntar al endpoint real de Anthropic Messages API');
+    $assert(str_contains($source,"'x-api-key: '"),'debe autenticar con el header x-api-key, no Bearer (formato distinto de OpenAI)');
+    $assert(str_contains($source,'anthropic-version'),'debe fijar la cabecera anthropic-version requerida por la API');
+    $assert(str_contains($source,"'tool_choice'"),'debe forzar tool-use (Claude no tiene json_schema strict como OpenAI)');
+    $assert(str_contains($source,"'model' => \$this->config['model']"),'el modelo debe venir de config, nunca hardcodeado');
+});
+
+$test('Fase 8 — Worker::create() conecta Claude como primario y OpenAI como fallback -> el extractor real es un FallbackExtractor (inspección por reflexión, sin red)',static function()use($assert,$sqliteDbWithLock,$workerConfig):void{
+    $db=$sqliteDbWithLock();
+    $worker=Salvest\Worker::create($db,$workerConfig());
+    $reflection=new ReflectionProperty(Salvest\Worker::class,'extractor');$reflection->setAccessible(true);
+    $extractor=$reflection->getValue($worker);
+    $assert($extractor instanceof Salvest\FallbackExtractor,'Worker::create() debe construir un FallbackExtractor, no un extractor suelto');
+    $primaryReflection=new ReflectionProperty(Salvest\FallbackExtractor::class,'primary');$primaryReflection->setAccessible(true);
+    $fallbackReflection=new ReflectionProperty(Salvest\FallbackExtractor::class,'fallback');$fallbackReflection->setAccessible(true);
+    $assert($primaryReflection->getValue($extractor) instanceof Salvest\ClaudeExtractor,'el primario debe ser Claude');
+    $assert($fallbackReflection->getValue($extractor) instanceof Salvest\OpenAIExtractor,'el fallback debe ser OpenAI');
+});
+
+$test('Fase 8 — cron.php y bin/worker.php usan Worker::create() (fuente única de verdad de qué extractor se usa), no construyen OpenAIExtractor a mano (guarda de regresión de código)',static function()use($assert):void{
+    foreach(['public/cron.php','bin/worker.php'] as $file){
+        $source=file_get_contents(__DIR__.'/../'.$file);
+        $assert(str_contains($source,'Worker::create('),"$file debe llamar a Worker::create(), no construir Worker a mano");
+        $assert(!str_contains($source,'new Salvest\Worker('),"$file no debe instanciar Worker directamente — así nunca puede quedarse con el wiring antiguo (solo OpenAI)");
+    }
+});
+
+$test('Fase 8 — processed_attachments.extractor_version refleja el proveedor real que sirvió cada factura, no un valor fijo (inspección de código): Worker.php ya no hardcodea OpenAIExtractor::VERSION en el INSERT',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert(str_contains($source,"\$data['extractor_version']??OpenAIExtractor::VERSION"),'debe usar el extractor_version real de la llamada, con la constante de OpenAI solo como valor por defecto antes de la extracción');
+    $assert(str_contains($source,'$extractorVersion=$this->extractor->version()'),'debe capturar version() justo después de la llamada real a extract()');
 });
 
 $failed=0;

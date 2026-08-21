@@ -653,7 +653,7 @@ $test('caso Iberdrola: MySQL corrige el "Agua" incorrecto de OpenAI usando CIF t
     $assert($route['evidence']['service']['field']==='supplier_main_service_type','el servicio debe venir del tipo configurado del proveedor, no de la sugerencia de OpenAI');
     $assert($route['reason']===null,'un caso correctamente asociado no debe llevar motivo de revisión');
 });
-$test('proveedor reconocido pero no asociado a la comunidad: va a revisión, no se fuerza el archivado',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — proveedor reconocido globalmente pero no asociado a la comunidad: clasifica con el fallback global, sin crear ninguna relación community_suppliers',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['30','CP TREINTA',Salvest\Text::normalize('CP TREINTA'),'H99999999','Calle Treinta','46030','Valencia','30 - CP TREINTA']);
@@ -663,11 +663,16 @@ $test('proveedor reconocido pero no asociado a la comunidad: va a revisión, no 
     $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
         ['IBERDROLA CLIENTES, S.A.U.',Salvest\Text::normalize('IBERDROLA CLIENTES, S.A.U.'),'A95758389',$serviceTypeId]);
     // Nótese: no hay fila en community_suppliers vinculando a este proveedor con esta comunidad.
+    $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>'A95758389','comunidad_cif'=>'H99999999','tipo_servicio'=>'agua'];
     $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
-    $assert($route['status']==='needs_review','un proveedor real pero no asociado nunca debe clasificarse automáticamente: '.json_encode($route));
-    $assert($route['supplier']===null,'no debe forzarse un proveedor no asociado a la comunidad resuelta');
-    $assert($route['reason']==='Proveedor reconocido pero no asociado a esta comunidad.','debe quedar el motivo exacto para el panel de revisión');
+    $assert($route['status']==='classified','Fase 6: un proveedor reconocido de forma inequívoca a nivel global debe clasificar, aunque no exista todavía community_suppliers: '.json_encode($route));
+    $assert($route['supplier']!==null && $route['supplier']['cif']==='A95758389','debe usarse el proveedor global resuelto');
+    $assert($route['evidence']['supplier']['source']==='global','la evidencia debe dejar constancia de que vino del fallback global, no de la comunidad');
+    $assert($route['service']==='ELECTRICIDAD','el servicio debe salir de supplier.main_service_type_id, con relation=null');
+    $assert($route['reason']===null,'una clasificación correcta no debe llevar motivo de revisión');
+    $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $assert($before===$after && $after===0,'Fase 6 NO debe crear ninguna relación community_suppliers — eso es Fase 7 (autolink): antes='.$before.' después='.$after);
 });
 
 /** Shared fixture: a community plus one supplier linked to it, no CIF anywhere unless given. */
@@ -2776,6 +2781,170 @@ $test('Fase 5 — trace: cuando resolveSupplier() global es ambiguo, la traza re
         function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
     $ambiguousStep=null;foreach($trace as $step)if($step[0]==='supplier_exact_name'&&$step[1]==='ambiguous')$ambiguousStep=$step;
     $assert($ambiguousStep!==null,'la traza debe mostrar explícitamente qué tier detectó la ambigüedad: '.json_encode($trace));
+});
+
+// ---- Fase 6: InvoiceRouter acepta el fallback global cuando la comunidad es real pero el
+// proveedor todavía no está en community_suppliers, sin crear ninguna relación nueva ----
+$test('Fase 6 — FACSA: comunidad conocida, FACSA no está en community_suppliers, resuelve globalmente por CIF, clasifica, 0 relaciones nuevas',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6A','CP FACSA','cp facsa','H11111111','x',1)");
+    $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Agua','agua',1)");
+    $serviceId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
+        ['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.',Salvest\Text::normalizeCompanyName('FACSA'),Salvest\Text::normalizeCompanyName('SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.'),'A12000022',$serviceId]);
+    $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'FACSA','proveedor_cif'=>'A12000022','comunidad_cif'=>'H11111111','tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $assert($route['status']==='classified' && $route['supplier']['cif']==='A12000022' && $route['service']==='Agua',json_encode($route));
+    $assert($route['evidence']['supplier']['source']==='global');
+    $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $assert($before===0 && $after===0,'0 relaciones nuevas: antes='.$before.' después='.$after);
+});
+$test('Fase 6 — PROFOC: proveedor extraído como la razón social completa, resuelve globalmente por official_name exacto',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6B','CP PROFOC','cp profoc','H22222222','x',1)");
+    $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Extintores','extintores',1)");
+    $serviceId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
+        ['PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',Salvest\Text::normalizeCompanyName('PROFOC'),Salvest\Text::normalizeCompanyName('GARCÍA MARÍN CONSULTORES, S.L.'),'B12802971',$serviceId]);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES S.L.','proveedor_cif'=>'B12802971','comunidad_cif'=>'H22222222','tipo_servicio'=>'desconocido'],'facturas@profoc.example');
+    $assert($route['status']==='classified' && $route['supplier']['name']==='PROFOC' && $route['evidence']['supplier']['source']==='global',json_encode($route));
+});
+$test('Fase 6 — EXTNCAS: alias global resuelve al target activo EXTINCAS, nunca al source inactivo, y clasifica',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6C','CP EXTINCAS','cp extincas','H33333333','x',1)");
+    $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Extintores','extintores',1)");
+    $serviceId=(int)$db->pdo()->lastInsertId();
+    $activeId=null;
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
+        ['EXTINCAS','EXTINTORES CASTELLÓN, S.L.',Salvest\Text::normalizeCompanyName('EXTINCAS'),Salvest\Text::normalizeCompanyName('EXTINTORES CASTELLÓN, S.L.'),'B12433314',$serviceId]);
+    $activeId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$activeId,'name','EXTNCAS',Salvest\Text::normalizeCompanyName('EXTNCAS')]);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,0)',['EXTNCAS','EXTNCAS',Salvest\Text::normalizeCompanyName('EXTNCAS'),null]); // source fusionado
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'EXTNCAS','proveedor_cif'=>'','comunidad_cif'=>'H33333333','tipo_servicio'=>'desconocido'],'facturas@extincas.example');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$activeId,'debe resolver al target activo, nunca al inactivo: '.json_encode($route));
+});
+$test('Fase 6 — ADRIAN TURCU: resuelve globalmente por CIF real (NIE X4153497L)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6D','CP ADRIAN','cp adrian','H44444444','x',1)");
+    $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Limpieza','limpieza',1)");
+    $serviceId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,1)',
+        ['ADRIAN TURCU','ADRIAN TURCU',Salvest\Text::normalizeCompanyName('ADRIAN TURCU'),'X4153497L',$serviceId]);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'X-4153497-L','comunidad_cif'=>'H44444444','tipo_servicio'=>'desconocido'],'facturas@adrian.example');
+    $assert($route['status']==='classified' && $route['supplier']['name']==='ADRIAN TURCU' && $route['evidence']['supplier']['type']==='exact',json_encode($route));
+});
+
+$test('Fase 6 — prioridad: si resolveSupplierInCommunity() ya resolvió, el fallback global ni se necesita (un duplicado global ambiguo no afecta al resultado)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6E','CP PRIORIDAD','cp prioridad','H55555555','x',1)");
+    $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Limpieza','limpieza',1)");
+    $serviceId=(int)$db->pdo()->lastInsertId();
+    $communityId=(int)$db->one("SELECT id FROM communities WHERE external_code='F6E'")['id'];
+    // Dos suppliers con el MISMO name — a nivel global esto sería ambiguo — pero solo uno está
+    // enlazado a esta comunidad, así que resolveSupplierInCommunity() lo encuentra sin ambigüedad
+    // (el segundo, con el mismo nombre, ni siquiera entra en su lista de candidatos).
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,main_service_type_id,active) VALUES (?,?,?,?,1)',['DUPLICADO','DUPLICADO EN COMUNIDAD, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO'),$serviceId]);
+    $inCommunityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$inCommunityId,'Limpieza']);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,main_service_type_id,active) VALUES (?,?,?,?,1)',['DUPLICADO','DUPLICADO EN OTRO SITIO, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO'),$serviceId]);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'DUPLICADO','proveedor_cif'=>'','comunidad_cif'=>'H55555555','tipo_servicio'=>'desconocido'],'facturas@dup.example');
+    $assert($route['status']==='classified' && (int)$route['supplier']['id']===$inCommunityId,'debe ganar el resultado de resolveSupplierInCommunity(), sin llegar nunca al fallback global: '.json_encode($route));
+    $assert(!isset($route['evidence']['supplier']['source']),'la evidencia no debe llevar source=global cuando resolvió en comunidad: '.json_encode($route['evidence']['supplier']));
+});
+
+$test('Fase 6 — ambigüedad global: comunidad conocida, sin match en comunidad, global ambiguo -> needs_review, 0 relaciones, traza explica el tier',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6F','CP AMBIGUO','cp ambiguo','H66666666','x',1)");
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['DUPLICADO GLOBAL','RAZÓN UNO, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO GLOBAL')]);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['DUPLICADO GLOBAL','RAZÓN DOS, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO GLOBAL')]);
+    $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $trace=[];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'DUPLICADO GLOBAL','proveedor_cif'=>'','comunidad_cif'=>'H66666666','tipo_servicio'=>'desconocido'],'facturas@dup.example',
+        '',null,function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
+    $assert($route['status']==='needs_review' && $route['supplier']===null && $route['supplier_ambiguous']===true,json_encode($route));
+    $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $assert($before===$after && $after===0,'ambigüedad global no debe crear ninguna relación');
+    $globalFallbackStep=null;foreach($trace as $step)if($step[0]==='supplier_global_fallback'&&$step[1]==='ambiguous')$globalFallbackStep=$step;
+    $assert($globalFallbackStep!==null,'la traza debe mostrar el tier real (anidado) que detectó la ambigüedad global: '.json_encode($trace));
+    $assert($globalFallbackStep[2]['tier']==='supplier_exact_name','el detalle debe indicar qué tier concreto fue ambiguo dentro del fallback global: '.json_encode($globalFallbackStep));
+});
+
+$test('Fase 6 — global unresolved: proveedor completamente desconocido -> needs_review, sin crear supplier ni relación',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6G','CP DESCONOCIDO','cp desconocido','H77777777','x',1)");
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['OTRO','OTRO PROVEEDOR, S.L.',Salvest\Text::normalizeCompanyName('OTRO')]);
+    $suppliersBefore=(int)$db->one('SELECT COUNT(*) n FROM suppliers')['n'];
+    $relationsBefore=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'PROVEEDOR TOTALMENTE DESCONOCIDO XYZ','proveedor_cif'=>'','comunidad_cif'=>'H77777777','tipo_servicio'=>'desconocido'],'facturas@x.example');
+    $assert($route['status']==='needs_review' && $route['supplier']===null,json_encode($route));
+    $assert((int)$db->one('SELECT COUNT(*) n FROM suppliers')['n']===$suppliersBefore,'resolveSupplier() nunca debe crear un supplier, ni siquiera con un CIF/nombre claro');
+    $assert((int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n']===$relationsBefore,'tampoco debe crear ninguna relación');
+});
+
+$test('Fase 6 — Caso A: supplier global sin main_service_type_id pero CON hint de OpenAI -> sigue clasificando con ese hint',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6H','CP SIN SERVICIO','cp sin servicio','H88888888','x',1)");
+    // Supplier sin main_service_type_id (NULL) — caso sintético, hoy los 39 activos reales SÍ lo tienen.
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,NULL,1)',
+        ['SIN SERVICIO','SIN SERVICIO CONFIGURADO, S.L.',Salvest\Text::normalizeCompanyName('SIN SERVICIO'),'B00000000']);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B00000000','comunidad_cif'=>'H88888888','tipo_servicio'=>'jardineria'],'facturas@x.example');
+    // Comportamiento actual documentado (sin cambios en esta fase): sin main_service_type_id y
+    // sin relation, resolveService() cae al hint de OpenAI si existe — la factura SIGUE
+    // clasificando, con el servicio que OpenAI propuso, nunca "Otros" inventado.
+    $assert($route['status']==='classified','documentando el comportamiento actual: sigue clasificando aunque no haya servicio configurado — ver riesgos en el informe');
+    $assert($route['service']==='jardineria' && $route['evidence']['service']['type']==='openai_suggestion','sin main_service_type_id ni relation, debe reutilizar el hint de OpenAI ya aprobado, nunca inventar una categoría');
+});
+$test('Fase 6 — Caso B: supplier global sin main_service_type_id NI hint de OpenAI -> needs_review, supplier sigue siendo el global resuelto, 0 relaciones nuevas, reason explica la falta de servicio',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6I','CP SIN SERVICIO NI HINT','cp sin servicio ni hint','H99999998','x',1)");
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,NULL,1)',
+        ['SIN NADA','SIN NADA CONFIGURADO, S.L.',Salvest\Text::normalizeCompanyName('SIN NADA'),'B00000001']);
+    $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B00000001','comunidad_cif'=>'H99999998','tipo_servicio'=>''],'facturas@x.example');
+    $assert($route['status']==='needs_review','sin servicio seguro, el fallback global NO debe clasificar automáticamente: '.json_encode($route));
+    $assert($route['supplier']!==null && $route['supplier']['cif']==='B00000001','el supplier debe seguir reconocido — solo el servicio bloquea, no la identidad del proveedor');
+    $assert($route['evidence']['supplier']['source']==='global','la evidencia del supplier debe seguir mostrando que vino del fallback global');
+    $assert($route['reason']==='Proveedor reconocido globalmente, pero no se pudo determinar un servicio seguro.','el motivo debe explicar exactamente qué falta');
+    $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $assert($before===0 && $after===0,'needs_review por falta de servicio no debe crear ninguna relación');
+});
+$test('Fase 6 — Caso C: el comportamiento legacy de resolveService() con supplier resuelto EN COMUNIDAD (no por fallback global) no cambia — sigue clasificando con service="desconocido" si así lo determinaba antes',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6L','CP LEGACY','cp legacy','H13131313','x',1)");
+    $communityId=(int)$db->one("SELECT id FROM communities WHERE external_code='F6L'")['id'];
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,main_service_type_id,active) VALUES (?,?,?,NULL,1)',['LEGACY','LEGACY SUPPLIER, S.L.',Salvest\Text::normalizeCompanyName('LEGACY')]);
+    $supplierId=(int)$db->pdo()->lastInsertId();
+    // category vacía a propósito: ni main_service_type_id ni relation.category dan un servicio.
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$supplierId,'']);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'LEGACY','proveedor_cif'=>'','comunidad_cif'=>'H13131313','tipo_servicio'=>''],'facturas@legacy.example');
+    // Este guard es EXCLUSIVO del fallback global (rama "source=global") — un supplier resuelto
+    // dentro de la comunidad nunca pasa por él, así que el comportamiento clásico de siempre
+    // (clasificar con "desconocido" si no hay ninguna otra señal) permanece intacto.
+    $assert($route['status']==='classified' && $route['service']==='desconocido','el guard de Fase 6 es específico del fallback global; el camino clásico de comunidad no debe verse afectado: '.json_encode($route));
+    $assert(!isset($route['evidence']['supplier']['source']),'un supplier resuelto en comunidad nunca lleva source=global');
+});
+
+$test('Fase 6 — 0 escrituras en community_suppliers: recuento idéntico antes/después en varios escenarios de fallback global consecutivos',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6J','CP MULTI','cp multi','H10101010','x',1)");
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['MULTI A','MULTI A, S.L.',Salvest\Text::normalizeCompanyName('MULTI A'),'B10101011']);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['MULTI B','MULTI B, S.L.',Salvest\Text::normalizeCompanyName('MULTI B'),'B10101012']);
+    $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db));
+    $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $router->route(['proveedor'=>'','proveedor_cif'=>'B10101011','comunidad_cif'=>'H10101010','tipo_servicio'=>''],'facturas@x.example');
+    $router->route(['proveedor'=>'','proveedor_cif'=>'B10101012','comunidad_cif'=>'H10101010','tipo_servicio'=>''],'facturas@x.example');
+    $router->route(['proveedor'=>'INEXISTENTE','proveedor_cif'=>'','comunidad_cif'=>'H10101010','tipo_servicio'=>''],'facturas@x.example');
+    $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
+    $assert($before===0 && $after===0,'ningún escenario de fallback global (resuelto, resuelto, no resuelto) debe escribir community_suppliers: antes='.$before.' después='.$after);
+});
+
+$test('Fase 6 — decision_json: la evidencia del supplier lleva source=global cuando vino del fallback, ausente cuando vino de la comunidad (sin auto_link todavía)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6K','CP DECISION','cp decision','H12121212','x',1)");
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['GLOBAL','GLOBAL SUPPLIER, S.L.',Salvest\Text::normalizeCompanyName('GLOBAL'),'B12121213']);
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B12121213','comunidad_cif'=>'H12121212','tipo_servicio'=>''],'facturas@x.example');
+    $assert($route['evidence']['supplier']['source']==='global');
+    $assert(!isset($route['evidence']['supplier']['auto_link']),'esta fase NO debe añadir ningún campo de auto_link — eso es Fase 7');
 });
 
 $failed=0;

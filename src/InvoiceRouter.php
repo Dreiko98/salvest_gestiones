@@ -37,7 +37,7 @@ final class InvoiceRouter
         $community=$decision['community'];
         $rawSupplierName=trim((string)($invoice['proveedor']??''));
 
-        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;$supplierAmbiguous=false;
+        $supplier=null;$supplierEvidence=null;$relation=null;$reason=null;$supplierAmbiguous=false;$globalSupplierNeedsService=false;
 
         if($community){
             $resolved=$this->classifier->resolveSupplierInCommunity((int)$community['id'],$invoice,$sender,$trace);
@@ -64,11 +64,51 @@ final class InvoiceRouter
                     }
                 }
                 if(!$supplier){
-                    // Not found among this community's own suppliers, and the restricted retry
-                    // (if any) didn't resolve it either. Check globally only to give a more
-                    // specific reason — never to force a supplier this community doesn't have.
-                    $global=$this->classifier->resolveSupplier($invoice,$sender);
-                    if($global['supplier'])$reason='Proveedor reconocido pero no asociado a esta comunidad.';
+                    // Fase 6: not found among this community's own suppliers, and the restricted
+                    // retry (if any) didn't resolve it either — the global, community-unscoped
+                    // lookup now gets to actually decide, not just annotate a reason. It's a pure
+                    // MySQL lookup (CIF/name/official_name/alias/containment/token/fuzzy, the
+                    // exact same fail-safe tiers resolveSupplierInCommunity() uses), never OpenAI,
+                    // so this costs zero extra API calls. Wrapped so every tier it tries lands in
+                    // the trace under a single 'supplier_global_fallback' step (with the real tier
+                    // nested in details['tier']) — never renaming resolveSupplierInCommunity()'s
+                    // own tier names above, so nothing here can be confused with an in-community
+                    // match, and no existing trace-based test depending on those names changes.
+                    $globalTrace=$trace?static function(string $tier,string $outcome,array $details)use($trace):void{
+                        $trace('supplier_global_fallback',$outcome,['tier'=>$tier]+$details);
+                    }:null;
+                    $global=$this->classifier->resolveSupplier($invoice,$sender,$globalTrace);
+                    if($global['ambiguous']){
+                        // Fails exactly like an in-community ambiguity: no candidate is ever
+                        // picked, community_suppliers is never touched (this whole method never
+                        // writes to it, in any branch), and the reason makes clear where the
+                        // ambiguity was found.
+                        $supplierAmbiguous=true;
+                        $reason='Proveedor reconocido de forma ambigua a nivel global (sin comunidad); revisa manualmente.';
+                    }elseif($global['supplier']){
+                        // Unambiguous global match: accepted as the resolved supplier. No
+                        // community_suppliers row exists yet for this pair — $relation stays null
+                        // on purpose, which is fine: resolveService() already checks the
+                        // supplier's own main_service_type_id before ever looking at $relation.
+                        $supplier=$global['supplier'];
+                        $supplierEvidence=$global['evidence']+['source'=>'global'];
+                        // Guard specific to the global fallback (never touches the classic
+                        // in-community path, which keeps whatever resolveService() already did —
+                        // including its existing 'desconocido' fallback, unchanged): with no
+                        // main_service_type_id AND no relation (there isn't one) AND no OpenAI
+                        // service hint either, there is genuinely no safe way to pick a service.
+                        // The supplier stays recognised (so /Revisar shows it was found) but the
+                        // invoice still goes to needs_review — never a silently invented category,
+                        // never "Otros".
+                        $hasConfiguredService=!empty($supplier['service_type_name']);
+                        $hasOpenAiServiceHint=trim((string)($invoice['tipo_servicio']??''))!=='';
+                        if(!$hasConfiguredService&&!$hasOpenAiServiceHint){
+                            $globalSupplierNeedsService=true;
+                            $reason='Proveedor reconocido globalmente, pero no se pudo determinar un servicio seguro.';
+                        }
+                    }
+                    // Else: genuinely unresolved (supplier=null, ambiguous=false) — needs_review,
+                    // exactly as before, no reason invented, nothing created.
                 }
             }
         }else{
@@ -81,7 +121,7 @@ final class InvoiceRouter
             ?$this->classifier->resolveService($supplier,$relation,$openAiService)
             :['service'=>$openAiService!==''?$openAiService:'desconocido','evidence'=>['field'=>'tipo_servicio','type'=>'openai_suggestion']];
 
-        $status=$community&&$supplier?'classified':($community?'needs_review':'unclassified');
+        $status=$community&&$supplier&&!$globalSupplierNeedsService?'classified':($community?'needs_review':'unclassified');
         return[
             'decision'=>$decision,'supplier'=>$supplier,'raw_supplier_name'=>$rawSupplierName,'service'=>$serviceResolution['service'],'reason'=>$reason,
             'evidence'=>['community'=>$decision['evidence'],'supplier'=>$supplierEvidence,'service'=>$serviceResolution['evidence']],

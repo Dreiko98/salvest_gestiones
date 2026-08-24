@@ -33,8 +33,6 @@ CREATE TABLE IF NOT EXISTS communities (
   postal_code VARCHAR(20) NULL,
   city VARCHAR(100) NULL,
   province VARCHAR(100) NULL,
-  country VARCHAR(100) NOT NULL DEFAULT 'España',
-  notes TEXT NULL,
   imap_folder_name VARCHAR(190) NULL,
   drive_folder_id VARCHAR(190) NULL,
   active TINYINT(1) NOT NULL DEFAULT 1,
@@ -89,8 +87,6 @@ CREATE TABLE IF NOT EXISTS suppliers (
   main_service_type_id BIGINT UNSIGNED NULL,
   address VARCHAR(500) NULL,
   email VARCHAR(255) NULL,
-  phone VARCHAR(50) NULL,
-  website VARCHAR(500) NULL,
   notes TEXT NULL,
   active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -144,17 +140,6 @@ CREATE TABLE IF NOT EXISTS community_suppliers (
   INDEX idx_cs_community (community_id),
   CONSTRAINT fk_cs_community FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE,
   CONSTRAINT fk_cs_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS drive_folders (
-  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  parent_drive_id VARCHAR(190) NOT NULL,
-  folder_name VARCHAR(255) NOT NULL,
-  drive_id VARCHAR(190) NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_drive_parent_name (parent_drive_id,folder_name),
-  UNIQUE KEY uq_drive_id (drive_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS drive_year_state (
@@ -275,20 +260,12 @@ CREATE TABLE IF NOT EXISTS processing_runs (
   error_message TEXT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS worker_locks (
-  name VARCHAR(100) PRIMARY KEY,
-  owner VARCHAR(190) NOT NULL,
-  acquired_at DATETIME NOT NULL,
-  expires_at DATETIME NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
 CREATE TABLE IF NOT EXISTS audit_log (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   user_id BIGINT UNSIGNED NULL,
   action VARCHAR(100) NOT NULL,
   entity_type VARCHAR(100) NOT NULL,
   entity_id VARCHAR(190) NULL,
-  old_values_json JSON NULL,
   new_values_json JSON NULL,
   ip_address VARCHAR(100) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

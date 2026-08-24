@@ -37,6 +37,7 @@ final class Schema
         // (0 parejas con COUNT(*)>1), así que añadirla ahora es seguro. Se conserva el índice de
         // 3 columnas ya existente (queda redundante pero inofensivo) para minimizar el cambio.
         self::uniqueIndex($database,'community_suppliers','uq_community_supplier_pair','community_id,supplier_id');
+        self::deadSchemaCleanup($database);
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0002_real_drive_structure')");
     }
@@ -78,6 +79,40 @@ final class Schema
         self::column($database,'mailboxes','baseline_captured_at','DATETIME NULL AFTER baseline_uid');
         $database->execute('UPDATE mailboxes SET process_existing_on_activate=1');
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0003_mailbox_baseline')");
+    }
+
+    /**
+     * Fase 10: removes tables/columns confirmed dead across the whole codebase (never read,
+     * never written, in `src/`/`bin/`/`public/`) AND confirmed empty in real production data
+     * before this migration ever ran — `worker_locks`/`drive_folders` had 0 rows, and
+     * `suppliers.phone`/`website`, `communities.country`/`notes`, `audit_log.old_values_json`
+     * were 0 non-empty across every existing row. Nothing here can lose real data: idempotent
+     * (safe to run on every migrate() call, in any order relative to the others), and each
+     * DROP is itself guarded so a database that already had this cleanup applied (or one that
+     * never had the dead column/table to begin with, e.g. a fresh install from the current
+     * schema.sql) just does nothing.
+     */
+    private static function deadSchemaCleanup(Database $database): void
+    {
+        self::dropTableIfExists($database,'worker_locks');
+        self::dropTableIfExists($database,'drive_folders');
+        self::dropColumn($database,'suppliers','phone');
+        self::dropColumn($database,'suppliers','website');
+        self::dropColumn($database,'communities','country');
+        self::dropColumn($database,'communities','notes');
+        self::dropColumn($database,'audit_log','old_values_json');
+    }
+
+    private static function dropTableIfExists(Database $database,string $table):void
+    {
+        $exists=$database->one('SELECT 1 ok FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?',[$table]);
+        if($exists)$database->execute("DROP TABLE `$table`");
+    }
+
+    private static function dropColumn(Database $database,string $table,string $column):void
+    {
+        $exists=$database->one('SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?',[$table,$column]);
+        if($exists)$database->execute("ALTER TABLE `$table` DROP COLUMN `$column`");
     }
 
     private static function column(Database $database,string $table,string $column,string $definition):void

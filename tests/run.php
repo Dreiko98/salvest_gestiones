@@ -39,7 +39,7 @@ SQL;
 $workerSchema=<<<SQL
 CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,process_existing_on_activate INTEGER DEFAULT 0,baseline_uidvalidity TEXT,baseline_uid INTEGER,baseline_captured_at TEXT,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
 CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
-CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,old_values_json TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
+CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
 CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,requeued_at TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT,UNIQUE(mailbox_id,uidvalidity,message_uid,attachment_sha256));
 CREATE TABLE processed_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,message_id_header TEXT,sender TEXT,subject TEXT,received_at TEXT,status TEXT,document_count INTEGER DEFAULT 0,imap_destination TEXT,imap_move_status TEXT,error_message TEXT,processed_at TEXT);
 CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
@@ -1685,6 +1685,35 @@ $test('Schema::migrate(): crea idx_supplier_normalized_official, idx_supplier_ci
         $assert($db->one("SELECT 1 ok FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='supplier_aliases' AND index_name='uq_supplier_alias'")!==null,'falta uq_supplier_alias');
         $aliasIndex=$db->one("SELECT non_unique AS n FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='supplier_aliases' AND index_name='uq_supplier_alias' LIMIT 1");
         $assert((int)$aliasIndex['n']===0,'uq_supplier_alias SÍ debe ser UNIQUE');
+    }finally{$mysqlSchemaCleanup($ctx);}
+});
+$test('Fase 10 — Schema::migrate() elimina worker_locks y drive_folders (tablas confirmadas muertas: 0 referencias en el código, 0 filas en producción)',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    try{
+        Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+        $assert($db->one("SELECT 1 ok FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='worker_locks'")===null,'worker_locks debería haberse eliminado');
+        $assert($db->one("SELECT 1 ok FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='drive_folders'")===null,'drive_folders debería haberse eliminado');
+        // Repetir la migración no debe fallar aunque las tablas ya no existan (idempotencia del DROP).
+        Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    }finally{$mysqlSchemaCleanup($ctx);}
+});
+$test('Fase 10 — Schema::migrate() elimina las columnas confirmadas muertas (suppliers.phone/website, communities.country/notes, audit_log.old_values_json — 0 uso en código, 0 valores reales en producción)',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
+    $db=$ctx['db'];
+    try{
+        Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+        $deadColumns=[['suppliers','phone'],['suppliers','website'],['communities','country'],['communities','notes'],['audit_log','old_values_json']];
+        foreach($deadColumns as [$table,$column]){
+            $exists=$db->one("SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?",[$table,$column]);
+            $assert($exists===null,"$table.$column debería haberse eliminado");
+        }
+        // suppliers.notes NO estaba en el alcance aprobado (solo communities.notes) -> debe seguir existiendo.
+        $assert($db->one("SELECT 1 ok FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='suppliers' AND column_name='notes'")!==null,'suppliers.notes NO debía tocarse');
+        // Repetir la migración no debe fallar aunque las columnas ya no existan (idempotencia del DROP).
+        Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
     }finally{$mysqlSchemaCleanup($ctx);}
 });
 $test('supplier_aliases: el UNIQUE(supplier_id,normalized_value) impide el mismo alias normalizado duplicado para el mismo proveedor',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{

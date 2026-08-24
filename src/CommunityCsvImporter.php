@@ -78,14 +78,13 @@ final class CommunityCsvImporter
             $this->db->execute('DELETE FROM supplier_aliases');
             $this->db->execute('DELETE FROM supplier_service_types');
             $this->db->execute('DELETE FROM suppliers');
-            $this->db->execute('DELETE FROM drive_folders');
             $supplierIds=[];$relations=0;
             foreach($rows as$row){
                 $code=self::code((string)$row['Código']);
                 $name=trim((string)$row['Comunidad']);
                 if($name===''||trim((string)$row['CIF'])===''||trim((string)$row['Dirección'])==='')throw new \RuntimeException("Datos básicos incompletos en comunidad $code");
-                $this->db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,province,notes,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,?,?,1)',[
-                    $code,$name,Text::normalize($name),trim((string)$row['CIF']),trim((string)$row['Dirección']),trim((string)$row['Código Postal']),trim((string)$row['Ciudad']),trim((string)$row['Provincia']),trim((string)$row['Notas']),$code.' - '.$name,
+                $this->db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,province,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,?,1)',[
+                    $code,$name,Text::normalize($name),trim((string)$row['CIF']),trim((string)$row['Dirección']),trim((string)$row['Código Postal']),trim((string)$row['Ciudad']),trim((string)$row['Provincia']),$code.' - '.$name,
                 ]);
                 $communityId=(int)$pdo->lastInsertId();
                 foreach(self::COLUMNS as$category=>[$providerColumn,$contractColumn]){

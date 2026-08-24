@@ -8,3 +8,7 @@
 !/storage/invoices/.gitkeep
 /.phpunit.cache/
 /.DS_Store
+
+# Local-only model-comparison harness: takes a real API key via env var and local PDF paths,
+# never meant to be committed, deployed, or run automatically.
+/bin/compare-models.php

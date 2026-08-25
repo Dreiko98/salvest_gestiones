@@ -23,6 +23,11 @@ final class WebApp
         // del check de sesión: deben ser accesibles sin login, igual que /health.
         if ($path === 'privacidad') { $this->privacyPolicy(); return; }
         if ($path === 'terminos') { $this->termsOfService(); return; }
+        // Google exige que la URL de "página principal" de la pantalla de consentimiento OAuth
+        // explique el propósito de la app sin pedir login — "/" no sirve porque es solo el
+        // formulario de acceso. Esta sí es esa página; hay que apuntar "Página principal de la
+        // aplicación" a esta URL en Google Cloud Console, no a "/".
+        if ($path === 'info') { $this->appInfo(); return; }
         if ($path === 'logout') { $this->auth->logout(); $this->redirect('/'); }
         if (!$this->auth->userId()) { $this->login(); return; }
         try {
@@ -84,6 +89,19 @@ final class WebApp
             '<h2>Uso previsto</h2><p>La herramienta procesa automáticamente las facturas recibidas por correo, las clasifica por comunidad y proveedor, y archiva el documento resultante. Las clasificaciones automáticas son propuestas: cualquier caso dudoso queda pendiente de revisión manual antes de archivarse.</p>'.
             '<h2>Responsabilidad</h2><p>La herramienta se ofrece tal cual, sin garantía de disponibilidad ininterrumpida. El uso queda restringido al personal autorizado por el titular de la aplicación.</p>'.
             '<h2>Contacto</h2><p>Para cualquier consulta sobre estas condiciones: <a href="mailto:jcmallo@gmail.com">jcmallo@gmail.com</a>.</p>');
+    }
+
+    /** Página pública de presentación — no requiere sesión, a propósito: es la URL que hay que
+     * poner como "Página principal de la aplicación" en la pantalla de consentimiento OAuth de
+     * Google. El nombre visible aquí ("Salvest Gestiones") debe coincidir EXACTAMENTE con el
+     * nombre configurado en esa pantalla — si no coinciden, Google rechaza la verificación. */
+    private function appInfo(): void
+    {
+        $this->legalPage('Salvest Gestiones','<h1>Salvest Gestiones</h1>'.
+            '<p class="muted">Herramienta interna de gestión documental</p>'.
+            '<p>Salvest Gestiones es una herramienta de uso interno para la administración de comunidades de propietarios. Recibe por correo electrónico las facturas de los proveedores de cada comunidad, las clasifica automáticamente (comunidad, proveedor, servicio, importe) y archiva el documento ya organizado — tanto en el propio sistema como en Google Drive.</p>'.
+            '<p>El acceso al panel de gestión está restringido mediante usuario y contraseña a las personas autorizadas por el administrador. Esta página, la de <a href="/?route=privacidad">política de privacidad</a> y la de <a href="/?route=terminos">condiciones del servicio</a> son las únicas secciones públicas.</p>'.
+            '<h2>Contacto</h2><p><a href="mailto:jcmallo@gmail.com">jcmallo@gmail.com</a></p>');
     }
 
     private function dashboard(): void

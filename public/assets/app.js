@@ -121,29 +121,6 @@ document.querySelector('[data-run-worker]')?.addEventListener('click',async even
   }
 });
 
-// Fase 12: "modo ayuda" — apagado por defecto (cero cambio visual), activado/desactivado con el
-// interruptor de la barra lateral, y recordado solo en este navegador (localStorage), nunca
-// enviado al servidor. Si localStorage no está disponible (privado, bloqueado), simplemente
-// arranca apagado cada vez — nunca debe romper la página por esto.
-const helpToggle=document.getElementById('help-toggle');
-const HELP_MODE_KEY='salvest-help-mode';
-const setHelpMode=on=>{
-  document.body.classList.toggle('help-mode',on);
-  helpToggle?.setAttribute('aria-pressed',String(on));
-  try{localStorage.setItem(HELP_MODE_KEY,on?'1':'0');}catch(storageError){/* modo privado u otro bloqueo: no persiste, no rompe nada */}
-};
-try{setHelpMode(localStorage.getItem(HELP_MODE_KEY)==='1');}catch(storageError){setHelpMode(false);}
-helpToggle?.addEventListener('click',()=>setHelpMode(!document.body.classList.contains('help-mode')));
-document.addEventListener('click',event=>{
-  const dot=event.target.closest('.help-dot');
-  document.querySelectorAll('.help-dot[aria-expanded=true]').forEach(open=>{if(open!==dot)open.setAttribute('aria-expanded','false');});
-  if(!dot)return;
-  dot.setAttribute('aria-expanded',String(dot.getAttribute('aria-expanded')!=='true'));
-});
-document.addEventListener('keydown',event=>{
-  if(event.key==='Escape')document.querySelectorAll('.help-dot[aria-expanded=true]').forEach(open=>open.setAttribute('aria-expanded','false'));
-});
-
 document.addEventListener('toggle',async event=>{
   const node=event.target.closest?.('.folder-node[data-folder-id]');
   if(!node||!node.open||node.dataset.loaded==='true'||node.dataset.loading==='true')return;

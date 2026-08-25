@@ -113,7 +113,7 @@ final class WebApp
         $status=$attention?'<section class="status warning"><div><span class="status-ring"><i></i></span><span><strong>'.$attention.' facturas pendientes de revisar</strong><small>Comprueba la comunidad y el proveedor antes de archivarlas.</small></span></div><a class="button" href="/?route=reviews">Revisar facturas</a></section>'
             :'<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Todo está al día</strong><small>No hay facturas pendientes de revisar.</small></span></section>';
         $this->page('Inicio','<div class="page-heading"><div><span class="eyebrow">Resumen de hoy</span><h1>Gestión de facturas</h1><p>El sistema revisa y archiva automáticamente las facturas recibidas.</p></div></div>'.$status.
-            '<div class="metrics"><button type="button" class="metric-toggle" id="archived-today-toggle" aria-expanded="false" aria-controls="archived-today-panel"><span class="metric-label">Archivadas hoy</span><strong>'.$classified.'</strong></button><article><span class="metric-label">Comunidades activas'.$this->helpSpot('El número de comunidades dadas de alta que el sistema reconoce ahora mismo.').'</span><strong>'.$communities.'</strong></article><article><span class="metric-label">Proveedores activos'.$this->helpSpot('El número de proveedores dados de alta que el sistema reconoce ahora mismo.').'</span><strong>'.$suppliers.'</strong></article></div>'.
+            '<div class="metrics"><button type="button" class="metric-toggle" id="archived-today-toggle" aria-expanded="false" aria-controls="archived-today-panel"><span class="metric-label">Archivadas hoy</span><strong>'.$classified.'</strong></button><article><span class="metric-label">Comunidades activas</span><strong>'.$communities.'</strong></article><article><span class="metric-label">Proveedores activos</span><strong>'.$suppliers.'</strong></article></div>'.
             $this->archivedTodayPanel().
             $this->botStatusCard());
     }
@@ -582,7 +582,7 @@ final class WebApp
         if(!$navigation){echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="login-page"><main class="login-main">'.$body.'</main></body></html>';return;}
         $route=trim((string)($_GET['route']??''));if($route==='index.php')$route='';
         $nav=$this->navLink('','Inicio','home',$route).$this->navLink('communities','Comunidades','communities',$route).$this->navLink('suppliers','Proveedores','suppliers',$route).$this->navLink('mailboxes','Correos','mail',$route).$this->navLink('reviews','Revisar','review',$route).$this->navLink('storage','Almacenamiento','storage',$route);
-        $sidebar='<aside class="sidebar" id="sidebar"><a class="brand" href="/" aria-label="Salvest, inicio"><img src="/assets/logoSalvest.png" alt="Salvest"></a><nav aria-label="Navegación principal">'.$nav.'</nav><button type="button" class="help-toggle" id="help-toggle" aria-pressed="false"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 4.9.8c0 1.7-2.4 1.7-2.4 3.5"/><path d="M12 17h.01"/></svg><span>Ayuda</span></button><a class="logout" href="/?route=logout">'.$this->icon('logout').'<span>Salir</span></a></aside>';
+        $sidebar='<aside class="sidebar" id="sidebar"><a class="brand" href="/" aria-label="Salvest, inicio"><img src="/assets/logoSalvest.png" alt="Salvest"></a><nav aria-label="Navegación principal">'.$nav.'</nav><a class="logout" href="/?route=logout">'.$this->icon('logout').'<span>Salir</span></a></aside>';
         $mobile='<header class="mobile-header"><a href="/" aria-label="Salvest, inicio"><img src="/assets/logoSalvest.png" alt="Salvest"></a><button class="menu-toggle" type="button" aria-controls="sidebar" aria-expanded="false"><span class="sr-only">Abrir menú</span><i></i><i></i><i></i></button></header><button class="nav-scrim" type="button" aria-label="Cerrar menú" tabindex="-1"></button>';
         echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="app-page">'.$mobile.'<div class="app-shell">'.$sidebar.'<main class="main-content">'.$body.'</main></div></body></html>';
     }
@@ -700,17 +700,6 @@ final class WebApp
             http_response_code(500);error_log('storage_children status=error folder_id='.$folderId.' '.$error->getMessage());echo json_encode(['error'=>'No se pudo cargar esta carpeta'],JSON_UNESCAPED_UNICODE);
         }
     }
-    /** Fase 12: "modo ayuda" — apagado por defecto, cero cambio visual hasta que alguien activa
-     * el interruptor de la barra lateral (ver app.js/#help-toggle, persistido en localStorage —
-     * nunca en el servidor, es puramente una preferencia del navegador de quien lo usa). Cuando
-     * está activo, aparece un pequeño círculo "?" junto al elemento anotado; al tocarlo, muestra
-     * una frase corta en lenguaje llano. Pensado para personas sin perfil técnico: nunca un
-     * tecnicismo, nunca más de una frase. */
-    private function helpSpot(string $text): string
-    {
-        return '<span class="help-spot"><button type="button" class="help-dot" aria-expanded="false" aria-label="Ayuda">?</button><span class="help-text" role="tooltip">'.$this->e($text).'</span></span>';
-    }
-
     private function navLink(string$route,string$label,string$icon,string$current):string
     {
         $active=$route===$current;$href=$route===''?'/':'/?route='.$route;

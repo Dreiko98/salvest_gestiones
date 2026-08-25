@@ -3549,6 +3549,37 @@ $test('Fase 11 — todas las páginas públicas legales/informativas enlazan a u
     $assert(substr_count($source,'mailto:jcmallo@gmail.com')===3,'privacidad, terminos e info deben tener un correo de contacto real');
 });
 
+// ============================================================================================
+// Fase 12 — "modo ayuda": interruptor no intrusivo (apagado por defecto, sin cambio visual) que
+// muestra tooltips en lenguaje llano junto a elementos concretos cuando alguien lo activa.
+// ============================================================================================
+
+$test('Fase 12 — el interruptor de "modo ayuda" existe en la barra lateral de las páginas internas, apagado por defecto (aria-pressed=false)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock();$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $html=$requestWebApp($webApp,'GET','');
+    $assert(str_contains($html,'id="help-toggle"'),'debe existir el interruptor de ayuda: '.substr($html,0,200));
+    $assert(str_contains($html,'aria-pressed="false"'),'debe arrancar apagado en el HTML servido — el estado real lo decide localStorage en el navegador, nunca el servidor');
+});
+$test('Fase 12 — las páginas públicas (login, privacidad, términos, info) NUNCA muestran el interruptor de ayuda — ese modo es solo para el panel interno',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock();$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    foreach(['privacidad','terminos','info'] as $route){
+        $html=$requestWebApp($webApp,'GET',$route);
+        $assert(!str_contains($html,'id="help-toggle"'),"$route no debe mostrar el interruptor de ayuda (esas páginas no llevan barra lateral)");
+    }
+});
+$test('Fase 12 — Inicio: los tooltips de ayuda de "Comunidades activas"/"Proveedores activos" existen y NUNCA anidan un botón dentro de otro botón (el de "Archivadas hoy" ya es un <button>, anidar ahí rompería el HTML)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $_SERVER['REQUEST_METHOD']='GET';$_GET=['route'=>''];
+    $method=new ReflectionMethod(Salvest\WebApp::class,'dashboard');$method->setAccessible(true);
+    ob_start();$method->invoke($webApp);$html=ob_get_clean();
+    restore_error_handler();
+    $assert(substr_count($html,'class="help-dot"')===2,'deben existir exactamente 2 tooltips en Inicio (comunidades y proveedores): '.$html);
+    $start=(int)strpos($html,'id="archived-today-toggle"');$end=strpos($html,'</button>',$start);
+    $archivedTodayButton=substr($html,$start,$end-$start);
+    $assert(!str_contains($archivedTodayButton,'help-dot'),'el botón de "Archivadas hoy" no debe contener un help-dot anidado dentro: '.$archivedTodayButton);
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

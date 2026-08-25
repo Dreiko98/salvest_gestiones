@@ -3549,6 +3549,30 @@ $test('Fase 11 — todas las páginas públicas legales/informativas enlazan a u
     $assert(substr_count($source,'mailto:jcmallo@gmail.com')===3,'privacidad, terminos e info deben tener un correo de contacto real');
 });
 
+// ============================================================================================
+// Fase 12.1 — apartado de ayuda dedicado (reemplaza el intento anterior de tooltips repartidos,
+// revertido porque no gustó): una sección propia en la barra lateral, con un acordeón por cada
+// parte del panel, en lenguaje llano.
+// ============================================================================================
+
+$test('Fase 12.1 — /?route=help requiere sesión, igual que el resto del panel interno (a diferencia de privacidad/terminos/info, que sí son públicas)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock();$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    unset($_SESSION['user_id']);
+    $html=$requestWebApp($webApp,'GET','help');
+    $assert(str_contains($html,'name="username"'),'sin sesión, /?route=help debe mostrar el login como cualquier otra página interna: '.substr($html,0,200));
+});
+$test('Fase 12.1 — el enlace "Ayuda" existe en la barra lateral, y la página explica las 6 secciones reales del panel',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock();$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $_SESSION['user_id']=1;
+    $dashboard=$requestWebApp($webApp,'GET','');
+    $assert(str_contains($dashboard,'route=help') && str_contains($dashboard,'>Ayuda<'),'debe existir el enlace de Ayuda en la barra lateral: '.substr($dashboard,0,50));
+    $html=$requestWebApp($webApp,'GET','help');
+    foreach(['Inicio','Comunidades','Proveedores','Correos','Revisar','Almacenamiento'] as $section){
+        $assert(str_contains($html,'>'.$section.'<'),"debe explicar la sección \"$section\": ".substr($html,0,200));
+    }
+    $assert(substr_count($html,'class="disclosure"')===6,'las 6 secciones deben venir en el mismo acordeón plegable que ya usa el resto del panel, no en markup nuevo');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

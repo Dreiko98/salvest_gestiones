@@ -39,6 +39,7 @@ final class WebApp
                 $path === 'mailboxes' => $this->mailboxes(),
                 $path === 'reviews' => $this->reviews(),
                 $path === 'storage' => $this->storage(),
+                $path === 'help' => $this->help(),
                 $path === 'storage-children' => $this->storageChildren(),
                 $path === 'run-worker' => $this->runWorker(),
                 $path === 'download' => $this->download((int)($_GET['id'] ?? 0)),
@@ -564,6 +565,26 @@ final class WebApp
         $this->page('Almacenamiento',$body);
     }
 
+    /** Fase 12.1: apartado de ayuda dedicado — sustituye el intento anterior de tooltips
+     * repartidos por cada página (revertido: no gustó) por una única sección explicando cada
+     * parte del panel, en lenguaje llano, sin tecnicismos. Reutiliza el mismo patrón de acordeón
+     * (disclosurePanel()) que ya usan otras páginas — sin CSS ni JS nuevos. */
+    private function help(): void
+    {
+        $sections=[
+            'Inicio'=>'Es la pantalla principal. De un vistazo ves cuántas facturas se han archivado hoy, cuántas comunidades y proveedores tenéis dados de alta, y si hay algo pendiente de revisar. Aquí también está el botón "Ejecutar bot ahora", para lanzar la clasificación a mano en vez de esperar a que se ejecute sola cada pocos minutos.',
+            'Comunidades'=>'Aquí se da de alta y se edita cada comunidad de propietarios: su nombre, CIF, dirección. El sistema usa estos datos para reconocer a qué comunidad pertenece cada factura que llega — cuanto más completos estén, menos facturas necesitarán revisión manual.',
+            'Proveedores'=>'Aquí se dan de alta los proveedores (compañías de agua, luz, ascensores, limpieza...) y el servicio que prestan. El sistema los usa para identificar quién ha emitido cada factura.',
+            'Correos'=>'Aquí se configuran los buzones de correo donde llegan las facturas. El sistema revisa estos buzones automáticamente, sin que nadie tenga que entrar a mirar el correo a mano.',
+            'Revisar'=>'Aquí aparecen únicamente las facturas que el sistema no ha podido clasificar con total seguridad. Es a propósito: antes que arriesgarse a archivar algo en el sitio equivocado, prefiere pedir que una persona lo confirme.',
+            'Almacenamiento'=>'Aquí se ve cómo está organizada la carpeta de Google Drive donde se archivan las facturas ya clasificadas, y si la conexión con Drive está funcionando correctamente en este momento.',
+        ];
+        $panels='';
+        foreach($sections as $label=>$text)$panels.=$this->disclosurePanel($label,'<p>'.$this->e($text).'</p>',false);
+        $body='<div class="page-heading"><div><span class="eyebrow">Guía</span><h1>Ayuda</h1><p>Qué es cada apartado del panel y para qué sirve.</p></div></div><section class="card">'.$panels.'</section>';
+        $this->page('Ayuda',$body);
+    }
+
     private function download(int $id): void
     {
         $row=$this->db->one('SELECT output_path,final_filename FROM processed_attachments WHERE id=?',[$id]); if(!$row||!$row['output_path'])$this->notFound();
@@ -581,7 +602,7 @@ final class WebApp
         $head='<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0A0A0A"><title>'.$this->e($title).' · Salvest</title><link rel="icon" href="/assets/logoSalvest.png"><link rel="stylesheet" href="/assets/fonts.css"><link rel="stylesheet" href="/assets/app.css?v='.$this->assetVersion('app.css').'"><script src="/assets/app.js?v='.$this->assetVersion('app.js').'" defer></script>';
         if(!$navigation){echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="login-page"><main class="login-main">'.$body.'</main></body></html>';return;}
         $route=trim((string)($_GET['route']??''));if($route==='index.php')$route='';
-        $nav=$this->navLink('','Inicio','home',$route).$this->navLink('communities','Comunidades','communities',$route).$this->navLink('suppliers','Proveedores','suppliers',$route).$this->navLink('mailboxes','Correos','mail',$route).$this->navLink('reviews','Revisar','review',$route).$this->navLink('storage','Almacenamiento','storage',$route);
+        $nav=$this->navLink('','Inicio','home',$route).$this->navLink('communities','Comunidades','communities',$route).$this->navLink('suppliers','Proveedores','suppliers',$route).$this->navLink('mailboxes','Correos','mail',$route).$this->navLink('reviews','Revisar','review',$route).$this->navLink('storage','Almacenamiento','storage',$route).$this->navLink('help','Ayuda','help',$route);
         $sidebar='<aside class="sidebar" id="sidebar"><a class="brand" href="/" aria-label="Salvest, inicio"><img src="/assets/logoSalvest.png" alt="Salvest"></a><nav aria-label="Navegación principal">'.$nav.'</nav><a class="logout" href="/?route=logout">'.$this->icon('logout').'<span>Salir</span></a></aside>';
         $mobile='<header class="mobile-header"><a href="/" aria-label="Salvest, inicio"><img src="/assets/logoSalvest.png" alt="Salvest"></a><button class="menu-toggle" type="button" aria-controls="sidebar" aria-expanded="false"><span class="sr-only">Abrir menú</span><i></i><i></i><i></i></button></header><button class="nav-scrim" type="button" aria-label="Cerrar menú" tabindex="-1"></button>';
         echo'<!doctype html><html lang="es"><head>'.$head.'</head><body class="app-page">'.$mobile.'<div class="app-shell">'.$sidebar.'<main class="main-content">'.$body.'</main></div></body></html>';
@@ -714,7 +735,8 @@ final class WebApp
             'mail'=>'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m4 7 8 6 8-6"/>',
             'review'=>'<path d="M9 4h6l1 2h3v15H5V6h3zM8 11h8M8 15h5"/>',
             'storage'=>'<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/>',
-            'logout'=>'<path d="M10 5H5v14h5M14 8l4 4-4 4M8 12h10"/>',default=>''};
+            'logout'=>'<path d="M10 5H5v14h5M14 8l4 4-4 4M8 12h10"/>',
+            'help'=>'<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 4.9.8c0 1.7-2.4 1.7-2.4 3.5"/><path d="M12 17h.01"/>',default=>''};
         return'<svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'.$path.'</svg>';
     }
     private function deleteForm(string$route,int$id,string$description):string

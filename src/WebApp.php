@@ -17,6 +17,12 @@ final class WebApp
     {
         $path = trim((string)($_GET['route'] ?? (parse_url($_SERVER['REQUEST_URI'] ?? '/',PHP_URL_PATH) ?: '/')),'/');
         if ($path === 'health') { header('Content-Type: application/json'); echo json_encode(['status'=>'ok']); return; }
+        // Fase 11: páginas públicas exigidas por la pantalla de consentimiento OAuth de Google
+        // (Marca/Branding) para poder publicar la app en "Producción" — sin ellas, el refresh
+        // token de Drive caduca a los 7 días por estar en modo "Prueba". Deliberadamente antes
+        // del check de sesión: deben ser accesibles sin login, igual que /health.
+        if ($path === 'privacidad') { $this->privacyPolicy(); return; }
+        if ($path === 'terminos') { $this->termsOfService(); return; }
         if ($path === 'logout') { $this->auth->logout(); $this->redirect('/'); }
         if (!$this->auth->userId()) { $this->login(); return; }
         try {
@@ -51,6 +57,33 @@ final class WebApp
         $body='<section class="login-wrap"><img class="login-logo" src="/assets/logoSalvest.png" alt="Salvest"><div class="card login"><div class="eyebrow">Panel de administración</div><h1>Gestión de facturas</h1><p class="muted">Accede para revisar y organizar la documentación de las comunidades.</p>'.($error?'<p class="error">'.$this->e($error).'</p>':'').
             '<form method="post"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><label>Usuario<input name="username" autocomplete="username" required autofocus></label><label>Contraseña<input type="password" name="password" autocomplete="current-password" required></label><button>Entrar al panel</button></form></div></section>';
         $this->page('Acceso',$body,false);
+    }
+
+    private function legalPage(string $title,string $html): void
+    {
+        $body='<section class="login-wrap legal-wrap"><img class="login-logo" src="/assets/logoSalvest.png" alt="Salvest"><div class="card login legal-card">'.$html.'<p><a href="/">&larr; Volver al panel</a></p></div></section>';
+        $this->page($title,$body,false);
+    }
+
+    private function privacyPolicy(): void
+    {
+        $this->legalPage('Política de privacidad','<h1>Política de privacidad</h1>'.
+            '<p class="muted">Última actualización: '.date('d/m/Y').'</p>'.
+            '<p>Salvest Gestiones es una herramienta de uso interno para la gestión administrativa de facturas de comunidades de propietarios. No es una aplicación pública ni recoge datos de visitantes ajenos a esa gestión.</p>'.
+            '<h2>Qué datos se tratan</h2><p>Correos electrónicos y sus adjuntos (facturas en PDF) recibidos en los buzones configurados; datos extraídos de esas facturas (proveedor, importe, fecha, comunidad); datos maestros de comunidades y proveedores dados de alta por el administrador de la herramienta.</p>'.
+            '<h2>Con quién se comparte</h2><p>Los documentos y sus datos se envían a proveedores de infraestructura estrictamente para prestar el servicio: modelos de IA (Anthropic/OpenAI) para extraer los datos de cada factura, y Google Drive para archivar los PDF ya clasificados. Ninguno de estos datos se vende, cede ni se usa con fines publicitarios.</p>'.
+            '<h2>Conservación</h2><p>Los datos se conservan mientras la herramienta esté en uso, con la finalidad de mantener el histórico documental y contable de cada comunidad.</p>'.
+            '<h2>Contacto</h2><p>Para cualquier consulta sobre esta política: <a href="mailto:jcmallo@gmail.com">jcmallo@gmail.com</a>.</p>');
+    }
+
+    private function termsOfService(): void
+    {
+        $this->legalPage('Condiciones del servicio','<h1>Condiciones del servicio</h1>'.
+            '<p class="muted">Última actualización: '.date('d/m/Y').'</p>'.
+            '<p>Salvest Gestiones es una herramienta interna de gestión documental para la administración de comunidades de propietarios. El acceso está restringido a las personas autorizadas por el administrador de la herramienta mediante usuario y contraseña.</p>'.
+            '<h2>Uso previsto</h2><p>La herramienta procesa automáticamente las facturas recibidas por correo, las clasifica por comunidad y proveedor, y archiva el documento resultante. Las clasificaciones automáticas son propuestas: cualquier caso dudoso queda pendiente de revisión manual antes de archivarse.</p>'.
+            '<h2>Responsabilidad</h2><p>La herramienta se ofrece tal cual, sin garantía de disponibilidad ininterrumpida. El uso queda restringido al personal autorizado por el titular de la aplicación.</p>'.
+            '<h2>Contacto</h2><p>Para cualquier consulta sobre estas condiciones: <a href="mailto:jcmallo@gmail.com">jcmallo@gmail.com</a>.</p>');
     }
 
     private function dashboard(): void

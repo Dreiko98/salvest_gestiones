@@ -3529,6 +3529,26 @@ $test('Fase 9.1 — los prompts de extracción (Claude y OpenAI) instruyen expl�
     }
 });
 
+// ============================================================================================
+// Fase 11 — páginas públicas de política de privacidad y condiciones del servicio, exigidas por
+// Google para publicar la pantalla de consentimiento OAuth en "Producción" (sin eso, el refresh
+// token de Drive caduca a los 7 días por quedarse en modo "Prueba").
+// ============================================================================================
+
+$test('Fase 11 — /?route=privacidad y /?route=terminos son accesibles SIN sesión (Google debe poder verlas sin loguearse), y nunca muestran el panel/sidebar interno',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
+    $db=$sqliteDbWithLock();$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    foreach(['privacidad'=>'Política de privacidad','terminos'=>'Condiciones del servicio'] as $route=>$heading){
+        $html=$requestWebApp($webApp,'GET',$route);
+        $assert(str_contains($html,'<h1>'.$heading.'</h1>'),"$route debe mostrar el título esperado: ".substr($html,0,200));
+        $assert(!str_contains($html,'class="sidebar"'),"$route no debe mostrar el panel interno (nav lateral) a un visitante sin sesión");
+        $assert(!str_contains($html,'name="username"'),"$route no debe redirigir al formulario de login — debe ser pública de verdad");
+    }
+});
+$test('Fase 11 — ambas páginas legales enlazan a un contacto real, no un placeholder vacío (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/WebApp.php');
+    $assert(substr_count($source,'mailto:jcmallo@gmail.com')===2,'ambas páginas deben tener un correo de contacto real');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

@@ -120,26 +120,51 @@ final class WebApp
     }
 
     /** The "Archivadas hoy" tile toggles this panel (see app.js's #archived-today-toggle
-     * listener) — where each of today's classified invoices actually ended up: local path and,
-     * when Drive is enabled, its Drive path too. Starts hidden; never rendered open by default,
-     * same closed-by-default convention as the technical-detail panels on /Revisar. */
+     * listener) — where each classified invoice actually ended up: local path and, when Drive is
+     * enabled, its Drive path too. Starts hidden; never rendered open by default, same
+     * closed-by-default convention as the technical-detail panels on /Revisar.
+     *
+     * Fase 13: filtrable por Hoy/Esta semana/Este mes/Mes pasado sin ninguna petición nueva al
+     * servidor — se trae de una sola vez todo lo necesario para cubrir el rango más amplio (desde
+     * el día 1 del mes pasado), cada fila lleva su fecha en data-date, y app.js decide qué filas
+     * mostrar según el filtro activo. La fecha "de hoy" la calcula el servidor (data-today en el
+     * propio panel), nunca el reloj del navegador — evita que un desfase de huso horario cambie
+     * qué factura cuenta como "de hoy".
+     */
     private function archivedTodayPanel(): string
     {
+        $today=new \DateTimeImmutable('today');
+        $rangeStart=$today->modify('first day of last month')->format('Y-m-d 00:00:00');
         $rows=$this->db->all("SELECT pa.processed_at,pa.provider,pa.service_type,pa.output_path,pa.drive_path,c.official_name
             FROM processed_attachments pa LEFT JOIN communities c ON c.id=pa.community_id
-            WHERE pa.status='classified' AND DATE(pa.processed_at)=CURDATE() ORDER BY pa.processed_at DESC");
+            WHERE pa.status='classified' AND pa.processed_at>=? ORDER BY pa.processed_at DESC",[$rangeStart]);
+        $filters='<div class="filter-chips" role="group" aria-label="Periodo">'.
+            '<button type="button" class="filter-chip" data-period="today" aria-pressed="true">Hoy</button>'.
+            '<button type="button" class="filter-chip" data-period="week" aria-pressed="false">Esta semana</button>'.
+            '<button type="button" class="filter-chip" data-period="month" aria-pressed="false">Este mes</button>'.
+            '<button type="button" class="filter-chip" data-period="last-month" aria-pressed="false">Mes pasado</button>'.
+            '</div>';
         if(!$rows){
-            $body='<p class="muted">Todavía no se ha archivado ninguna factura hoy.</p>';
+            $body='<p class="muted" data-period-empty="today">Todavía no se ha archivado ninguna factura hoy.</p>'.
+                '<p class="muted" data-period-empty="week" hidden>No se ha archivado ninguna factura esta semana.</p>'.
+                '<p class="muted" data-period-empty="month" hidden>No se ha archivado ninguna factura este mes.</p>'.
+                '<p class="muted" data-period-empty="last-month" hidden>No se archivó ninguna factura el mes pasado.</p>';
         }else{
             $tableRows='';
             foreach($rows as $row){
-                $time=(static function(string $value):string{try{return(new \DateTimeImmutable($value))->format('H:i');}catch(\Throwable){return'—';}})((string)$row['processed_at']);
+                $processedAt=(string)$row['processed_at'];
+                $date=substr($processedAt,0,10);
+                $time=(static function(string $value):string{try{return(new \DateTimeImmutable($value))->format('H:i');}catch(\Throwable){return'—';}})($processedAt);
                 $location=$row['drive_path']?:($row['output_path']?:'—');
-                $tableRows.='<tr><td class="mono">'.$this->e($time).'</td><td><strong>'.$this->e($row['official_name']?:'Sin comunidad').'</strong></td><td>'.$this->e($row['provider']?:'—').'</td><td>'.$this->e($row['service_type']?:'—').'</td><td class="mono">'.$this->e($location).'</td></tr>';
+                $tableRows.='<tr data-date="'.$this->e($date).'"><td class="mono">'.$this->e($time).'</td><td><strong>'.$this->e($row['official_name']?:'Sin comunidad').'</strong></td><td>'.$this->e($row['provider']?:'—').'</td><td>'.$this->e($row['service_type']?:'—').'</td><td class="mono">'.$this->e($location).'</td></tr>';
             }
-            $body='<div class="table-wrap"><table><thead><tr><th>Hora</th><th>Comunidad</th><th>Proveedor</th><th>Servicio</th><th>Ruta</th></tr></thead><tbody>'.$tableRows.'</tbody></table></div>';
+            $body='<div class="table-wrap"><table><thead><tr><th>Hora</th><th>Comunidad</th><th>Proveedor</th><th>Servicio</th><th>Ruta</th></tr></thead><tbody>'.$tableRows.'</tbody></table></div>'.
+                '<p class="muted" data-period-empty="today" hidden>Todavía no se ha archivado ninguna factura hoy.</p>'.
+                '<p class="muted" data-period-empty="week" hidden>No se ha archivado ninguna factura esta semana.</p>'.
+                '<p class="muted" data-period-empty="month" hidden>No se ha archivado ninguna factura este mes.</p>'.
+                '<p class="muted" data-period-empty="last-month" hidden>No se archivó ninguna factura el mes pasado.</p>';
         }
-        return '<section class="card archived-today-panel" id="archived-today-panel" hidden><div class="section-heading flat"><div><span class="eyebrow">Hoy</span><h2>Facturas archivadas</h2></div></div>'.$body.'</section>';
+        return '<section class="card archived-today-panel" id="archived-today-panel" data-today="'.$this->e($today->format('Y-m-d')).'" hidden><div class="section-heading flat"><div><span class="eyebrow">Historial</span><h2>Facturas archivadas</h2></div></div>'.$filters.$body.'</section>';
     }
 
     private function botStatusCard(): string

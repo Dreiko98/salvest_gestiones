@@ -232,6 +232,29 @@ $test('archivado y colisión determinista',static function()use($assert):void{
     $assert(basename($a)==='2026-07_agua_hidralux-servicios.pdf');
     $assert(basename($b)==='2026-07_agua_hidralux-servicios_02.pdf');
 });
+$test('Fase 13 — Archiver::archive() añade el importe al final del nombre cuando la extracción lo trajo',static function()use($assert):void{
+    $root=sys_get_temp_dir().'/salvest-test-'.bin2hex(random_bytes(4)); mkdir($root,0770,true);
+    $invoice=['fecha_factura'=>'2026-07-01','tipo_servicio'=>'agua','proveedor'=>'Hidralux Servicios','importe'=>13.6];
+    $community=['official_name'=>'CP Uno']; $archiver=new Salvest\Archiver($root);
+    $file=$root.'/one.pdf';file_put_contents($file,'%PDF');
+    $result=$archiver->archive($file,'factura.pdf',$invoice,$community,'classified');
+    $assert(basename($result)==='2026-07_agua_hidralux-servicios_13.60.pdf','debe llevar el importe con 2 decimales: '.basename($result));
+});
+$test('Fase 13 — Archiver::archive() NUNCA inventa un importe: sin dato, el nombre queda exactamente como antes (regresión)',static function()use($assert):void{
+    $root=sys_get_temp_dir().'/salvest-test-'.bin2hex(random_bytes(4)); mkdir($root,0770,true);
+    $invoice=['fecha_factura'=>'2026-07-01','tipo_servicio'=>'agua','proveedor'=>'Hidralux Servicios'];
+    $community=['official_name'=>'CP Uno']; $archiver=new Salvest\Archiver($root);
+    $file=$root.'/one.pdf';file_put_contents($file,'%PDF');
+    $result=$archiver->archive($file,'factura.pdf',$invoice,$community,'classified');
+    $assert(basename($result)==='2026-07_agua_hidralux-servicios.pdf','sin importe extraído, no debe añadirse ningún sufijo: '.basename($result));
+});
+$test('Fase 13 — DriveInvoiceArchiver::amountSuffix(): numérico -> "_XX.XX", ausente/no numérico -> cadena vacía (nunca "0.00" inventado)',static function()use($assert):void{
+    $assert(Salvest\DriveInvoiceArchiver::amountSuffix(13.6)==='_13.60');
+    $assert(Salvest\DriveInvoiceArchiver::amountSuffix(0)==='_0.00','un importe real de 0 sí debe reflejarse, no confundirse con "ausente"');
+    $assert(Salvest\DriveInvoiceArchiver::amountSuffix(null)==='');
+    $assert(Salvest\DriveInvoiceArchiver::amountSuffix('')==='');
+    $assert(Salvest\DriveInvoiceArchiver::amountSuffix('no es un número')==='');
+});
 $test('códigos y proveedores del CSV real',static function()use($assert):void{
     $assert(Salvest\CommunityCsvImporter::code('1')==='01');
     $assert(Salvest\CommunityCsvImporter::code('109')==='109');
@@ -1492,15 +1515,34 @@ $test('Inicio: "Archivadas hoy" prefiere la ruta de Drive sobre la ruta local cu
     $assert(str_contains($html,'COMUNIDADES/Menendez/2026/factura.pdf'),'con Drive habilitado debe mostrarse la ruta de Drive: '.$html);
     $assert(!str_contains($html,'/var/storage/local/factura.pdf'),'no debe mostrar también la ruta local cuando ya hay una de Drive');
 });
-$test('Inicio: "Archivadas hoy" no incluye facturas clasificadas en días anteriores',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+$test('Fase 13 — Inicio: el historial trae filas de ayer (para poder filtrar por semana/mes), pero SIN ninguna factura hoy el estado vacío de "Hoy" (el filtro por defecto) sigue mostrándose',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
-    $yesterday=(new DateTimeImmutable('-1 day'))->format('Y-m-d H:i:s');
+    $yesterday=new DateTimeImmutable('-1 day');
     $db->execute("INSERT INTO processed_attachments(status,processed_at,provider,service_type,output_path) VALUES (?,?,?,?,?)",
-        ['classified',$yesterday,'PROVEEDOR DE AYER','agua','/x/ayer.pdf']);
+        ['classified',$yesterday->format('Y-m-d H:i:s'),'PROVEEDOR DE AYER','agua','/x/ayer.pdf']);
     $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
     $html=$method->invoke($webApp);
-    $assert(!str_contains($html,'PROVEEDOR DE AYER'),'una factura archivada ayer no debe aparecer en el historial de hoy: '.$html);
-    $assert(str_contains($html,'Todavía no se ha archivado ninguna factura hoy.'));
+    $assert(str_contains($html,'data-date="'.$yesterday->format('Y-m-d').'"'),'la fila de ayer debe estar en el HTML (el filtro por defecto la oculta en el navegador, no el servidor): '.$html);
+    $assert(str_contains($html,'PROVEEDOR DE AYER'));
+    $assert(str_contains($html,'data-period-empty="today"'),'debe existir el mensaje vacío específico de "Hoy", que es el filtro activo por defecto');
+});
+$test('Fase 13 — Inicio: una factura de hace dos meses queda FUERA del historial (el rango solo cubre desde el mes pasado, para no cargar todo el histórico)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $longAgo=(new DateTimeImmutable('first day of this month'))->modify('-2 months')->modify('-1 day');
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,provider,service_type,output_path) VALUES (?,?,?,?,?)",
+        ['classified',$longAgo->format('Y-m-d H:i:s'),'PROVEEDOR MUY ANTIGUO','agua','/x/antiguo.pdf']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(!str_contains($html,'PROVEEDOR MUY ANTIGUO'),'nada anterior al mes pasado debe traerse: '.$html);
+});
+$test('Fase 13 — Inicio: existen los 4 filtros de periodo, con "Hoy" activo por defecto',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    foreach(['today'=>'true','week'=>'false','month'=>'false','last-month'=>'false'] as $period=>$pressed){
+        $assert(str_contains($html,'data-period="'.$period.'" aria-pressed="'.$pressed.'"'),"el filtro $period debe existir con aria-pressed=$pressed: ".$html);
+    }
+    $assert(str_contains($html,'data-today="'),'el panel debe llevar la fecha de "hoy" calculada por el servidor, nunca confiar en el reloj del navegador');
 });
 $test('Inicio: el botón "Archivadas hoy" está correctamente enlazado al panel desplegable',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);

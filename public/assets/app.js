@@ -30,6 +30,52 @@ archivedToggle?.addEventListener('click',()=>{
   archivedToggle.setAttribute('aria-expanded',String(open));
 });
 
+// Fase 13: filtro de periodo del historial de "Facturas archivadas" — puramente en el navegador,
+// sobre las filas que el servidor ya envió (desde el día 1 del mes pasado). "Hoy" lo calcula el
+// servidor (data-today en el panel), nunca el reloj del navegador, para que un desfase de huso
+// horario nunca decida qué factura cuenta como "de hoy".
+if(archivedPanel){
+  const toDateOnly=iso=>{const[y,m,d]=iso.split('-').map(Number);return new Date(y,m-1,d);};
+  const todayDate=toDateOnly(archivedPanel.dataset.today||new Date().toISOString().slice(0,10));
+  const periodBounds=period=>{
+    if(period==='today')return[todayDate,todayDate];
+    if(period==='week'){
+      const weekday=(todayDate.getDay()+6)%7; // lunes=0
+      const monday=new Date(todayDate);monday.setDate(todayDate.getDate()-weekday);
+      return[monday,todayDate];
+    }
+    if(period==='month'){
+      const first=new Date(todayDate.getFullYear(),todayDate.getMonth(),1);
+      return[first,todayDate];
+    }
+    const lastMonthFirst=new Date(todayDate.getFullYear(),todayDate.getMonth()-1,1);
+    const lastMonthEnd=new Date(todayDate.getFullYear(),todayDate.getMonth(),0);
+    return[lastMonthFirst,lastMonthEnd];
+  };
+  const applyPeriod=period=>{
+    const[start,end]=periodBounds(period);
+    let visible=0;
+    archivedPanel.querySelectorAll('tbody tr[data-date]').forEach(row=>{
+      const rowDate=toDateOnly(row.dataset.date);
+      const show=rowDate>=start&&rowDate<=end;
+      row.hidden=!show;
+      if(show)visible++;
+    });
+    archivedPanel.querySelectorAll('[data-period-empty]').forEach(empty=>{
+      empty.hidden=!(visible===0&&empty.dataset.periodEmpty===period);
+    });
+    const table=archivedPanel.querySelector('.table-wrap');
+    if(table)table.hidden=visible===0;
+  };
+  archivedPanel.querySelectorAll('.filter-chip').forEach(chip=>{
+    chip.addEventListener('click',()=>{
+      archivedPanel.querySelectorAll('.filter-chip').forEach(other=>other.setAttribute('aria-pressed',String(other===chip)));
+      applyPeriod(chip.dataset.period);
+    });
+  });
+  applyPeriod('today');
+}
+
 const menuButton=document.querySelector('.menu-toggle');
 const scrim=document.querySelector('.nav-scrim');
 const closeMenu=()=>{

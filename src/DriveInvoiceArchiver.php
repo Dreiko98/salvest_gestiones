@@ -21,6 +21,7 @@ final class DriveInvoiceArchiver
         foreach($parts as$part)$parent=$this->drive->ensureFolder($parent,$part);
         $base=$date.'_'.self::token((string)$supplier['official_name']);
         $number=self::token((string)($invoice['numero_factura']??''));if($number!=='')$base.='_'.$number;
+        $base.=self::amountSuffix($invoice['importe']??null);
         $names=array_map(static fn(array$file):string=>(string)$file['name'],$this->drive->children($parent));
         $filename=self::availableFilename($names,$base.'.pdf');$uploaded=$this->drive->upload($parent,$filename,$localPath);
         return['id'=>(string)$uploaded['id'],'name'=>$filename,'path'=>$communityFolder.'/Doc año en Vigor/'.implode('/',$parts).'/'.$filename,'webViewLink'=>$uploaded['webViewLink']??null];
@@ -43,6 +44,14 @@ final class DriveInvoiceArchiver
     public static function token(string $value):string
     {
         $value=Text::normalize($value);$value=strtoupper((string)preg_replace('/[^a-z0-9]+/','-',$value));return trim($value,'-');
+    }
+
+    /** Mismo criterio que Archiver::archive(): el importe se añade al final del nombre solo
+     * cuando la extracción trajo uno — nunca se inventa un "0.00" para una factura sin importe
+     * reconocido, se omite el trozo entero (sin guion bajo colgando). */
+    public static function amountSuffix(mixed $amount):string
+    {
+        return is_numeric($amount) ? '_'.number_format((float)$amount,2,'.','') : '';
     }
 
     /** @return list<string> */

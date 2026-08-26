@@ -15,7 +15,11 @@ final class Archiver
             if (!preg_match('/^(\d{4})-(\d{2})/', $date, $match)) throw new \RuntimeException('Fecha de factura no válida');
             $folder = $this->root . '/comunidades/' . Text::slug((string)$community['official_name']) . '/' . $match[1] . '/' . $match[2];
             $extension = strtolower(pathinfo($originalName, PATHINFO_EXTENSION) ?: 'pdf');
-            $filename = sprintf('%s-%s_%s_%s.%s', $match[1], $match[2], Text::slug((string)$invoice['tipo_servicio']), Text::slug((string)$invoice['proveedor']), $extension);
+            // El importe se añade al final, solo cuando la extracción trajo uno — nunca se
+            // inventa un "0.00" para una factura sin importe reconocido, se omite el trozo entero.
+            $amount = $invoice['importe'] ?? null;
+            $amountSuffix = is_numeric($amount) ? '_' . number_format((float)$amount, 2, '.', '') : '';
+            $filename = sprintf('%s-%s_%s_%s%s.%s', $match[1], $match[2], Text::slug((string)$invoice['tipo_servicio']), Text::slug((string)$invoice['proveedor']), $amountSuffix, $extension);
         } else {
             $folder = $this->root . '/unclassified';
             $filename = Text::safeFilename($originalName, 1);

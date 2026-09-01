@@ -156,7 +156,7 @@ final class InvoiceRouter
             'evidence'=>['community'=>$decision['evidence'],'supplier'=>$supplierEvidence,'service'=>$serviceResolution['evidence']],
             'status'=>$status,
             'message_status'=>$status==='classified'?'completed':'needs_review',
-            'imap_destination'=>$status==='unclassified'?'Facturas/Sin clasificar':($status==='needs_review'?'Facturas/Pendientes de revisión':''),
+            'imap_destination'=>$status==='unclassified'?'facturgerman/Sin clasificar':($status==='needs_review'?'facturgerman/Pendientes de revisión':''),
             'drive_upload'=>$status==='classified',
             'supplier_ambiguous'=>$supplierAmbiguous,
         ];

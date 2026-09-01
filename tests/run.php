@@ -94,7 +94,7 @@ $seedRequeueFixture=static function(Salvest\Database $db,array $attachmentStatus
         ['Test','buzon@example.com','imap.example.com',993,1,'buzon@example.com','ignored-in-these-tests','INBOX']);
     $mailboxId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,message_id_header,sender,subject,received_at,status,document_count,imap_destination,imap_move_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-        [$mailboxId,'1001','500',$messageIdHeader,'facturas@proveedor.example','Factura',date('Y-m-d H:i:s'),'needs_review',count($attachmentStatuses),'Facturas/Pendientes de revisión',$imapMoveStatus,date('Y-m-d H:i:s')]);
+        [$mailboxId,'1001','500',$messageIdHeader,'facturas@proveedor.example','Factura',date('Y-m-d H:i:s'),'needs_review',count($attachmentStatuses),'facturgerman/Pendientes de revisión',$imapMoveStatus,date('Y-m-d H:i:s')]);
     $messageId=(int)$db->pdo()->lastInsertId();
     $attachmentIds=[];
     foreach($attachmentStatuses as $index=>$status){
@@ -212,6 +212,21 @@ $test('validación acepta un pdf',static function()use($assert):void{
     Salvest\DocumentValidator::validate(['payload'=>'%PDF-1.4 demo','mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);
     $assert(true);
 });
+$test('Fase 14 — validación rechaza un PDF protegido con contraseña (caso real: ni Claude ni OpenAI pudieron leerlo)',static function()use($assert):void{
+    // "/Encrypt" en el trailer es justo la palabra clave real del formato PDF para un
+    // diccionario de cifrado — reproduce el caso real encontrado en producción.
+    $encrypted="%PDF-1.4\n...contenido...\ntrailer\n<< /Size 10 /Root 1 0 R /Encrypt 5 0 R /ID [<abc><abc>] >>\nstartxref\n123\n%%EOF";
+    try{
+        Salvest\DocumentValidator::validate(['payload'=>$encrypted,'mime_type'=>'application/pdf','original_filename'=>'factura-protegida.pdf'],1024);
+        $assert(false,'debería rechazar un PDF cifrado');
+    }catch(Salvest\EncryptedPdfException $error){$assert(str_contains($error->getMessage(),'contraseña'));}
+});
+$test('Fase 14 — un PDF sin "/Encrypt" en el trailer NUNCA se confunde con uno cifrado, aunque contenga la palabra "Encrypt" en otro contexto',static function()use($assert):void{
+    // Con barra inicial explícita en la comprobación (str_contains($payload,\'/Encrypt\')) para no
+    // disparar con texto normal de factura que mencione la palabra "Encrypt" sin la barra.
+    Salvest\DocumentValidator::validate(['payload'=>"%PDF-1.4\nEste documento no usa Encrypt de ningún tipo.\n%%EOF",'mime_type'=>'application/pdf','original_filename'=>'factura.pdf'],1024);
+    $assert(true,'sin la barra inicial, no debe considerarse cifrado');
+});
 $test('mime con varios pdf y nombre especial',static function()use($assert):void{
     $boundary='demo-boundary';
     $raw="From: Demo <demo@example.com>\r\nSubject: Facturas\r\nContent-Type: multipart/mixed; boundary=\"$boundary\"\r\n\r\n".
@@ -248,12 +263,20 @@ $test('Fase 13 — Archiver::archive() NUNCA inventa un importe: sin dato, el no
     $result=$archiver->archive($file,'factura.pdf',$invoice,$community,'classified');
     $assert(basename($result)==='2026-07_agua_hidralux-servicios.pdf','sin importe extraído, no debe añadirse ningún sufijo: '.basename($result));
 });
-$test('Fase 13 — DriveInvoiceArchiver::amountSuffix(): numérico -> "_XX.XX", ausente/no numérico -> cadena vacía (nunca "0.00" inventado)',static function()use($assert):void{
-    $assert(Salvest\DriveInvoiceArchiver::amountSuffix(13.6)==='_13.60');
-    $assert(Salvest\DriveInvoiceArchiver::amountSuffix(0)==='_0.00','un importe real de 0 sí debe reflejarse, no confundirse con "ausente"');
-    $assert(Salvest\DriveInvoiceArchiver::amountSuffix(null)==='');
-    $assert(Salvest\DriveInvoiceArchiver::amountSuffix('')==='');
-    $assert(Salvest\DriveInvoiceArchiver::amountSuffix('no es un número')==='');
+$test('Fase 14 — DriveInvoiceArchiver::amountToken(): numérico -> "XX.XX€", ausente/no numérico -> cadena vacía (nunca "0.00" inventado)',static function()use($assert):void{
+    $assert(Salvest\DriveInvoiceArchiver::amountToken(13.6)==='13.60€');
+    $assert(Salvest\DriveInvoiceArchiver::amountToken(0)==='0.00€','un importe real de 0 sí debe reflejarse, no confundirse con "ausente"');
+    $assert(Salvest\DriveInvoiceArchiver::amountToken(null)==='');
+    $assert(Salvest\DriveInvoiceArchiver::amountToken('')==='');
+    $assert(Salvest\DriveInvoiceArchiver::amountToken('no es un número')==='');
+});
+$test('Fase 14 — DriveInvoiceArchiver::folderMatchesCode(): reconoce el código de comunidad al principio del nombre pase lo que pase después, sin falsos positivos por prefijo',static function()use($assert):void{
+    $assert(Salvest\DriveInvoiceArchiver::folderMatchesCode('82 - MENENDEZ Y PELAYO 10','82'));
+    $assert(Salvest\DriveInvoiceArchiver::folderMatchesCode('82-MENENDEZ YPELAYO 10','82'),'debe dar igual el separador exacto (sin espacio)');
+    $assert(Salvest\DriveInvoiceArchiver::folderMatchesCode('082 - ALGO','82'),'un cero a la izquierda en la carpeta no debe importar');
+    $assert(!Salvest\DriveInvoiceArchiver::folderMatchesCode('820 - OTRA COMUNIDAD','82'),'"820" nunca debe confundirse con la comunidad "82"');
+    $assert(!Salvest\DriveInvoiceArchiver::folderMatchesCode('8 - OTRA','82'));
+    $assert(!Salvest\DriveInvoiceArchiver::folderMatchesCode('Doc año en Vigor','82'),'sin ningún dígito inicial, nunca hay coincidencia');
 });
 $test('códigos y proveedores del CSV real',static function()use($assert):void{
     $assert(Salvest\CommunityCsvImporter::code('1')==='01');
@@ -2610,6 +2633,21 @@ $test('Worker: la exclusión de un adjunto no-PDF ocurre ANTES de llamar a proce
     $assert($validatePos!==false&&$catchNotPdfPos!==false&&$continuePos!==false&&$processAttachmentCallPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
     $assert($validatePos<$catchNotPdfPos,'la validación debe ocurrir antes de decidir si se excluye');
     $assert($catchNotPdfPos<$processAttachmentCallPos,'el catch de NotPdfException (con su continue) debe preceder textualmente a la llamada a processAttachment() dentro del mismo bucle — así un adjunto no-PDF nunca puede alcanzarla');
+});
+$test('Fase 14 — Worker: un PDF cifrado recibe exactamente el mismo tratamiento estructural que uno que no es PDF (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $validatePos=strpos($source,'DocumentValidator::validate($attachment,');
+    $catchEncryptedPos=strpos($source,'catch (EncryptedPdfException)');
+    $processAttachmentCallPos=strpos($source,'$outcomes[] = $this->processAttachment(');
+    $assert($validatePos!==false&&$catchEncryptedPos!==false&&$processAttachmentCallPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
+    $assert($validatePos<$catchEncryptedPos&&$catchEncryptedPos<$processAttachmentCallPos,'el catch de EncryptedPdfException debe estar entre la validación y processAttachment(), igual que NotPdfException');
+});
+$test('Fase 14 — la carpeta base del correo es "facturgerman", ya no "Facturas" — guarda de regresión sobre Worker.php e InvoiceRouter.php (los 2 sitios reales, no la cadena suelta de un fixture de test)',static function()use($assert):void{
+    foreach(['src/Worker.php','src/InvoiceRouter.php'] as $file){
+        $source=file_get_contents(__DIR__.'/../'.$file);
+        $assert(!str_contains($source,"'Facturas/"),"$file no debe contener ninguna referencia a la carpeta antigua 'Facturas/'");
+        $assert(str_contains($source,"facturgerman/"),"$file debe usar la carpeta nueva 'facturgerman/'");
+    }
 });
 $test('Worker: cuando todos los adjuntos de un correo quedan excluidos, se usa exactamente el mismo saveMessage(...\'ignored\',0,null) que el caso "sin adjuntos" — sin destino, sin IMAP move (guarda de regresión de código)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');

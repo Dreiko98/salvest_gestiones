@@ -118,6 +118,15 @@ final class Worker
                             // MimeParser already keeps most of these out of $attachments entirely;
                             // this is the defense-in-depth backstop for whatever still gets here.
                             continue;
+                        } catch (EncryptedPdfException) {
+                            // Fase 14: a real invoice, but password-protected — same treatment as
+                            // NotPdfException (never counted, never reaches the extractor, never a
+                            // processed_attachments row, never fails the whole email), since there
+                            // is nothing the pipeline can do with it automatically. The one line a
+                            // developer needs to trace a specific "vanished" invoice back to this
+                            // stays in error_log() only — never surfaced to the non-technical UI.
+                            error_log('mailbox_id='.$mailbox['id'].' uid='.$uid.' status=skipped reason=encrypted_pdf filename='.($attachment['original_filename']??'?'));
+                            continue;
                         }
                         $counts['documents']++;
                         // Content already confirmed real PDF above — the declared MIME (possibly
@@ -143,7 +152,7 @@ final class Worker
                     $allClassified = !array_filter($outcomes,static fn(array $item): bool => !in_array($item['status'],['classified','duplicate'],true));
                     if ($allClassified && count($communityIds) === 1) {
                         $community = $this->db->one('SELECT * FROM communities WHERE id=?',[$communityIds[0]]);
-                        $destination = 'Facturas/'.($community['imap_folder_name'] ?: Text::slug((string)$community['official_name']));
+                        $destination = 'facturgerman/'.($community['imap_folder_name'] ?: Text::slug((string)$community['official_name']));
                         try {
                             $client->markSeen($uid); $client->move($uid,$destination);
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'moved');
@@ -152,7 +161,7 @@ final class Worker
                         }
                     } else {
                         $allUnknown = !array_filter($outcomes,static fn(array $item): bool => $item['status'] !== 'unclassified');
-                        $destination = $allUnknown ? 'Facturas/Sin clasificar' : 'Facturas/Pendientes de revisión';
+                        $destination = $allUnknown ? 'facturgerman/Sin clasificar' : 'facturgerman/Pendientes de revisión';
                         try {
                             $client->move($uid,$destination);
                             $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'moved');
@@ -161,10 +170,10 @@ final class Worker
                         }
                     }
                 } catch (\Throwable $error) {
-                    try { $client->move($uid,'Facturas/Errores'); } catch (\Throwable $moveError) {
+                    try { $client->move($uid,'facturgerman/Errores'); } catch (\Throwable $moveError) {
                         $error = new \RuntimeException($error->getMessage().'; movimiento IMAP: '.$moveError->getMessage(),0,$error);
                     }
-                    $this->saveMessage($mailbox,$client,$uid,$message,'error',count($message['attachments']),'Facturas/Errores','failed',$error->getMessage());
+                    $this->saveMessage($mailbox,$client,$uid,$message,'error',count($message['attachments']),'facturgerman/Errores','failed',$error->getMessage());
                     $counts['errors']++;
                 }
             }

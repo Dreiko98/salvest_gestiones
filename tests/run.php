@@ -3653,6 +3653,25 @@ $test('Fase 12.1 — el enlace "Ayuda" existe en la barra lateral, y la página 
     $assert(substr_count($html,'class="disclosure"')===6,'las 6 secciones deben venir en el mismo acordeón plegable que ya usa el resto del panel, no en markup nuevo');
 });
 
+$test('Fase 15 — Worker: una fecha de factura no reconocible degrada a needs_review ANTES de llamar a Archiver::archive(), nunca lo deja lanzar (guarda de regresión de código: caso real, "Estado de Cuenta" con comunidad y proveedor ya resueltos pero sin fecha válida — antes perdía PDF, extraction_json y detalle técnico por completo)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $routePos=strpos($source,'$route=$this->router->route(');
+    $invalidDatePos=strpos($source,'$invalidDate=');
+    $archiverCallPos=strpos($source,'$target = $this->archiver->archive(');
+    $assert($routePos!==false&&$invalidDatePos!==false&&$archiverCallPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
+    $assert($routePos<$invalidDatePos&&$invalidDatePos<$archiverCallPos,'la comprobación de fecha inválida debe calcularse después de router->route() y antes de archiver->archive(), para poder degradar $status a tiempo');
+    $assert(str_contains($source,"'invalid_date'"),'blockingFactor debe distinguir explícitamente el caso de fecha inválida, no confundirlo con supplier_unresolved/community_unresolved');
+    // Misma forma de regex que Archiver.php usa realmente para decidir si archiva — la
+    // comprobación previa de Worker.php debe ser al menos tan estricta (o más), nunca más laxa,
+    // o dejaría pasar a archiver->archive() justo el caso que se supone que evita.
+    $archiverSource=file_get_contents(__DIR__.'/../src/Archiver.php');
+    $assert(str_contains($archiverSource,"preg_match('/^(\\d{4})-(\\d{2})/'"),'Archiver.php debe seguir exigiendo el mismo formato AAAA-MM al inicio de fecha_factura (si cambia ahí, la comprobación de Worker.php debe revisarse a la vez)');
+});
+$test('Fase 15 — Worker: fecha_factura inválida en un documento needs_review (no classified) nunca degrada nada — el guard solo actúa quando el estado ya era classified (regresión: no debe tocar el needs_review/unclassified normal)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert(str_contains($source,"\$invalidDate=\$status==='classified'&&!preg_match"),'el guard de fecha inválida debe estar condicionado a status==="classified" — needs_review/unclassified no deben pasar por aquí, ya iban a la carpeta de no clasificados de todos modos');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

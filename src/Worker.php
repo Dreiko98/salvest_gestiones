@@ -285,6 +285,17 @@ final class Worker
         $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver,$resolutionTrace);
         $decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
 
+        // Fase 15: una fecha de factura ausente o con un formato que Archiver no reconoce nunca
+        // debe destruir todo el intento — antes, Archiver::archive() lanzaba una excepción no
+        // capturada aquí, y esa excepción se comía la copia local del PDF, el JSON de extracción
+        // y el detalle técnico entero, dejando solo una fila 'error' opaca sin nada que revisar
+        // (caso real: un "Estado de Cuenta" con comunidad y proveedor ya resueltos, pero sin una
+        // fecha de factura reconocible). Se degrada a needs_review con motivo explícito — el
+        // documento sigue archivándose (a la carpeta de no clasificados) y queda descargable y
+        // con su detalle técnico, en vez de perderse.
+        $invalidDate=$status==='classified'&&!preg_match('/^\d{4}-\d{2}/',(string)($invoice['fecha_factura']??''));
+        if($invalidDate){$status='needs_review';$route['reason']='Fecha de factura no reconocible; revisa y confirma manualmente.';}
+
         $trace->add('community_resolution',['signals'=>$communitySignals,'community_id'=>$decision['community']['id']??null,
             'official_name'=>$decision['community']['official_name']??null,'evidence'=>$decision['evidence']]);
         $communityCandidates=$decision['community']?$this->classifier->suppliersForCommunity((int)$decision['community']['id']):[];
@@ -302,7 +313,7 @@ final class Worker
                 'provider'=>$this->extractor->version(),
                 'validated'=>($route['evidence']['supplier']['type']??null)==='restricted_openai_retry']);
         }
-        $blockingFactor=$status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null);
+        $blockingFactor=$invalidDate?'invalid_date':($status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null));
         $trace->add('final_decision',['status'=>$status,'reason'=>$route['reason'],'blocking_factor'=>$blockingFactor]);
 
         // MySQL corrects OpenAI's suggestion here: $route['service'] already went through

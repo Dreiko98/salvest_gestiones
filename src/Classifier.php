@@ -52,12 +52,21 @@ final class Classifier
             if ($row) return ['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>$field,'type'=>'exact']];
         }
         $communities = $this->db->all('SELECT * FROM communities WHERE active=1');
+        $communitiesById = array_column($communities, null, 'id');
         $aliases = $this->db->all('SELECT a.*,c.official_name,c.main_address,c.cif,c.active FROM community_aliases a JOIN communities c ON c.id=a.community_id WHERE a.active=1 AND c.active=1');
         $candidates = [];
         foreach($communities as$community){$candidates[]=['community'=>$community,'value'=>$community['main_address'],'kind'=>'address'];$candidates[]=['community'=>$community,'value'=>$community['official_name'],'kind'=>'name'];}
         foreach ($aliases as $alias) {
-            $candidates[] = ['community'=>['id'=>$alias['community_id'],'official_name'=>$alias['official_name'],
-                'main_address'=>$alias['main_address'],'cif'=>$alias['cif']],'value'=>$alias['value'],'kind'=>'address'];
+            // Fase 16.2: un candidato vía alias solo necesita el TEXTO del alias para comparar —
+            // pero la comunidad que se devuelve si gana debe ser la fila completa de
+            // `communities` (external_code, cif, main_address... todo), nunca este objeto a
+            // medias construido solo con lo que trae el JOIN del alias. Bug real de producción:
+            // un documento resuelto por alias llegaba a "classified" con una comunidad sin
+            // external_code, y DriveInvoiceArchiver reventaba con "La comunidad no tiene código
+            // externo" al archivar — el documento SÍ se había reconocido bien, solo que el objeto
+            // que se pasaba río abajo estaba incompleto.
+            $fullCommunity = $communitiesById[$alias['community_id']] ?? ['id'=>$alias['community_id'],'official_name'=>$alias['official_name'],'main_address'=>$alias['main_address'],'cif'=>$alias['cif']];
+            $candidates[] = ['community'=>$fullCommunity,'value'=>$alias['value'],'kind'=>'address'];
         }
         // Fase 9: containment safety net — exact whole-word match, no numeric threshold. Same
         // philosophy resolveSupplier() already uses for suppliers (its own supplier_containment

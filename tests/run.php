@@ -3526,13 +3526,18 @@ $test('Fase 9 — ambigüedad: dos comunidades cuyo official_name aparece comple
 
 $test('Fase 9 — contención también aplica vía alias de dirección (no solo official_name)',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
-    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['CP ALIAS',Salvest\Text::normalize('CP ALIAS'),'Avenida Principal 9']);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES (?,?,?,?,1)',['77','CP ALIAS',Salvest\Text::normalize('CP ALIAS'),'Avenida Principal 9']);
     $communityId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
         [$communityId,'address','Calle Secundaria 42',Salvest\Text::normalize('Calle Secundaria 42')]);
     $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'','direccion'=>'Calle Secundaria 42, bajo'],'');
     $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver vía el alias de dirección: '.json_encode($result));
     $assert($result['evidence']['type']==='name_containment');
+    // Fase 16.2: bug real de producción — una comunidad resuelta vía alias llegaba a Drive sin
+    // external_code (DriveInvoiceArchiver reventaba con "La comunidad no tiene código externo"),
+    // porque el candidato de alias se construía a medias en vez de usar la fila real de
+    // `communities`. La comunidad devuelta aquí debe ser la fila COMPLETA, no un objeto parcial.
+    $assert(($result['community']['external_code']??null)==='77','la comunidad resuelta vía alias debe traer external_code (fila completa, no un objeto a medias): '.json_encode($result['community']));
 });
 
 $test('Fase 9 — el contexto del correo (asunto/cuerpo) NUNCA se usa para la contención, solo nombre_comunidad/direccion — a diferencia del tier fuzzy que sí lo usa',static function()use($assert,$sqliteDb,$classifierSchema):void{
@@ -3603,6 +3608,21 @@ $test('Fase 16 — caso real OTIS: "AV MEDITERRANEO 12" (masculino, sin acabar e
         [$communityId,'address','MEDITERRANEO 12',Salvest\Text::normalize('MEDITERRANEO 12')]);
     $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'C.P. MEDITERRANEO 12','direccion'=>'AV MEDITERRANEO 12'],'');
     $assert($result['community']!==null && (int)$result['community']['id']===$communityId,json_encode($result));
+    $assert(($result['community']['external_code']??null)==='90','debe traer external_code — si no, DriveInvoiceArchiver revienta al archivar (bug real: "La comunidad no tiene código externo"): '.json_encode($result['community']));
+});
+$test('Fase 16.2 — un alias también trae external_code cuando resuelve por el tier FUZZY, no solo por contención (bestFuzzyMatch comparte el mismo array de candidatos que la contención — prueba directa por reflexión sobre el método privado, ya que el umbral 92 hace muy difícil forzar el tier fuzzy de punta a punta con datos de prueba cortos)',static function()use($assert):void{
+    $method=new ReflectionMethod(Salvest\Classifier::class,'bestFuzzyMatch');
+    $method->setAccessible(true);
+    // Candidato construido exactamente como Classifier::classify() construye uno vía alias
+    // ANTES del arreglo: solo id/official_name/main_address/cif, sin external_code — y uno
+    // construido como debería quedar DESPUÉS del arreglo, con la fila completa.
+    $candidatesBeforeFix=[['community'=>['id'=>64,'official_name'=>'JAIME CHICHARRO 27','main_address'=>'CALLE JAIME CHICHARRO 27','cif'=>'H12247573'],'value'=>'CHICHARRO 27','kind'=>'address']];
+    $candidatesAfterFix=[['community'=>['id'=>64,'external_code'=>'64','official_name'=>'JAIME CHICHARRO 27','main_address'=>'CALLE JAIME CHICHARRO 27','cif'=>'H12247573'],'value'=>'CHICHARRO 27','kind'=>'address']];
+    $queries=['address'=>['CHICHARRO 27'],'name'=>[]];
+    $before=$method->invoke(null,$candidatesBeforeFix,$queries,null);
+    $after=$method->invoke(null,$candidatesAfterFix,$queries,null);
+    $assert(!array_key_exists('external_code',$before['best']),'reproduce el bug real tal cual estaba: el ganador del fuzzy vía alias no traía external_code');
+    $assert(($after['best']['external_code']??null)==='64','con la fila completa como candidato, el ganador del fuzzy sí trae external_code — así es como Classifier::classify() debe construir los candidatos de alias ahora');
 });
 $test('Fase 16 — quitar el prefijo genérico no inventa coincidencias entre calles distintas (regresión: solo se perdona la palabra de tipo de vía, el resto de la dirección se sigue exigiendo exacto)',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);

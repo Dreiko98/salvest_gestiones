@@ -11,7 +11,7 @@ final class Text
         $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
         $ascii = mb_strtolower($ascii, 'UTF-8');
         $words = preg_split('/[^a-z0-9]+/', $ascii, -1, PREG_SPLIT_NO_EMPTY) ?: [];
-        $replacements = ['avinguda'=>'avenida','avda'=>'avenida','carrer'=>'calle','placa'=>'plaza'];
+        $replacements = ['avinguda'=>'avenida','avda'=>'avenida','av'=>'avenida','carrer'=>'calle','placa'=>'plaza'];
         return implode(' ', array_map(static fn(string $word): string => $replacements[$word] ?? $word, $words));
     }
 

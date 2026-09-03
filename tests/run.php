@@ -3564,6 +3564,10 @@ $test('Fase 9 — sin contención NI fuzzy suficiente, sigue sin resolver comuni
 // texto extraído.
 // ============================================================================================
 
+$test('Fase 16 — Text::normalize() reconoce "AV" como abreviatura de "Avenida", igual que ya hacía con "AVDA" (caso real: OTIS escribe "AV MEDITERRANEO 12" en sus partes de trabajo)',static function()use($assert):void{
+    $assert(Salvest\Text::normalize('AV Mediterraneo 12')==='avenida mediterraneo 12');
+    $assert(Salvest\Text::normalize('Av. Mediterraneo 12')===Salvest\Text::normalize('Avda. Mediterraneo 12'),'"Av" y "Avda" deben normalizar exactamente igual');
+});
 $test('Fase 16 — Text::stripLeadingAddressWord() quita como mucho una palabra genérica del principio, nunca del medio ni si es la única palabra',static function()use($assert):void{
     $assert(Salvest\Text::stripLeadingAddressWord('calle encarnacion 35')==='encarnacion 35');
     $assert(Salvest\Text::stripLeadingAddressWord('avenida mediterranea 12')==='mediterranea 12');
@@ -3590,6 +3594,16 @@ $test('Fase 16 — el prefijo genérico también funciona al revés: maestro sin
     $assert($result['community']!==null && (int)$result['community']['id']===$communityId,json_encode($result));
 });
 
+$test('Fase 16 — caso real OTIS: "AV MEDITERRANEO 12" (masculino, sin acabar en "avda") resuelve vía alias "MEDITERRANEO 12" contra la comunidad dada de alta como "AVDA. MEDITERRANEA 12" (femenino)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
+        ['90','AVDA. MEDITERRANEA 12',Salvest\Text::normalize('AVDA. MEDITERRANEA 12'),'H12278057','AVDA MEDITERRANEA 12']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
+        [$communityId,'address','MEDITERRANEO 12',Salvest\Text::normalize('MEDITERRANEO 12')]);
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'C.P. MEDITERRANEO 12','direccion'=>'AV MEDITERRANEO 12'],'');
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,json_encode($result));
+});
 $test('Fase 16 — quitar el prefijo genérico no inventa coincidencias entre calles distintas (regresión: solo se perdona la palabra de tipo de vía, el resto de la dirección se sigue exigiendo exacto)',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['CALLE MAYOR 1',Salvest\Text::normalize('CALLE MAYOR 1'),'CALLE MAYOR 1']);

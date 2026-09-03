@@ -73,10 +73,19 @@ final class Classifier
         $containmentQueries=['address'=>array_filter([(string)($invoice['direccion']??'')]),'name'=>array_filter([(string)($invoice['nombre_comunidad']??'')])];
         $containmentMatches=[];
         foreach ($candidates as $candidate) {
+            // Fase 16: además de la coincidencia exacta, se prueba también quitando como mucho
+            // una palabra genérica de vía ("Calle", "Avenida"...) del principio de la dirección
+            // del maestro — caso real: comunidad dada de alta como "CALLE ENCARNACION 35",
+            // proveedor que en su factura solo escribe "ENCARNACION, 35" (sin "Calle"). Antes no
+            // había match porque la comparación exigía la palabra "calle" también en el texto
+            // extraído, aunque el resto de la dirección coincidiera exactamente.
             $candidateValue=Text::normalize((string)$candidate['value']);
             if ($candidateValue==='') continue;
+            $candidateValueStripped=Text::stripLeadingAddressWord($candidateValue);
             foreach ($containmentQueries[$candidate['kind']] as $query) {
-                if (Text::containsWholeWords(Text::normalize((string)$query),$candidateValue)) {
+                $queryNormalized=Text::normalize((string)$query);
+                if (Text::containsWholeWords($queryNormalized,$candidateValue)
+                    || ($candidateValueStripped!==$candidateValue && Text::containsWholeWords($queryNormalized,$candidateValueStripped))) {
                     $containmentMatches[$candidate['community']['id']]=$candidate['community'];
                     break;
                 }

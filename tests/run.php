@@ -3557,6 +3557,47 @@ $test('Fase 9 — sin contención NI fuzzy suficiente, sigue sin resolver comuni
 });
 
 // ============================================================================================
+// Fase 16 — la contención de comunidad ya no exige la palabra genérica de vía ("Calle",
+// "Avenida"...) exacta al principio de la dirección — caso real de producción: FAIN Ascensores
+// escribe "ENCARNACION, 35" en su parte, pero la comunidad está dada de alta como "CALLE
+// ENCARNACION 35"; antes eso NUNCA contaba como contención porque exigía "calle" también en el
+// texto extraído.
+// ============================================================================================
+
+$test('Fase 16 — Text::stripLeadingAddressWord() quita como mucho una palabra genérica del principio, nunca del medio ni si es la única palabra',static function()use($assert):void{
+    $assert(Salvest\Text::stripLeadingAddressWord('calle encarnacion 35')==='encarnacion 35');
+    $assert(Salvest\Text::stripLeadingAddressWord('avenida mediterranea 12')==='mediterranea 12');
+    $assert(Salvest\Text::stripLeadingAddressWord('encarnacion 35')==='encarnacion 35','sin prefijo genérico, no debe cambiar nada');
+    $assert(Salvest\Text::stripLeadingAddressWord('llombai calle 11')==='llombai calle 11','"calle" en medio de la frase nunca se quita, solo al principio');
+    $assert(Salvest\Text::stripLeadingAddressWord('calle')==='calle','una única palabra nunca se vacía, aunque sea genérica');
+});
+
+$test('Fase 16 — CALLE ENCARNACION 35 (maestro) vs "ENCARNACION, 35, 12530 BURRIANA" (factura real de FAIN Ascensores) -> match por contención pese al prefijo "Calle" ausente',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
+        ['02','ENCARNACION 35',Salvest\Text::normalize('ENCARNACION 35'),'H12798526','CALLE ENCARNACION 35']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>null,'direccion'=>'ENCARNACION, 35, 12530 BURRIANA'],'');
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver a ENCARNACION 35 pese a que la factura no escriba "Calle": '.json_encode($result));
+    $assert($result['evidence']['type']==='name_containment');
+});
+
+$test('Fase 16 — el prefijo genérico también funciona al revés: maestro sin "Avenida", factura que sí la escribe',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['MEDITERRANEA 12',Salvest\Text::normalize('MEDITERRANEA 12'),'MEDITERRANEA 12']);
+    $communityId=(int)$db->pdo()->lastInsertId();
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>null,'direccion'=>'Avenida Mediterranea 12, Burriana'],'');
+    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,json_encode($result));
+});
+
+$test('Fase 16 — quitar el prefijo genérico no inventa coincidencias entre calles distintas (regresión: solo se perdona la palabra de tipo de vía, el resto de la dirección se sigue exigiendo exacto)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['CALLE MAYOR 1',Salvest\Text::normalize('CALLE MAYOR 1'),'CALLE MAYOR 1']);
+    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>null,'direccion'=>'Avenida Menor 5, Burriana'],'');
+    $assert($result['community']===null,'"Mayor 1" y "Menor 5" son calles distintas — quitar el prefijo de tipo de vía nunca debe igualarlas: '.json_encode($result));
+});
+
+// ============================================================================================
 // Fase 9.1 — el contexto del correo (asunto/cuerpo) nunca debe pesar más que los propios campos
 // extraídos de la factura al resolver comunidad por fuzzy. Caso real: una factura de una
 // comunidad, enviada en un correo cuyo asunto/cuerpo mencionaba OTRA comunidad -> el sistema

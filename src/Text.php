@@ -64,6 +64,24 @@ final class Text
         return false;
     }
 
+    /** Palabras genéricas de tipo de vía al principio de una dirección normalizada — de sobra
+     * conocidas, no aportan nada para identificar UNA comunidad en concreto. Muchos proveedores
+     * las omiten al escribir la dirección del cliente aunque la comunidad esté dada de alta con
+     * ese prefijo ("Calle Encarnacion 35" en el maestro, "Encarnacion 35" en la factura) — o al
+     * revés. Fase 16: quita como mucho UNA palabra genérica, y solo si está al principio, nunca
+     * en medio ni más de una — así dos direcciones que solo difieren en ese prefijo cuentan como
+     * la misma, sin arriesgarse a recortar una palabra que sí distinga una comunidad de otra. */
+    private const GENERIC_ADDRESS_WORDS = ['calle','avenida','plaza','paseo','ronda','carretera','camino','via','grupo','urbanizacion'];
+    public static function stripLeadingAddressWord(string $normalized): string
+    {
+        $words = explode(' ', $normalized);
+        if (count($words) > 1 && in_array($words[0], self::GENERIC_ADDRESS_WORDS, true)) {
+            array_shift($words);
+            return implode(' ', $words);
+        }
+        return $normalized;
+    }
+
     /** Does every word of $needle appear somewhere among $haystack's words, in any order? */
     public static function containsAllWords(string $haystack, string $needle): bool
     {

@@ -148,11 +148,17 @@ final class Worker
                         $this->saveMessage($mailbox,$client,$uid,$message,'ignored',0,null);
                         continue;
                     }
-                    $communityIds = array_values(array_unique(array_filter(array_column($outcomes,'community_id'))));
+                    // Fase 18: una única carpeta "Facturas" para TODO lo clasificado, sin
+                    // importar a cuántas comunidades distintas pertenezcan sus adjuntos — antes
+                    // se movía a una carpeta por comunidad (y solo cuando todos los adjuntos eran
+                    // de la misma), lo que además de complicar el correo sin necesidad (cada
+                    // comunidad con su propia carpeta IMAP) era la fuente directa de bugs reales
+                    // de nomenclatura (espacios repetidos, "TRYCREATE" de Gmail — ver Fase 17).
+                    // El archivo real de cada factura (en Drive, por comunidad) no cambia en
+                    // absoluto: esto solo afecta a dónde va a parar el CORREO ya procesado.
                     $allClassified = !array_filter($outcomes,static fn(array $item): bool => !in_array($item['status'],['classified','duplicate'],true));
-                    if ($allClassified && count($communityIds) === 1) {
-                        $community = $this->db->one('SELECT * FROM communities WHERE id=?',[$communityIds[0]]);
-                        $destination = 'facturgerman/'.($community['imap_folder_name'] ?: Text::slug((string)$community['official_name']));
+                    if ($allClassified) {
+                        $destination = 'facturgerman/Facturas';
                         try {
                             $client->markSeen($uid); $client->move($uid,$destination);
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'moved');

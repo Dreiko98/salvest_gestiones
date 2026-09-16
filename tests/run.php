@@ -2656,6 +2656,12 @@ $test('Fase 14 — la carpeta base del correo es "facturgerman", ya no "Facturas
         $assert(str_contains($source,"facturgerman/"),"$file debe usar la carpeta nueva 'facturgerman/'");
     }
 });
+$test('Fase 18 — un correo totalmente clasificado se mueve SIEMPRE a "facturgerman/Facturas", una única carpeta para todo — nunca a una carpeta por comunidad (guarda de regresión de código: la carpeta por comunidad fue la causa directa de bugs reales de nomenclatura IMAP, Fase 17)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert(str_contains($source,"'facturgerman/Facturas'"),'debe existir la carpeta única de destino para todo lo clasificado');
+    $assert(!str_contains($source,"imap_folder_name"),'Worker.php ya no debe construir el destino IMAP a partir de la comunidad — eso es justo lo que causaba el bug de Fase 17');
+    $assert(!str_contains($source,'communityIds'),'ya no debe importar a cuántas comunidades distintas pertenecen los adjuntos de un correo para decidir dónde moverlo');
+});
 $test('Worker: cuando todos los adjuntos de un correo quedan excluidos, se usa exactamente el mismo saveMessage(...\'ignored\',0,null) que el caso "sin adjuntos" — sin destino, sin IMAP move (guarda de regresión de código)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
     $noAttachmentsSave=strpos($source,"\$this->saveMessage(\$mailbox,\$client,\$uid,\$message,'ignored',0,null);");

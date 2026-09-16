@@ -37,6 +37,12 @@ archivedToggle?.addEventListener('click',()=>{
 if(archivedPanel){
   const toDateOnly=iso=>{const[y,m,d]=iso.split('-').map(Number);return new Date(y,m-1,d);};
   const todayDate=toDateOnly(archivedPanel.dataset.today||new Date().toISOString().slice(0,10));
+  // Fase 19: el número del recuadro "Archivadas hoy" refleja el periodo elegido en el propio
+  // historial — si se mira "Esta semana"/"Este mes"/"Mes pasado", el número cambia a cuántas se
+  // archivaron en ESE periodo; en "Hoy" se deja tal cual lo mandó el servidor (nunca se recalcula
+  // aquí, para no arriesgarse a un desfase con el COUNT(*) real del servidor).
+  const archivedCount=archivedToggle?.querySelector('strong');
+  const archivedTodayCount=archivedCount?.textContent;
   const periodBounds=period=>{
     if(period==='today')return[todayDate,todayDate];
     if(period==='week'){
@@ -66,6 +72,7 @@ if(archivedPanel){
     });
     const table=archivedPanel.querySelector('.table-wrap');
     if(table)table.hidden=visible===0;
+    if(archivedCount)archivedCount.textContent=period==='today'?archivedTodayCount:String(visible);
   };
   archivedPanel.querySelectorAll('.filter-chip').forEach(chip=>{
     chip.addEventListener('click',()=>{

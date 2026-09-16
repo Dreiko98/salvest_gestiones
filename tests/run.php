@@ -1574,6 +1574,16 @@ $test('Fase 13 — Inicio: existen los 4 filtros de periodo, con "Hoy" activo po
     }
     $assert(str_contains($html,'data-today="'),'el panel debe llevar la fecha de "hoy" calculada por el servidor, nunca confiar en el reloj del navegador');
 });
+$test('Fase 19 — Inicio: "Archivadas hoy" muestra fecha (d/m/Y) y hora de archivado en columnas separadas, no solo la hora — antes la fecha solo vivía oculta en data-date, para el filtro',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    $db->execute("INSERT INTO processed_attachments(status,processed_at,provider,service_type,output_path) VALUES (?,?,?,?,?)",
+        ['classified','2026-08-21 09:05:00','PROVEEDOR CON FECHA','agua','/x/con-fecha.pdf']);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'<th>Fecha</th>'),'debe existir una columna de Fecha, separada de la de Hora: '.$html);
+    $assert(str_contains($html,'21/08/2026'),'la fecha debe mostrarse en formato d/m/Y, igual que el resto de la aplicación (formatRunTime): '.$html);
+    $assert(str_contains($html,'09:05'),'la hora debe seguir mostrándose, junto a la fecha, no en su lugar: '.$html);
+});
 $test('Inicio: el botón "Archivadas hoy" está correctamente enlazado al panel desplegable',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
     set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));

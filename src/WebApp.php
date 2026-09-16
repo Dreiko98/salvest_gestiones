@@ -154,11 +154,18 @@ final class WebApp
             foreach($rows as $row){
                 $processedAt=(string)$row['processed_at'];
                 $date=substr($processedAt,0,10);
-                $time=(static function(string $value):string{try{return(new \DateTimeImmutable($value))->format('H:i');}catch(\Throwable){return'—';}})($processedAt);
+                // Fase 19: fecha y hora de archivado, ambas visibles en la propia tabla — antes
+                // la fecha solo vivía en el atributo data-date (oculto, solo para el filtro de
+                // periodo) y la fila únicamente mostraba la hora, así que al mirar varias
+                // semanas o meses a la vez no había forma de saber qué día era cada factura.
+                [$displayDate,$time]=(static function(string $value):array{
+                    try{$parsed=new \DateTimeImmutable($value);return[$parsed->format('d/m/Y'),$parsed->format('H:i')];}
+                    catch(\Throwable){return['—','—'];}
+                })($processedAt);
                 $location=$row['drive_path']?:($row['output_path']?:'—');
-                $tableRows.='<tr data-date="'.$this->e($date).'"><td class="mono">'.$this->e($time).'</td><td><strong>'.$this->e($row['official_name']?:'Sin comunidad').'</strong></td><td>'.$this->e($row['provider']?:'—').'</td><td>'.$this->e($row['service_type']?:'—').'</td><td class="mono">'.$this->e($location).'</td></tr>';
+                $tableRows.='<tr data-date="'.$this->e($date).'"><td class="mono">'.$this->e($displayDate).'</td><td class="mono">'.$this->e($time).'</td><td><strong>'.$this->e($row['official_name']?:'Sin comunidad').'</strong></td><td>'.$this->e($row['provider']?:'—').'</td><td>'.$this->e($row['service_type']?:'—').'</td><td class="mono">'.$this->e($location).'</td></tr>';
             }
-            $body='<div class="table-wrap"><table><thead><tr><th>Hora</th><th>Comunidad</th><th>Proveedor</th><th>Servicio</th><th>Ruta</th></tr></thead><tbody>'.$tableRows.'</tbody></table></div>'.
+            $body='<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Hora</th><th>Comunidad</th><th>Proveedor</th><th>Servicio</th><th>Ruta</th></tr></thead><tbody>'.$tableRows.'</tbody></table></div>'.
                 '<p class="muted" data-period-empty="today" hidden>Todavía no se ha archivado ninguna factura hoy.</p>'.
                 '<p class="muted" data-period-empty="week" hidden>No se ha archivado ninguna factura esta semana.</p>'.
                 '<p class="muted" data-period-empty="month" hidden>No se ha archivado ninguna factura este mes.</p>'.

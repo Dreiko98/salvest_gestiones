@@ -1584,6 +1584,23 @@ $test('Fase 19 — Inicio: "Archivadas hoy" muestra fecha (d/m/Y) y hora de arch
     $assert(str_contains($html,'21/08/2026'),'la fecha debe mostrarse en formato d/m/Y, igual que el resto de la aplicación (formatRunTime): '.$html);
     $assert(str_contains($html,'09:05'),'la hora debe seguir mostrándose, junto a la fecha, no en su lugar: '.$html);
 });
+$test('Fase 19.1 — Inicio: el rótulo "Archivadas hoy" lleva un id estable (archived-today-label) para que app.js pueda cambiarlo a "Archivadas esta semana"/"este mes"/"el mes pasado" según el filtro activo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
+    set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));
+    $_SERVER['REQUEST_METHOD']='GET';$_GET=['route'=>''];
+    $method=new ReflectionMethod(Salvest\WebApp::class,'dashboard');$method->setAccessible(true);
+    ob_start();$method->invoke($webApp);$html=ob_get_clean();
+    restore_error_handler();
+    $assert(str_contains($html,'<span class="metric-label" id="archived-today-label">Archivadas hoy</span>'),'el rótulo debe llevar exactamente ese id, sobre el que engancha app.js: '.$html);
+});
+$test('Fase 19.1 — app.js: el rótulo del recuadro cambia junto con el número, para cada uno de los 4 periodos (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../public/assets/app.js');
+    $assert(str_contains($source,"getElementById('archived-today-label')"),'app.js debe enganchar el rótulo por su id');
+    foreach(["'Archivadas esta semana'","'Archivadas este mes'","'Archivadas el mes pasado'"] as $label){
+        $assert(str_contains($source,$label),"debe existir el texto exacto $label");
+    }
+    $assert(str_contains($source,'archivedLabel.textContent=periodLabels[period]'),'el cambio de rótulo debe aplicarse en el mismo sitio que el cambio de número (applyPeriod)');
+});
 $test('Inicio: el botón "Archivadas hoy" está correctamente enlazado al panel desplegable',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
     set_error_handler(static fn(int$errno,string$message):bool=>str_contains($message,'session')||str_contains($message,'headers already'));

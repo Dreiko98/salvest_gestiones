@@ -116,7 +116,7 @@ final class ImapClient
         if (!$parts) throw new \InvalidArgumentException('Carpeta IMAP vacía');
         $path = '';
         foreach ($parts as $part) {
-            $part = mb_substr(trim((string)preg_replace('/[\x00-\x1F]+/', ' ', $part)), 0, 100);
+            $part = self::sanitizeFolderPart($part);
             $path = $path === '' ? $part : $path.$this->delimiter.$part;
             try { $this->command('CREATE '.$this->mailbox($path)); }
             catch (\RuntimeException $error) {
@@ -124,6 +124,21 @@ final class ImapClient
             }
         }
         return $this->mailbox($path);
+    }
+
+    /** Caso real de producción: una comunidad con dos espacios seguidos en su nombre oficial
+     * ("CL SANTA TERESA  Y PLAZA SAN MARCOS 14") generaba una carpeta IMAP con esos dos espacios
+     * tal cual — CREATE parecía funcionar, pero Gmail normaliza internamente el nombre de la
+     * etiqueta a un solo espacio, así que el UID COPY posterior fallaba con "No folder ... (single
+     * space)": la carpeta que Gmail creó de verdad nunca coincidía con el nombre exacto que
+     * seguíamos usando. El correo se quedaba entonces atascado en la bandeja de entrada aunque
+     * las facturas ya se hubieran archivado bien. Colapsar cualquier repetición de espacios en
+     * blanco a uno solo, aquí, evita el desajuste desde el origen. */
+    public static function sanitizeFolderPart(string $part): string
+    {
+        $part = (string)preg_replace('/[\x00-\x1F]+/', ' ', $part);
+        $part = (string)preg_replace('/\s+/', ' ', $part);
+        return mb_substr(trim($part), 0, 100);
     }
 
     private function command(string $command): string

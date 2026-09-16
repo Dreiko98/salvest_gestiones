@@ -154,6 +154,13 @@ $test('cifrado autenticado',static function()use($assert):void{
 $test('imap modified utf7',static function()use($assert):void{
     $assert(Salvest\ImapClient::modifiedUtf7('Pendientes de revisión')==='Pendientes de revisi&APM-n');
 });
+$test('Fase 17 — ImapClient::sanitizeFolderPart() colapsa espacios repetidos a uno solo (caso real de producción: comunidad "CL SANTA TERESA  Y PLAZA SAN MARCOS 14" con doble espacio hacía que Gmail creara la carpeta con un solo espacio y el UID COPY posterior fallara con "No folder..." — el correo se quedaba atascado en la bandeja de entrada aunque las facturas ya se hubieran archivado bien)',static function()use($assert):void{
+    $assert(Salvest\ImapClient::sanitizeFolderPart('71 - CL SANTA TERESA  Y PLAZA SAN MARCOS 14')==='71 - CL SANTA TERESA Y PLAZA SAN MARCOS 14');
+    $assert(Salvest\ImapClient::sanitizeFolderPart('70 - CL.  ESCORREDOR 46')==='70 - CL. ESCORREDOR 46');
+    $assert(Salvest\ImapClient::sanitizeFolderPart('Pendientes de revisión')==='Pendientes de revisión','sin espacios repetidos, no debe cambiar nada');
+    $assert(Salvest\ImapClient::sanitizeFolderPart("con\ttabulador")==='con tabulador','un tabulador también cuenta como espacio repetible, no dos palabras pegadas');
+    $assert(Salvest\ImapClient::sanitizeFolderPart('  bordes con espacios  ')==='bordes con espacios','recorta espacios sueltos al principio y al final, como antes');
+});
 $test('proveedores IMAP seguros',static function()use($assert):void{
     $assert(Salvest\MailboxProvider::connection('gmail')===['host'=>'imap.gmail.com','port'=>993,'use_ssl'=>1]);
     $assert(Salvest\MailboxProvider::connection('ionos')===['host'=>'imap.ionos.es','port'=>993,'use_ssl'=>1]);

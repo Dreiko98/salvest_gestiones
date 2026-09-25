@@ -522,8 +522,17 @@ final class WebApp
         if($_SERVER['REQUEST_METHOD']==='POST'&&($_POST['action']??'')==='purge'){
             if(!hash_equals('PURGE',(string)($_POST['confirm_purge']??'')))throw new \RuntimeException('La acción no fue confirmada');
             $result=(new AttachmentPurge($this->db))->purge((int)($_POST['id']??0));
-            if($result['ok'])$this->audit('purge','attachment',(int)($_POST['id']??0),$result['deleted']??null);
-            $this->redirect('/?route=reviews&'.($result['ok']?'purged=1':'purge_error='.rawurlencode($result['message'])));
+            $moveError='';
+            if($result['ok']){
+                $this->audit('purge','attachment',(int)($_POST['id']??0),$result['deleted']??null);
+                // Fase 21: si lo borrado era lo único pendiente de un correo cuyas otras facturas ya
+                // están clasificadas (caso típico: aviso de privacidad junto a un parte), el correo
+                // sale ahora de la bandeja de entrada hacia "Facturas".
+                $deleted=$result['deleted'];
+                $finalized=(new MessageFinalizer($this->db,$this->crypto,$this->config))->finalizeMessage((int)$deleted['mailbox_id'],(string)$deleted['uidvalidity'],(string)$deleted['message_uid']);
+                if(!$finalized['moved']&&!in_array($finalized['message'],['pending_siblings','nothing_classified','no_message'],true))$moveError='&move_error='.rawurlencode($finalized['message']);
+            }
+            $this->redirect('/?route=reviews&'.($result['ok']?'purged=1'.$moveError:'purge_error='.rawurlencode($result['message'])));
         }
         if($_SERVER['REQUEST_METHOD']==='POST'){
             $attachment=$this->db->one('SELECT * FROM processed_attachments WHERE id=?',[(int)$_POST['id']]);
@@ -536,12 +545,17 @@ final class WebApp
             $this->db->execute("UPDATE processed_attachments SET community_id=?,provider=?,service_type=?,invoice_date=?,amount=?,invoice_number=?,confidence=100,
                 final_filename=?,output_path=?,drive_file_id=?,drive_path=?,drive_status=?,status='classified',error_message=NULL,processed_at=NOW() WHERE id=?",[$community['id'],$supplier['official_name'],mb_strtolower((string)$supplier['category']),$_POST['invoice_date'],$_POST['amount']?:null,$_POST['invoice_number']?:null,basename($target),$target,$drive['id']??null,$drive['path']??null,$drive?'uploaded':null,$attachment['id']]);
             $this->audit('confirm_classification','attachment',$attachment['id'],['community_id'=>$community['id'],'supplier_id'=>$supplier['id']]);
-            $this->redirect('/?route=reviews');
+            // Fase 21: si con esto ya no queda nada pendiente en ese correo, sale de la bandeja de
+            // entrada hacia "Facturas". Si el movimiento falla, la factura sigue archivada igual.
+            $finalized=(new MessageFinalizer($this->db,$this->crypto,$this->config))->finalizeIfComplete((int)$attachment['id']);
+            $failedMove=!$finalized['moved']&&!in_array($finalized['message'],['pending_siblings','nothing_classified','no_attachment','no_message'],true);
+            $this->redirect('/?route=reviews'.($failedMove?'&move_error='.rawurlencode($finalized['message']):''));
         }
         $rows=$this->db->all("SELECT pa.*,c.official_name FROM processed_attachments pa LEFT JOIN communities c ON c.id=pa.community_id WHERE pa.status IN ('unclassified','needs_review','error') ORDER BY pa.processed_at DESC LIMIT 200");
         $communities=$this->db->all('SELECT id,official_name FROM communities WHERE active=1 ORDER BY official_name');$suppliers=$this->db->all('SELECT id,name,official_name FROM suppliers WHERE active=1 ORDER BY official_name');$services=$this->db->all('SELECT normalized_name,name FROM service_types WHERE active=1 ORDER BY name');
         $banner='';
-        if(($_GET['requeued']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Factura devuelta a la bandeja de entrada</strong><small>Se procesará de nuevo en la próxima ejecución del bot.</small></span></section>';
+        if(($_GET['move_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>Hecho, pero el correo no se pudo mover a «Facturas»</strong><small>'.$this->e((string)$_GET['move_error']).'. Puedes moverlo a mano en Gmail.</small></span></section>';
+        elseif(($_GET['requeued']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Factura devuelta a la bandeja de entrada</strong><small>Se procesará de nuevo en la próxima ejecución del bot.</small></span></section>';
         elseif(($_GET['requeue_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo volver a procesar</strong><small>'.$this->e((string)$_GET['requeue_error']).'</small></span></section>';
         elseif(($_GET['dismissed']??'')==='1')$banner='<section class="status ok"><span class="status-ring"><i></i></span><span><strong>Correo marcado como que no contiene ninguna factura</strong><small>Ha vuelto a la bandeja de entrada y Salvest no volverá a procesarlo.</small></span></section>';
         elseif(($_GET['dismiss_error']??'')!=='')$banner='<section class="status warning"><span class="status-ring"><i></i></span><span><strong>No se pudo completar</strong><small>'.$this->e((string)$_GET['dismiss_error']).'</small></span></section>';
@@ -677,7 +691,7 @@ final class WebApp
             $confirmDismiss='Este correo volverá a la bandeja de entrada y Salvest dejará de procesarlo en futuras ejecuciones. Se conservará el historial técnico de este intento. ¿Confirmas que este correo no contiene ninguna factura?';
             $dismiss='<form method="post" action="/?route=reviews" class="inline dismiss-form" data-confirm="'.$this->e($confirmDismiss).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="dismiss"><input type="hidden" name="confirm_dismiss" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="button-quiet">Esto no es una factura</button></form>';
         }
-        $confirmPurge='Esta factura se eliminará por completo de Salvest — no podrás recuperarla desde el panel. El correo no se moverá ni se tocará. Si el mismo documento vuelve a llegar, se procesará como si fuera nuevo. ¿Confirmas que quieres eliminarla?';
+        $confirmPurge='Esta factura se eliminará por completo de Salvest — no podrás recuperarla desde el panel. El correo no se borrará; si ya no queda nada pendiente en él, saldrá de la bandeja de entrada hacia «Facturas». Si el mismo documento vuelve a llegar, se procesará como si fuera nuevo. ¿Confirmas que quieres eliminarla?';
         $purge='<form method="post" action="/?route=reviews" class="inline purge-form" data-confirm="'.$this->e($confirmPurge).'"><input type="hidden" name="csrf" value="'.$this->auth->csrf().'"><input type="hidden" name="action" value="purge"><input type="hidden" name="confirm_purge" value=""><input type="hidden" name="id" value="'.$row['id'].'"><button type="submit" class="danger">Eliminar factura</button></form>';
         return '<div class="review-actions">'.$requeue.$dismiss.$purge.'</div>';
     }

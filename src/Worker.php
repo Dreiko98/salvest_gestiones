@@ -166,20 +166,19 @@ final class Worker
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'failed',$imapError->getMessage());
                         }
                     } else {
-                        $allUnknown = !array_filter($outcomes,static fn(array $item): bool => $item['status'] !== 'unclassified');
-                        $destination = $allUnknown ? 'facturgerman/Sin clasificar' : 'facturgerman/Pendientes de revisión';
-                        try {
-                            $client->move($uid,$destination);
-                            $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'moved');
-                        } catch (\Throwable $imapError) {
-                            $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'failed',$imapError->getMessage());
-                        }
+                        // Fase 21: lo que va a revisión se queda en la bandeja de entrada hasta que
+                        // se clasifique — ya no se mueve a "Pendientes de revisión"/"Sin
+                        // clasificar". No se reprocesa en cada pasada: el status 'needs_review'
+                        // ya está en la lista de estados que el bucle de arriba se salta. Cuando
+                        // alguien lo confirma a mano en /Revisar, MessageFinalizer lo mueve a
+                        // "Facturas"; si se reprocesa ("Volver a procesar") y sale clasificado, lo
+                        // mueve el propio bot por la rama de arriba.
+                        $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),null);
                     }
                 } catch (\Throwable $error) {
-                    try { $client->move($uid,'facturgerman/Errores'); } catch (\Throwable $moveError) {
-                        $error = new \RuntimeException($error->getMessage().'; movimiento IMAP: '.$moveError->getMessage(),0,$error);
-                    }
-                    $this->saveMessage($mailbox,$client,$uid,$message,'error',count($message['attachments']),'facturgerman/Errores','failed',$error->getMessage());
+                    // Fase 21: un error también aparece en /Revisar, así que sigue la misma regla —
+                    // el correo se queda en la bandeja de entrada.
+                    $this->saveMessage($mailbox,$client,$uid,$message,'error',count($message['attachments']),null,'not_required',$error->getMessage());
                     $counts['errors']++;
                 }
             }

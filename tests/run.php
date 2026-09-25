@@ -3845,6 +3845,79 @@ $test('Fase 15 — Worker: fecha_factura inválida en un documento needs_review 
     $assert(str_contains($source,"\$invalidDate=\$status==='classified'&&!preg_match"),'el guard de fecha inválida debe estar condicionado a status==="classified" — needs_review/unclassified no deben pasar por aquí, ya iban a la carpeta de no clasificados de todos modos');
 });
 
+// ============================================================================================
+// Fase 21 — lo que va a revisión se queda en la bandeja de entrada hasta que se clasifique.
+// ============================================================================================
+$test('Fase 21 — MessageFinalizer: al confirmar la última pendiente de un correo, se busca en la bandeja de entrada y se mueve a "facturgerman/Facturas"',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');
+    $fixture=$seedRequeueFixture($db,['classified','classified'],'not_required');
+    $fake=$fakeRequeueImapClient(['777']);$folders=[];
+    $finalizer=new Salvest\MessageFinalizer($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$workerConfig(),static function(array $mailbox,string $folder)use($fake,&$folders){$folders[]=$folder;return $fake;});
+    $result=$finalizer->finalizeIfComplete($fixture['attachmentIds'][1]);
+    $assert($result['moved']===true,json_encode($result));
+    $assert($folders===['INBOX'],'un correo nuevo sigue en la carpeta de entrada del buzón: '.json_encode($folders));
+    $assert($fake->moved===['uid'=>'777','destination'=>'facturgerman/Facturas'],json_encode($fake->moved));
+    $message=$db->one('SELECT status,imap_destination,imap_move_status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message===['status'=>'completed','imap_destination'=>'facturgerman/Facturas','imap_move_status'=>'moved'],json_encode($message));
+});
+$test('Fase 21 — MessageFinalizer: si en ese correo aún queda otra factura pendiente, no se toca el correo (ni siquiera se conecta a IMAP)',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture):void{
+    $db=$sqliteDbWithLock('always-free');
+    $fixture=$seedRequeueFixture($db,['classified','needs_review'],'not_required');
+    $called=false;
+    $finalizer=new Salvest\MessageFinalizer($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$workerConfig(),static function()use(&$called){$called=true;throw new RuntimeException('no debería llamarse');});
+    $result=$finalizer->finalizeIfComplete($fixture['attachmentIds'][0]);
+    $assert($result===['moved'=>false,'message'=>'pending_siblings'],json_encode($result));
+    $assert(!$called,'no debe abrirse ninguna conexión IMAP mientras quede algo pendiente');
+    $assert($db->one('SELECT status FROM processed_messages WHERE id=?',[$fixture['messageId']])['status']==='needs_review');
+});
+$test('Fase 21 — MessageFinalizer: un correo antiguo (de antes de Fase 21) que ya estaba en "Pendientes de revisión" se busca ahí, no en la bandeja de entrada',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');
+    $fixture=$seedRequeueFixture($db,['classified'],'moved');
+    $fake=$fakeRequeueImapClient(['12']);$folders=[];
+    $finalizer=new Salvest\MessageFinalizer($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$workerConfig(),static function(array $mailbox,string $folder)use($fake,&$folders){$folders[]=$folder;return $fake;});
+    $result=$finalizer->finalizeIfComplete($fixture['attachmentIds'][0]);
+    $assert($result['moved']===true&&$folders===['facturgerman/Pendientes de revisión'],json_encode([$result,$folders]));
+});
+$test('Fase 21 — MessageFinalizer: si el correo no aparece, la factura sigue clasificada y solo queda anotado el fallo de movimiento',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');
+    $fixture=$seedRequeueFixture($db,['classified'],'not_required');
+    $fake=$fakeRequeueImapClient([]);
+    $finalizer=new Salvest\MessageFinalizer($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$workerConfig(),static fn()=>$fake);
+    $result=$finalizer->finalizeIfComplete($fixture['attachmentIds'][0]);
+    $assert($result['moved']===false&&str_contains($result['message'],'no se encontró'),json_encode($result));
+    $assert($db->one('SELECT status FROM processed_attachments WHERE id=?',[$fixture['attachmentIds'][0]])['status']==='classified','la factura nunca se desclasifica por un fallo de IMAP');
+    $message=$db->one('SELECT status,imap_move_status FROM processed_messages WHERE id=?',[$fixture['messageId']]);
+    $assert($message===['status'=>'completed','imap_move_status'=>'failed'],json_encode($message));
+});
+$test('Fase 21 — tras "Eliminar factura" del único pendiente (p.ej. aviso de privacidad junto a un parte ya archivado), el correo sale hacia "Facturas"; si no quedaba ninguna clasificada, se queda donde está',static function()use($assert,$sqliteDbWithLock,$workerConfig,$seedRequeueFixture,$fakeRequeueImapClient):void{
+    $db=$sqliteDbWithLock('always-free');
+    $fixture=$seedRequeueFixture($db,['classified','needs_review'],'not_required');
+    (new Salvest\AttachmentPurge($db))->purge($fixture['attachmentIds'][1]);
+    $fake=$fakeRequeueImapClient(['55']);
+    $finalizer=new Salvest\MessageFinalizer($db,new Salvest\Crypto(Salvest\Crypto::generateKey()),$workerConfig(),static fn()=>$fake);
+    $result=$finalizer->finalizeMessage($fixture['mailboxId'],'1001','500');
+    $assert($result['moved']===true&&$fake->moved['destination']==='facturgerman/Facturas',json_encode($result));
+
+    $db2=$sqliteDbWithLock('always-free');
+    $only=$seedRequeueFixture($db2,['needs_review'],'not_required');
+    (new Salvest\AttachmentPurge($db2))->purge($only['attachmentIds'][0]);
+    $called=false;
+    $finalizer2=new Salvest\MessageFinalizer($db2,new Salvest\Crypto(Salvest\Crypto::generateKey()),$workerConfig(),static function()use(&$called){$called=true;throw new RuntimeException('no');});
+    $assert($finalizer2->finalizeMessage($only['mailboxId'],'1001','500')===['moved'=>false,'message'=>'nothing_classified']&&!$called,'un correo sin ninguna factura clasificada nunca va a "Facturas"');
+});
+$test('Fase 21 — Worker: revisión y error ya no mueven el correo (se queda en la bandeja de entrada); solo lo totalmente clasificado va a "Facturas" (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $assert(substr_count($source,'$client->move(')===1,'solo debe quedar un movimiento IMAP en Worker.php: el de lo totalmente clasificado');
+    $assert(!str_contains($source,"'facturgerman/Pendientes de revisión'")&&!str_contains($source,"'facturgerman/Sin clasificar'")&&!str_contains($source,"'facturgerman/Errores'"),'Worker.php ya no debe mover a las carpetas de revisión/errores');
+    $assert(str_contains($source,"\$this->saveMessage(\$mailbox,\$client,\$uid,\$message,'needs_review',count(\$outcomes),null);"),'lo que va a revisión se guarda sin destino');
+    $assert(str_contains($source,"in_array(\$existing['status'],['completed','ignored','needs_review','error'],true)) continue;"),'needs_review y error se siguen saltando en las pasadas siguientes: quedarse en la bandeja no puede hacer que se reprocese una y otra vez');
+    $web=file_get_contents(__DIR__.'/../src/WebApp.php');
+    $confirmPos=strpos($web,"'confirm_classification'");
+    $assert($confirmPos!==false&&strpos($web,'->finalizeIfComplete(',$confirmPos)!==false,'"Confirmar y archivar" debe finalizar el correo DESPUÉS de guardar la factura');
+    $purgePos=strpos($web,"new AttachmentPurge(");
+    $assert($purgePos!==false&&strpos($web,'->finalizeMessage(',$purgePos)!==false,'"Eliminar factura" debe intentar finalizar el correo después de borrar');
+});
+
 $failed=0;
 foreach($tests as $name=>$callback){try{$callback();echo "PASS $name\n";}catch(Throwable $error){$failed++;echo "FAIL $name: {$error->getMessage()}\n";}}
 echo sprintf("%d tests, %d failed\n",count($tests),$failed);

@@ -12,7 +12,19 @@ final class Text
         $ascii = mb_strtolower($ascii, 'UTF-8');
         $words = preg_split('/[^a-z0-9]+/', $ascii, -1, PREG_SPLIT_NO_EMPTY) ?: [];
         $replacements = ['avinguda'=>'avenida','avda'=>'avenida','av'=>'avenida','carrer'=>'calle','placa'=>'plaza'];
-        return implode(' ', array_map(static fn(string $word): string => $replacements[$word] ?? $word, $words));
+        $words = array_map(static fn(string $word): string => $replacements[$word] ?? $word, $words);
+        // Fase 20: el marcador de número ("N-12", "Nº 1", "núm. 5", "nº12") no forma parte de la
+        // dirección — caso real: "MEDITERRANEO N-12" y "LES ERES N-3" no coincidían con las
+        // comunidades "…12" y "LES ERES 3" porque la "n" se quedaba entre el nombre y el número.
+        // Solo se quita cuando va justo delante de un número; "n", "no" o "num" sueltos se quedan.
+        $markers = ['n','no','num','numero','nro'];
+        $result = [];
+        foreach ($words as $index => $word) {
+            if (preg_match('/^(?:n|no|num|nro)(\d+)$/', $word, $match)) { $result[] = $match[1]; continue; }
+            if (in_array($word, $markers, true) && preg_match('/^\d/', $words[$index + 1] ?? '')) continue;
+            $result[] = $word;
+        }
+        return implode(' ', $result);
     }
 
     /**

@@ -59,6 +59,12 @@ final class InvoiceRouter
                         $chosenId=$restrictedResolver($candidates,$community);
                         if($chosenId!==null){
                             $confirmed=$this->classifier->supplierInCommunity((int)$community['id'],(int)$chosenId);
+                            // Fase 20: misma regla que el nivel comunidad+servicio de Classifier —
+                            // si el documento y el proveedor elegido tienen ambos CIF y no
+                            // coinciden, la elección de la IA se descarta: es otro emisor.
+                            $documentCif=Text::normalizeIdentifier((string)($invoice['proveedor_cif']??''));
+                            $chosenCif=$confirmed?Text::normalizeIdentifier((string)($confirmed['cif']??'')):'';
+                            if($documentCif!==''&&$chosenCif!==''&&$documentCif!==$chosenCif)$confirmed=null;
                             if($confirmed){
                                 $supplier=$confirmed;$relation=['category'=>$confirmed['category'],'contract_reference'=>$confirmed['contract_reference']];
                                 $supplierEvidence=['field'=>'proveedor','type'=>'restricted_openai_retry'];

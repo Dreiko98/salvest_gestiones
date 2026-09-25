@@ -302,6 +302,15 @@ final class Worker
         $invalidDate=$status==='classified'&&!preg_match('/^\d{4}-\d{2}/',(string)($invoice['fecha_factura']??''));
         if($invalidDate){$status='needs_review';$route['reason']='Fecha de factura no reconocible; revisa y confirma manualmente.';}
 
+        // Fase 20: un presupuesto nunca se archiva solo como si fuera una factura. Caso real: tres
+        // presupuestos de limpieza (título "Presupuesto", número y comunidad correctos) y uno de
+        // electricidad ("PRESSUPOST") se archivaron en Drive como facturas. Basta cualquiera de
+        // las dos señales: lo que la IA dice del propio documento, o que el nombre del archivo lo
+        // diga — un archivo de factura real nunca se llama "Presupuesto...". Nunca se descarta:
+        // va a revisión, donde una persona decide.
+        $isQuote=$status==='classified'&&self::looksLikeQuote($invoice,(string)$attachment['original_filename']);
+        if($isQuote){$status='needs_review';$route['reason']='Parece un presupuesto, no una factura; revisa antes de archivarlo.';}
+
         $trace->add('community_resolution',['signals'=>$communitySignals,'community_id'=>$decision['community']['id']??null,
             'official_name'=>$decision['community']['official_name']??null,'evidence'=>$decision['evidence']]);
         $communityCandidates=$decision['community']?$this->classifier->suppliersForCommunity((int)$decision['community']['id']):[];
@@ -319,7 +328,7 @@ final class Worker
                 'provider'=>$this->extractor->version(),
                 'validated'=>($route['evidence']['supplier']['type']??null)==='restricted_openai_retry']);
         }
-        $blockingFactor=$invalidDate?'invalid_date':($status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null));
+        $blockingFactor=$invalidDate?'invalid_date':($isQuote?'quote_document':($status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null)));
         $trace->add('final_decision',['status'=>$status,'reason'=>$route['reason'],'blocking_factor'=>$blockingFactor]);
 
         // MySQL corrects OpenAI's suggestion here: $route['service'] already went through
@@ -365,6 +374,18 @@ final class Worker
             $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,$data['debug_trace_json']??null,
             $data['error_message']??null,$data['extractor_version']??OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
         ]);
+    }
+
+    /** Fase 20: ¿es un presupuesto y no una factura? Dos señales independientes, basta una: lo
+     * que la IA dice del propio documento (tipo_documento), o una palabra de presupuesto en el
+     * nombre del archivo como palabra completa — "Presupuesto 1-000035.pdf", "PRE 266.pdf",
+     * "Pressupost_12.pdf" sí; "Prestaciones.pdf" o "Premium.pdf" no.
+     * @param array<string,mixed> $invoice */
+    public static function looksLikeQuote(array $invoice, string $filename): bool
+    {
+        if (Text::normalize((string)($invoice['tipo_documento'] ?? '')) === 'presupuesto') return true;
+        $words = explode(' ', Text::normalize(pathinfo($filename, PATHINFO_FILENAME)));
+        return (bool)array_intersect($words, ['presupuesto','presupuestos','pressupost','pre','proforma']);
     }
 
     private function saveMessage(array $mailbox, ImapClient $client, string $uid, array $message, string $status, int $count,

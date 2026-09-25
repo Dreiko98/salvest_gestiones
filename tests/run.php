@@ -829,6 +829,64 @@ $test('inferencia comunidad+servicio: caso real MENENDEZ YPELAYO 10 / CRISLA —
     $assert($route['evidence']['supplier']['field']==='community_service' && $route['evidence']['supplier']['type']==='community_service_unique_supplier','debe quedar constancia de la señal usada: '.json_encode($route['evidence']['supplier']));
     $assert($route['service']==='LIMPIEZA');
 });
+$test('Fase 20 — inferencia comunidad+servicio: caso real SANCHEZ/IBERDROLA — si el documento trae un CIF de proveedor y el único candidato tiene OTRO CIF en el maestro, nunca se elige (antes: presupuesto de MONTAJES ELECTRICOS O. SANCHEZ archivado como IBERDROLA)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'24','URBANIZACION LA PALMERA','IBERDROLA CLIENTES, S.A.U.','ELECTRICIDAD','A95758389','H12351482');
+    $invoice=['proveedor'=>'MONTAJES ELECTRICOS O. SANCHEZ S.L.','proveedor_cif'=>'B12632105','comunidad_cif'=>'H12351482','tipo_servicio'=>'electricidad'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'sanchez@example.com');
+    $assert($route['supplier']===null,'no debe resolverse a IBERDROLA con un CIF de documento distinto: '.json_encode($route['supplier']));
+    $assert($route['status']==='needs_review','comunidad conocida pero proveedor sin resolver -> revisión: '.$route['status']);
+});
+$test('Fase 20 — reintento restringido con IA: si la IA elige un proveedor cuyo CIF contradice el del documento, la elección se descarta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'24','URBANIZACION LA PALMERA','IBERDROLA CLIENTES, S.A.U.','ELECTRICIDAD','A95758389','H12351482');
+    $invoice=['proveedor'=>'MONTAJES ELECTRICOS O. SANCHEZ S.L.','proveedor_cif'=>'B12632105','comunidad_cif'=>'H12351482','tipo_servicio'=>'desconocido'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'sanchez@example.com','',static fn(array $candidates,array $community):int=>$fixture['supplierId']);
+    $assert($route['supplier']===null,'la elección de la IA con CIF contradictorio debe descartarse: '.json_encode($route['supplier']));
+});
+$test('Fase 20 — Worker::looksLikeQuote(): presupuestos por tipo_documento o por nombre de archivo; nunca una factura normal',static function()use($assert):void{
+    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>'presupuesto'],'documento.pdf'),'la IA dice presupuesto');
+    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>'Presupuesto'],'x.pdf'),'sin importar mayúsculas');
+    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>null],'Presupuesto  1-000035.pdf'),'caso real: nombre de archivo de Rafael Guijarro');
+    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>'factura'],'PRE 266.pdf'),'caso real: nombre de archivo de O. Sanchez, aunque la IA se equivoque');
+    $assert(Salvest\Worker::looksLikeQuote([],'Pressupost_12.pdf'));
+    $assert(!Salvest\Worker::looksLikeQuote(['tipo_documento'=>'factura'],'Factura H-12286035 1-000167.pdf'),'una factura normal nunca');
+    $assert(!Salvest\Worker::looksLikeQuote(['tipo_documento'=>'otro'],'INFORME CERTIFICADO I22921.PDF'),'un parte/informe no es presupuesto: sigue archivándose como hasta ahora');
+    $assert(!Salvest\Worker::looksLikeQuote([],'Prestaciones premium.pdf'),'"pre" solo cuenta como palabra completa');
+});
+$test('Fase 20 — Worker: un presupuesto degrada a needs_review ANTES de archivarlo, con motivo propio (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $quotePos=strpos($source,'$isQuote=');$archiverPos=strpos($source,'$target = $this->archiver->archive(');
+    $assert($quotePos!==false&&$archiverPos!==false&&$quotePos<$archiverPos,'la comprobación de presupuesto debe ir antes de archivar');
+    $assert(str_contains($source,"'quote_document'"),'blockingFactor debe distinguir el caso presupuesto');
+    foreach(['src/ClaudeExtractor.php','src/OpenAIExtractor.php'] as $file){
+        $assert(str_contains(file_get_contents(__DIR__.'/../'.$file),"'tipo_documento'"),"$file debe pedir tipo_documento a la IA");
+    }
+});
+$test('Fase 20 — Text::normalize() quita el marcador de número delante de una cifra (N-12, Nº 1, núm. 5, nº12), y nada más',static function()use($assert):void{
+    $assert(Salvest\Text::normalize('MEDITERRANEO N-12')==='mediterraneo 12');
+    $assert(Salvest\Text::normalize('C.P. LES ERES N-3')==='c p les eres 3');
+    $assert(Salvest\Text::normalize('C/ BENET XIII Nº 1')==='c benet xiii 1');
+    $assert(Salvest\Text::normalize('Calle Mayor núm. 5')==='calle mayor 5');
+    $assert(Salvest\Text::normalize('Portal nº12')==='portal 12');
+    $assert(Salvest\Text::normalize('No hay nada')==='no hay nada','"no" sin número detrás se queda');
+    $assert(Salvest\Text::normalize('Plaza N')==='plaza n','"n" al final se queda');
+});
+$test('Fase 20 — casos reales de Rafael Guijarro: "C.P. MEDITERRANEO N-12" y "C.P. LES ERES N-3" resuelven su comunidad',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['90','AVDA. MEDITERRANEA 12',Salvest\Text::normalize('AVDA. MEDITERRANEA 12'),'H12278057','AVDA MEDITERRANEA 12']);
+    $mediterraneoId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$mediterraneoId,'address','MEDITERRANEO 12',Salvest\Text::normalize('MEDITERRANEO 12')]);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['01','LES ERES 3',Salvest\Text::normalize('LES ERES 3'),'H12805990','CALLE LES ERES 3']);
+    $leseresId=(int)$db->pdo()->lastInsertId();
+    $classifier=new Salvest\Classifier($db);
+    $a=$classifier->classify(['nombre_comunidad'=>'C.P. MEDITERRANEO N-12','direccion'=>'MEDITERRANEO N-12'],'');
+    $assert((int)($a['community']['id']??0)===$mediterraneoId,json_encode($a));
+    // El NIF del documento real venía mal escrito ("H-1285990", le falta un dígito): no debe
+    // estorbar, la dirección basta.
+    $b=$classifier->classify(['nombre_comunidad'=>'C.P. LES ERES N-3','direccion'=>'LES ERES N-3','comunidad_cif'=>'H-1285990'],'');
+    $assert((int)($b['community']['id']??0)===$leseresId,json_encode($b));
+});
 $test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo servicio nunca se eligen automáticamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',

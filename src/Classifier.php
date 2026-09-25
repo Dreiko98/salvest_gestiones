@@ -370,6 +370,18 @@ final class Classifier
             ));
             if($trace)$trace('supplier_community_service',count($compatible)===1?'match':(count($compatible)>1?'ambiguous_skipped':'none'),['service_hint'=>$serviceHint,'compatibles'=>count($compatible)]);
             if (count($compatible) === 1) {
+                // Fase 20: el único candidato queda descartado si el documento trae el CIF de su
+                // emisor, el candidato TAMBIÉN tiene CIF en el maestro, y no coinciden — eso es
+                // una contradicción directa, no falta de datos. Caso real: un presupuesto de
+                // MONTAJES ELECTRICOS O. SANCHEZ (B12632105, no dado de alta) se archivó como
+                // IBERDROLA (A95758389) solo por ser el único proveedor de electricidad de esa
+                // comunidad. Si el candidato no tiene CIF en el maestro (caso real CRISLA), no hay
+                // contradicción posible y la inferencia sigue valiendo como siempre.
+                $candidateCif = Text::normalizeIdentifier((string)($compatible[0]['cif'] ?? ''));
+                if ($cifIdentifier !== '' && $candidateCif !== '' && $candidateCif !== $cifIdentifier) {
+                    if($trace)$trace('supplier_community_service','contradicted',['candidato'=>$compatible[0]['official_name'],'cif_candidato'=>$candidateCif,'cif_documento'=>$cifIdentifier]);
+                    return $none;
+                }
                 return ['supplier'=>$compatible[0],'evidence'=>['field'=>'community_service','type'=>'community_service_unique_supplier'],'ambiguous'=>false];
             }
         }

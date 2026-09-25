@@ -183,8 +183,12 @@ final class WebApp
         $lastLine=$when?'<p class="bot-status-line">Última ejecución: <strong>'.$this->e($when).'</strong></p>':'<p class="bot-status-line">Todavía no se ha ejecutado.</p>';
         $resultLine='';
         if($lastRun){
-            $archivadas=(int)$lastRun['classified_count'];$pendientes=(int)$lastRun['needs_review_count'];$errores=(int)$lastRun['error_count'];
-            $resultLine='<p class="bot-status-line">Resultado: <strong>'.$archivadas.' '.($archivadas===1?'archivada':'archivadas').' · '.$pendientes.' '.($pendientes===1?'pendiente':'pendientes').' · '.$errores.' '.($errores===1?'error':'errores').'</strong></p>';
+            // Fase 22: "a revisión" suma needs_review Y unclassified — las dos acaban en /Revisar.
+            // Antes solo contaba needs_review: una pasada que mandó 5 "sin clasificar" a revisión
+            // decía "0 pendientes" (caso real, 24/09 18:55). Y el rótulo deja claro que es lo que
+            // hizo ESA pasada, no un total: lo pendiente ahora mismo ya lo dice el aviso de arriba.
+            $archivadas=(int)$lastRun['classified_count'];$aRevision=(int)$lastRun['needs_review_count']+(int)$lastRun['unclassified_count'];$errores=(int)$lastRun['error_count'];
+            $resultLine='<p class="bot-status-line">Resultado de esa ejecución: <strong>'.$archivadas.' '.($archivadas===1?'archivada':'archivadas').' · '.$aRevision.' a revisión · '.$errores.' '.($errores===1?'error':'errores').'</strong></p>';
         }
         $estimateLine='';
         if($estimate=$this->nextRunEstimate()){

@@ -495,6 +495,15 @@ $test('ejecutar bot ahora: doble clic / doble petición solo lanza una ejecució
     $assert(($second['status']??null)==='busy','la segunda petición casi simultánea debe rechazarse, no relanzar el worker');
     $assert((int)$db->one('SELECT COUNT(*) n FROM processing_runs')['n']===1,'pese a las dos peticiones solo debe quedar registrada una ejecución');
 });
+$test('Fase 22 — estado del bot: "a revisión" suma también las sin clasificar (caso real 24/09 18:55: 4 archivadas y 5 sin clasificar se mostraba como "0 pendientes"), y el rótulo dice que es de esa ejecución',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
+    $db=$sqliteDbWithLock('always-free');
+    $webApp=$makeWebApp($db,$workerConfig());
+    $db->execute('INSERT INTO processing_runs(run_uuid,trigger_type,started_at,finished_at,status,classified_count,needs_review_count,unclassified_count,error_count) VALUES (?,?,?,?,?,?,?,?,?)',
+        ['uuid-real','cron',date('Y-m-d H:i:s'),date('Y-m-d H:i:s'),'completed',4,0,5,0]);
+    $method=new ReflectionMethod(Salvest\WebApp::class,'botStatusCard');$method->setAccessible(true);
+    $html=$method->invoke($webApp);
+    $assert(str_contains($html,'Resultado de esa ejecución: <strong>4 archivadas · 5 a revisión · 0 errores'),$html);
+});
 $test('estado del bot: el dashboard muestra la última ejecución sin detalles técnicos',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');
     $webApp=$makeWebApp($db,$workerConfig());
@@ -503,7 +512,7 @@ $test('estado del bot: el dashboard muestra la última ejecución sin detalles t
     $method=new ReflectionMethod(Salvest\WebApp::class,'botStatusCard');$method->setAccessible(true);
     $html=$method->invoke($webApp);
     $assert(str_contains($html,'2 archivadas'),'debe mostrar cuántas facturas se archivaron: '.$html);
-    $assert(str_contains($html,'1 pendiente'),'debe mostrar cuántas quedaron pendientes, en singular cuando es 1: '.$html);
+    $assert(str_contains($html,'1 a revisión'),'debe mostrar cuántas se mandaron a revisión: '.$html);
     $assert(str_contains($html,'0 errores'),'debe mostrar cuántas fallaron: '.$html);
     $assert(str_contains($html,'Última ejecución: <strong>hoy '),'debe mostrar cuándo fue la última ejecución');
     $assert(str_contains($html,'Ejecutar bot ahora'),'el botón debe estar disponible cuando no hay nada en marcha');

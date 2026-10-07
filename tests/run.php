@@ -896,6 +896,36 @@ $test('Fase 20 — casos reales de Rafael Guijarro: "C.P. MEDITERRANEO N-12" y "
     $b=$classifier->classify(['nombre_comunidad'=>'C.P. LES ERES N-3','direccion'=>'LES ERES N-3','comunidad_cif'=>'H-1285990'],'');
     $assert((int)($b['community']['id']??0)===$leseresId,json_encode($b));
 });
+$test('Fase 23 — caso real FACSA Tarancón: la IA puso el CIF de la comunidad como CIF del proveedor y dejó comunidad_cif vacío -> se recoloca y la factura se clasifica sola',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'67','CARDENAL VTE. ENRIQUE TARANCON','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua','A12000022','H12542460');
+    $invoice=['proveedor'=>'SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','proveedor_cif'=>'H12542460','comunidad_cif'=>null,
+        'nombre_comunidad'=>'CDAD PROP AV CARDENAL V ENRIQUE TARANCON','direccion'=>'CARRER MARE TERESA DE CALCUTA 18 - C.G. S.E., BURRIANA','tipo_servicio'=>'agua'];
+    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@facsa.example');
+    $assert((int)($route['decision']['community']['id']??0)===$fixture['communityId'],'debe resolver la comunidad por su CIF: '.json_encode($route['decision']));
+    $assert($route['decision']['evidence']===['field'=>'holder_cif','type'=>'exact'],json_encode($route['decision']['evidence']));
+    $assert((int)($route['supplier']['id']??0)===$fixture['supplierId']&&$route['status']==='classified',json_encode([$route['status'],$route['supplier']]));
+});
+$test('Fase 23 — reassignMisplacedHolderCif(): solo actúa si el CIF del "proveedor" es de una comunidad nuestra; si comunidad_cif ya venía, se respeta',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,1)',['XILXES 14','xilxes 14','H12725404','CALLE XILXES 14']);
+    $classifier=new Salvest\Classifier($db);
+    $assert($classifier->reassignMisplacedHolderCif(['proveedor_cif'=>'H-12725404','comunidad_cif'=>null])===['proveedor_cif'=>null,'comunidad_cif'=>'H-12725404']);
+    $assert($classifier->reassignMisplacedHolderCif(['proveedor_cif'=>'H12725404','comunidad_cif'=>'H12725404'])===['proveedor_cif'=>null,'comunidad_cif'=>'H12725404']);
+    $normal=['proveedor_cif'=>'A12000022','comunidad_cif'=>'H12725404'];
+    $assert($classifier->reassignMisplacedHolderCif($normal)===$normal,'un CIF de proveedor de verdad nunca se toca');
+});
+$test('Fase 23 — dos comunidades con el mismo CIF (caso real EDIFICI/PARKING GERMANIES): el CIF no decide; decide el nombre, y sin nombre no se elige ninguna',static function()use($assert,$sqliteDb,$classifierSchema):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,1)',['EDIFICI GERMANIES','edifici germanies','H12771119','CALLE GERMANIES 7']);
+    $edificiId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,1)',['PARKING GERMANIES','parking germanies','H12771119','CALLE GERMANIES 7']);
+    $classifier=new Salvest\Classifier($db);
+    $none=$classifier->classify(['comunidad_cif'=>'H12771119'],'');
+    $assert($none['community']===null,'sin nombre ni dirección no debe elegir ninguna de las dos al azar: '.json_encode($none));
+    $named=$classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM. PROP. EDIFICI GERMANIES'],'');
+    $assert((int)($named['community']['id']??0)===$edificiId,json_encode($named));
+});
 $test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo servicio nunca se eligen automáticamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
@@ -1644,11 +1674,13 @@ $test('Fase 13 — Inicio: existen los 4 filtros de periodo, con "Hoy" activo po
 $test('Fase 19 — Inicio: "Archivadas hoy" muestra fecha (d/m/Y) y hora de archivado en columnas separadas, no solo la hora — antes la fecha solo vivía oculta en data-date, para el filtro',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{
     $db=$sqliteDbWithLock('always-free');$config=$workerConfig();$webApp=$makeWebApp($db,$config);
     $db->execute("INSERT INTO processed_attachments(status,processed_at,provider,service_type,output_path) VALUES (?,?,?,?,?)",
-        ['classified','2026-08-21 09:05:00','PROVEEDOR CON FECHA','agua','/x/con-fecha.pdf']);
+        ['classified',(new DateTimeImmutable('today 09:05'))->format('Y-m-d H:i:s'),'PROVEEDOR CON FECHA','agua','/x/con-fecha.pdf']);
     $method=new ReflectionMethod(Salvest\WebApp::class,'archivedTodayPanel');$method->setAccessible(true);
     $html=$method->invoke($webApp);
     $assert(str_contains($html,'<th>Fecha</th>'),'debe existir una columna de Fecha, separada de la de Hora: '.$html);
-    $assert(str_contains($html,'21/08/2026'),'la fecha debe mostrarse en formato d/m/Y, igual que el resto de la aplicación (formatRunTime): '.$html);
+    // Fecha relativa a hoy: el historial solo carga desde el día 1 del mes pasado, así que una
+    // fecha fija acaba quedándose fuera del rango con el paso del tiempo.
+    $assert(str_contains($html,(new DateTimeImmutable('today'))->format('d/m/Y')),'la fecha debe mostrarse en formato d/m/Y, igual que el resto de la aplicación (formatRunTime): '.$html);
     $assert(str_contains($html,'09:05'),'la hora debe seguir mostrándose, junto a la fecha, no en su lugar: '.$html);
 });
 $test('Fase 19.1 — Inicio: el rótulo "Archivadas hoy" lleva un id estable (archived-today-label) para que app.js pueda cambiarlo a "Archivadas esta semana"/"este mes"/"el mes pasado" según el filtro activo',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp):void{

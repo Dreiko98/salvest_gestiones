@@ -38,6 +38,9 @@ final class InvoiceRouter
      */
     public function route(array $invoice,string $sender,string $context='',?callable $restrictedResolver=null,?callable $trace=null):array
     {
+        // Fase 23: antes de nada, devolver a su sitio un CIF de comunidad que la IA haya puesto
+        // como CIF del proveedor (ver Classifier::reassignMisplacedHolderCif()).
+        $invoice=$this->classifier->reassignMisplacedHolderCif($invoice);
         $decision=$this->classifier->classify($invoice,$context,$trace);
         $community=$decision['community'];
         $rawSupplierName=trim((string)($invoice['proveedor']??''));

@@ -153,10 +153,36 @@ final class Classifier
      * values in PHP rather than in SQL. */
     private function matchByNormalizedCif(string $holderCif): ?array
     {
-        foreach ($this->db->all('SELECT * FROM communities WHERE active=1') as $community) {
-            if (Text::normalizeIdentifier((string)$community['cif']) === $holderCif) return $community;
-        }
-        return null;
+        // Fase 23: si dos comunidades comparten CIF (caso real: EDIFICI GERMANIES y PARKING
+        // GERMANIES, ambas H12771119), el CIF no decide entre ellas — antes se devolvía la
+        // primera que saliera, sin avisar. Ahora no hay coincidencia por CIF y deciden el nombre
+        // o la dirección en los niveles siguientes, igual que con cualquier otra factura.
+        $matches = $this->communitiesWithCif($holderCif);
+        return count($matches) === 1 ? $matches[0] : null;
+    }
+
+    /** @return list<array<string,mixed>> */
+    private function communitiesWithCif(string $normalizedCif): array
+    {
+        if ($normalizedCif === '') return [];
+        return array_values(array_filter($this->db->all('SELECT * FROM communities WHERE active=1'),
+            static fn(array $community): bool => Text::normalizeIdentifier((string)$community['cif']) === $normalizedCif));
+    }
+
+    /** Fase 23: la IA a veces pone el CIF de la comunidad en proveedor_cif y deja comunidad_cif
+     * vacío. Caso real, sistemático en los recibos de agua de FACSA: el único NIF visible en la
+     * primera página es el de "DATOS TITULAR" (la comunidad), y se lo atribuía al emisor — 20
+     * facturas en un mes, 4 acabaron sin comunidad. Un CIF que coincide con el de una de nuestras
+     * comunidades nunca es el de un proveedor, así que se recoloca: pasa a comunidad_cif (si
+     * estaba vacío) y se quita de proveedor_cif, para que tampoco estorbe al buscar el proveedor.
+     * @param array<string,mixed> $invoice @return array<string,mixed> */
+    public function reassignMisplacedHolderCif(array $invoice): array
+    {
+        $supplierCif = Text::normalizeIdentifier((string)($invoice['proveedor_cif'] ?? ''));
+        if (!$this->communitiesWithCif($supplierCif)) return $invoice;
+        if (Text::normalizeIdentifier((string)($invoice['comunidad_cif'] ?? '')) === '') $invoice['comunidad_cif'] = $invoice['proveedor_cif'];
+        $invoice['proveedor_cif'] = null;
+        return $invoice;
     }
 
     /**

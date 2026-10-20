@@ -12,3 +12,13 @@
 # Local-only model-comparison harness: takes a real API key via env var and local PDF paths,
 # never meant to be committed, deployed, or run automatically.
 /bin/compare-models.php
+
+# Espejo plano de public/ que vive en la raíz del servidor (IONOS sin document root en public/).
+# Son copias: la fuente es public/; al desplegar un cambio en public/ se sube también aquí.
+/cron.php
+/index.php
+/install.php
+/assets/
+
+# Marca de instalación ya hecha (existe en producción; impide repetir install.php).
+/storage/install.lock

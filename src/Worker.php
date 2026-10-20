@@ -87,7 +87,15 @@ final class Worker
         try {
             $client->connect();
             $this->db->execute('UPDATE mailboxes SET last_connection_at=NOW(),last_connection_ok=1,last_error=NULL WHERE id=?',[$mailbox['id']]);
-            $uids = $this->applyBaseline($mailbox, $client, $client->listUids()); $examined = 0;
+            $inboxUids = $client->listUids();
+            // Fase 24: antes de leer correo nuevo, volver a intentar mover los que se quedaron en la
+            // bandeja de entrada porque su movimiento falló en una pasada anterior (ver
+            // ImapMoveRetry). Nunca tumba el buzón: si algo falla aquí, se sigue con lo nuevo.
+            if (!$dryRun) {
+                try { (new ImapMoveRetry($this->db))->retry((int)$mailbox['id'], $client, $inboxUids); }
+                catch (\Throwable $retryError) { error_log('mailbox_id='.$mailbox['id'].' status=move_retry_error error='.$retryError->getMessage()); }
+            }
+            $uids = $this->applyBaseline($mailbox, $client, $inboxUids); $examined = 0;
             foreach ($uids as $uid) {
                 if ($limit !== null && $examined >= $limit) break;
                 $existing = $this->db->one('SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
@@ -160,7 +168,7 @@ final class Worker
                     if ($allClassified) {
                         $destination = 'facturgerman/Facturas';
                         try {
-                            $client->markSeen($uid); $client->move($uid,$destination);
+                            $this->moveWithReconnect($client,$uid,$destination,true);
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'moved');
                         } catch (\Throwable $imapError) {
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'failed',$imapError->getMessage());
@@ -169,7 +177,7 @@ final class Worker
                         $allUnknown = !array_filter($outcomes,static fn(array $item): bool => $item['status'] !== 'unclassified');
                         $destination = $allUnknown ? 'facturgerman/Sin clasificar' : 'facturgerman/Pendientes de revisión';
                         try {
-                            $client->move($uid,$destination);
+                            $this->moveWithReconnect($client,$uid,$destination,false);
                             $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'moved');
                         } catch (\Throwable $imapError) {
                             $this->saveMessage($mailbox,$client,$uid,$message,'needs_review',count($outcomes),$destination,'failed',$imapError->getMessage());
@@ -184,6 +192,25 @@ final class Worker
                 }
             }
         } finally { $client->close(); }
+    }
+
+    /** Fase 24: mover el correo ya tratado, con un segundo intento tras reconectar. Entre leer un
+     * correo y moverlo pasan las llamadas a la IA de todos sus adjuntos — con varios PDF, minutos —
+     * y un corte de la conexión en ese rato bastaba para que el correo se quedara en la bandeja de
+     * entrada. Al reconectar se vuelve a seleccionar la misma carpeta, así que el UID sigue valiendo.
+     * Si el segundo intento también falla, la excepción sigue su curso y ImapMoveRetry lo
+     * reintentará en la próxima pasada. */
+    private function moveWithReconnect(ImapClient $client, string $uid, string $destination, bool $markSeen): void
+    {
+        try {
+            if ($markSeen) $client->markSeen($uid);
+            $client->move($uid,$destination);
+        } catch (\Throwable $firstError) {
+            error_log('uid='.$uid.' status=move_failed_reconnecting error='.$firstError->getMessage());
+            $client->close(); $client->connect();
+            if ($markSeen) $client->markSeen($uid);
+            $client->move($uid,$destination);
+        }
     }
 
     /** Recognition side of InvoiceDismissal — deliberately keyed by (mailbox_id,message_id_header)

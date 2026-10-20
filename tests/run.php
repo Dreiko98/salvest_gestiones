@@ -581,13 +581,13 @@ $test('baseline: un cambio de UIDVALIDITY invalida el baseline anterior y no rep
 });
 $test('baseline: convive con la deduplicación existente por mailbox_id+UIDVALIDITY+UID (guarda de regresión de código)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
-    $assert(str_contains($source,'applyBaseline($mailbox, $client, $client->listUids())'),'el filtro de baseline debe aplicarse sobre el listado de UIDs antes del bucle de mensajes');
+    $assert(str_contains($source,'$inboxUids = $client->listUids();')&&str_contains($source,'applyBaseline($mailbox, $client, $inboxUids)'),'el filtro de baseline debe aplicarse sobre el listado de UIDs antes del bucle de mensajes');
     $assert(str_contains($source,"SELECT status FROM processed_messages WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?"),'la deduplicación por mailbox_id+UIDVALIDITY+UID debe seguir intacta después del filtro de baseline');
     $assert(str_contains($source,"in_array(\$existing['status'],['completed','ignored','needs_review','error'],true)) continue;"),'solo los estados terminales deben saltarse; el baseline no sustituye a esta comprobación');
 });
 $test('baseline: el límite max_messages_per_mailbox se sigue aplicando tras el filtro de baseline (guarda de regresión de código)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
-    $assert((bool)preg_match('/applyBaseline\(\$mailbox, \$client, \$client->listUids\(\)\); \$examined = 0;/',$source),'el contador de mensajes examinados debe arrancar en 0 después de aplicar el baseline, no antes');
+    $assert((bool)preg_match('/applyBaseline\(\$mailbox, \$client, \$inboxUids\); \$examined = 0;/',$source),'el contador de mensajes examinados debe arrancar en 0 después de aplicar el baseline, no antes');
     $assert(str_contains($source,'if ($limit !== null && $examined >= $limit) break;'),'el corte por límite debe seguir activo tras el filtro de baseline');
 });
 
@@ -3884,6 +3884,99 @@ $test('Fase 15 — Worker: una fecha de factura no reconocible degrada a needs_r
 $test('Fase 15 — Worker: fecha_factura inválida en un documento needs_review (no classified) nunca degrada nada — el guard solo actúa quando el estado ya era classified (regresión: no debe tocar el needs_review/unclassified normal)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
     $assert(str_contains($source,"\$invalidDate=\$status==='classified'&&!preg_match"),'el guard de fecha inválida debe estar condicionado a status==="classified" — needs_review/unclassified no deben pasar por aquí, ya iban a la carpeta de no clasificados de todos modos');
+});
+
+// ---- Fase 24: correos archivados que se quedaban en la bandeja de entrada ----
+// Doble de ImapClient para ImapMoveRetry: registra lo que se mueve y puede fallar a propósito.
+$fakeMoveClient=static function(array $failUids=[]):object{
+    return new class($failUids){
+        public array $moved=[];public array $seen=[];
+        public function __construct(private array $failUids){}
+        public function uidValidity():string{return '1001';}
+        public function markSeen(string $uid):void{$this->seen[]=$uid;}
+        public function move(string $uid,string $destination):void{
+            if(in_array($uid,$this->failUids,true))throw new RuntimeException('IMAP rechazó UID MOVE');
+            $this->moved[$uid]=$destination;
+        }
+    };
+};
+$seedStuckMessage=static function(Salvest\Database $db,string $uid,string $status,string $destination,array $attachmentStatuses,string $uidValidity='1001'):int{
+    $db->execute("INSERT INTO processed_messages(mailbox_id,uidvalidity,message_uid,message_id_header,sender,subject,received_at,status,document_count,imap_destination,imap_move_status,error_message,processed_at) VALUES (1,?,?,?,?,?,?,?,?,?,'failed','conexión cortada',?)",
+        [$uidValidity,$uid,"<$uid@iberdrola.es>",'facturas@iberdrola.es','Tu factura',date('Y-m-d H:i:s'),$status,count($attachmentStatuses),$destination,date('Y-m-d H:i:s')]);
+    $id=(int)$db->pdo()->lastInsertId();
+    foreach($attachmentStatuses as $index=>$attachmentStatus){
+        $db->execute('INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,status,processed_at) VALUES (1,?,?,?,?,?,?,?,?)',
+            [$uidValidity,$uid,"factura-$index.pdf",hash('sha256',$uid.'-'.$index),'application/pdf',1000,$attachmentStatus,date('Y-m-d H:i:s')]);
+    }
+    return $id;
+};
+$test('Fase 24 — caso real IBERDROLA: un correo ya archivado cuyo movimiento falló se mueve a "facturgerman/Facturas" en la siguiente pasada, marcado como leído, y queda como movido',static function()use($assert,$sqliteDbWithLock,$fakeMoveClient,$seedStuckMessage):void{
+    $db=$sqliteDbWithLock();
+    $id=$seedStuckMessage($db,'501','completed','facturgerman/Facturas',['classified']);
+    $client=$fakeMoveClient();
+    $result=(new Salvest\ImapMoveRetry($db))->retry(1,$client,['499','501','502']);
+    $assert($result['moved']===1,'debe haberse movido 1 correo: '.json_encode($result));
+    $assert(($client->moved['501']??null)==='facturgerman/Facturas','el correo debe ir a facturgerman/Facturas');
+    $assert($client->seen===['501'],'un correo archivado se marca como leído, igual que en el primer intento');
+    $row=$db->one('SELECT status,imap_move_status,error_message FROM processed_messages WHERE id=?',[$id]);
+    $assert($row['status']==='completed'&&$row['imap_move_status']==='moved'&&$row['error_message']===null,'debe quedar movido y sin error: '.json_encode($row));
+    $again=(new Salvest\ImapMoveRetry($db))->retry(1,$fakeMoveClient(),['501']);
+    $assert($again['moved']===0,'una vez movido, nunca se vuelve a intentar');
+});
+$test('Fase 24 — un correo que se quedó en revisión con el movimiento fallido, y que después se confirmó a mano en /Revisar, también va a "facturgerman/Facturas" y pasa a completed',static function()use($assert,$sqliteDbWithLock,$fakeMoveClient,$seedStuckMessage):void{
+    $db=$sqliteDbWithLock();
+    $id=$seedStuckMessage($db,'610','needs_review','facturgerman/Pendientes de revisión',['classified','duplicate']);
+    $client=$fakeMoveClient();
+    (new Salvest\ImapMoveRetry($db))->retry(1,$client,['610']);
+    $assert(($client->moved['610']??null)==='facturgerman/Facturas','todo archivado: destino Facturas, no la carpeta de revisión');
+    $row=$db->one('SELECT status,imap_destination FROM processed_messages WHERE id=?',[$id]);
+    $assert($row['status']==='completed'&&$row['imap_destination']==='facturgerman/Facturas',json_encode($row));
+});
+$test('Fase 24 — un correo con algo todavía pendiente se reintenta hacia su carpeta de revisión, nunca hacia Facturas, y no se marca como leído',static function()use($assert,$sqliteDbWithLock,$fakeMoveClient,$seedStuckMessage):void{
+    $db=$sqliteDbWithLock();
+    $id=$seedStuckMessage($db,'620','needs_review','facturgerman/Pendientes de revisión',['classified','needs_review']);
+    $client=$fakeMoveClient();
+    (new Salvest\ImapMoveRetry($db))->retry(1,$client,['620']);
+    $assert(($client->moved['620']??null)==='facturgerman/Pendientes de revisión','debe ir a la carpeta de revisión que ya tenía');
+    $assert($client->seen===[],'lo pendiente de revisar no se marca como leído');
+    $assert($db->one('SELECT status FROM processed_messages WHERE id=?',[$id])['status']==='needs_review','el estado no cambia: sigue pendiente');
+});
+$test('Fase 24 — si el correo ya no está en la bandeja de entrada (alguien lo movió a mano), no se toca IMAP y se deja de buscar',static function()use($assert,$sqliteDbWithLock,$fakeMoveClient,$seedStuckMessage):void{
+    $db=$sqliteDbWithLock();
+    $id=$seedStuckMessage($db,'630','completed','facturgerman/Facturas',['classified']);
+    $client=$fakeMoveClient();
+    $result=(new Salvest\ImapMoveRetry($db))->retry(1,$client,['629','631']);
+    $assert($client->moved===[]&&$result['not_in_inbox']===1,json_encode($result));
+    $assert($db->one('SELECT imap_move_status FROM processed_messages WHERE id=?',[$id])['imap_move_status']==='not_in_inbox');
+});
+$test('Fase 24 — si el reintento vuelve a fallar, queda pendiente para la siguiente pasada con el error nuevo, y no impide mover los demás',static function()use($assert,$sqliteDbWithLock,$fakeMoveClient,$seedStuckMessage):void{
+    $db=$sqliteDbWithLock();
+    $failing=$seedStuckMessage($db,'640','completed','facturgerman/Facturas',['classified']);
+    $seedStuckMessage($db,'641','completed','facturgerman/Facturas',['classified']);
+    $client=$fakeMoveClient(['640']);
+    $result=(new Salvest\ImapMoveRetry($db))->retry(1,$client,['640','641']);
+    $assert($result['failed']===1&&$result['moved']===1&&isset($client->moved['641']),json_encode($result));
+    $row=$db->one('SELECT imap_move_status,error_message FROM processed_messages WHERE id=?',[$failing]);
+    $assert($row['imap_move_status']==='failed'&&str_contains((string)$row['error_message'],'UID MOVE'),json_encode($row));
+});
+$test('Fase 24 — los correos de otro UIDVALIDITY (UID ya sin sentido), los ignorados, los de error y los ya movidos nunca se tocan',static function()use($assert,$sqliteDbWithLock,$fakeMoveClient,$seedStuckMessage):void{
+    $db=$sqliteDbWithLock();
+    $seedStuckMessage($db,'650','completed','facturgerman/Facturas',['classified'],'999');
+    $seedStuckMessage($db,'651','error','facturgerman/Errores',['error']);
+    $seedStuckMessage($db,'652','completed','facturgerman/Facturas',['classified']);
+    $db->execute("UPDATE processed_messages SET imap_move_status='moved' WHERE message_uid='652'");
+    $client=$fakeMoveClient();
+    $result=(new Salvest\ImapMoveRetry($db))->retry(1,$client,['650','651','652']);
+    $assert($client->moved===[]&&$result===['moved'=>0,'not_in_inbox'=>0,'failed'=>0],json_encode($result));
+});
+$test('Fase 24 — Worker: el barrido se hace en cada pasada (salvo dry-run) antes de leer correo nuevo, y el movimiento inmediato reintenta reconectando (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/Worker.php');
+    $retryPos=strpos($source,'(new ImapMoveRetry($this->db))->retry(');
+    $baselinePos=strpos($source,'$uids = $this->applyBaseline($mailbox, $client, $inboxUids);');
+    $assert($retryPos!==false&&$baselinePos!==false&&$retryPos<$baselinePos,'el barrido debe ir antes de procesar lo nuevo, con la lista completa de la bandeja de entrada');
+    $assert(str_contains($source,"\$this->moveWithReconnect(\$client,\$uid,\$destination,true);"),'lo clasificado se mueve con reintento y marcado como leído');
+    $assert(str_contains($source,"\$this->moveWithReconnect(\$client,\$uid,\$destination,false);"),'lo de revisión también se mueve con reintento, sin marcar como leído');
+    $assert(substr_count($source,'$client->close(); $client->connect();')===1,'el segundo intento reconecta antes de volver a mover');
 });
 
 $failed=0;

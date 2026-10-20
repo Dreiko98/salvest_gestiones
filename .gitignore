@@ -22,3 +22,6 @@
 
 # Marca de instalación ya hecha (existe en producción; impide repetir install.php).
 /storage/install.lock
+
+# Permisos locales de Claude Code (propios de este equipo, nunca al repositorio).
+/.claude/settings.local.json

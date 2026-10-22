@@ -42,6 +42,13 @@ final class Classifier
             $row = $this->matchByNormalizedCif($holderCif);
             if($trace)$trace('holder_cif',$row?'match':'none',['cif_extraido'=>(string)($invoice['comunidad_cif']??''),'cif_normalizado'=>$holderCif]);
             if ($row) return ['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>'holder_cif','type'=>'exact']];
+            // Fase 25: CIF compartido por varias comunidades — se desempata SOLO entre ellas.
+            $shared = $this->communitiesWithCif($holderCif);
+            if (count($shared) > 1) {
+                $row = self::pickByDistinctiveWord($shared, $invoice);
+                if($trace)$trace('holder_cif_shared',$row?'match':'none',['comunidades'=>array_column($shared,'official_name'),'elegida'=>$row['official_name']??null]);
+                if ($row) return ['community'=>$row,'confidence'=>100.0,'evidence'=>['field'=>'holder_cif','type'=>'shared_cif_distinctive_word']];
+            }
         }
         foreach (['cups'=>'cups','numero_contrato'=>'contract','referencia_cliente'=>'customer_reference'] as $field => $type) {
             $value = Text::normalize((string)($invoice[$field] ?? ''));
@@ -159,6 +166,39 @@ final class Classifier
         // o la dirección en los niveles siguientes, igual que con cualquier otra factura.
         $matches = $this->communitiesWithCif($holderCif);
         return count($matches) === 1 ? $matches[0] : null;
+    }
+
+    /** Fase 25: equivalencias para desempatar comunidades que comparten CIF — solo aquí, nunca
+     * en Text::normalize(), que alimenta valores normalizados ya guardados en la base de datos. */
+    private const SHARED_CIF_SYNONYMS = ['parking'=>'garaje','pk'=>'garaje','aparcamiento'=>'garaje','aparcament'=>'garaje',
+        'garatge'=>'garaje','edifici'=>'edificio'];
+
+    /** Fase 25: caso real EXTINPLAN, "COM.PROP.GERMANIES 7-9 GARAJE" con NIF H12771119 — ese NIF es
+     * a la vez de EDIFICI GERMANIES y de PARKING GERMANIES, con la misma dirección, así que ni el
+     * CIF ni la dirección distinguen, y el nombre completo no llegaba al umbral. Lo que sí las
+     * distingue es la palabra que solo tiene cada una ("edifici" / "parking"), y la factura dice
+     * "GARAJE". Se elige la única comunidad, de entre las que comparten ese CIF, cuya palabra propia
+     * aparece en el nombre o la dirección del documento (con garaje = parking = PK...). Ninguna o
+     * varias -> null, y deciden los niveles siguientes como hasta ahora. Nunca el correo: solo el
+     * propio documento, igual que la contención (Fase 9.1).
+     * @param list<array<string,mixed>> $communities @param array<string,mixed> $invoice */
+    private static function pickByDistinctiveWord(array $communities, array $invoice): ?array
+    {
+        $words = static fn(string $value): array => array_values(array_unique(array_map(
+            static fn(string $word): string => self::SHARED_CIF_SYNONYMS[$word] ?? $word,
+            array_filter(explode(' ', Text::normalize($value)), static fn(string $word): bool => $word !== ''))));
+        $document = array_flip($words(($invoice['nombre_comunidad'] ?? '').' '.($invoice['direccion'] ?? '')));
+        if (!$document) return null;
+        $names = array_map(static fn(array $community): array => $words((string)$community['official_name']), $communities);
+        $hits = [];
+        foreach ($communities as $index => $community) {
+            $others = array_merge(...array_values(array_diff_key($names, [$index => true])));
+            $distinctive = array_diff($names[$index], $others);
+            foreach ($distinctive as $word) {
+                if (isset($document[$word])) { $hits[] = $community; break; }
+            }
+        }
+        return count($hits) === 1 ? $hits[0] : null;
     }
 
     /** @return list<array<string,mixed>> */

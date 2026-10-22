@@ -926,6 +926,31 @@ $test('Fase 23 — dos comunidades con el mismo CIF (caso real EDIFICI/PARKING G
     $named=$classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM. PROP. EDIFICI GERMANIES'],'');
     $assert((int)($named['community']['id']??0)===$edificiId,json_encode($named));
 });
+$seedGermanies=static function(Salvest\Database $db):array{
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['65','EDIFICI GERMANIES','edifici germanies','H12771119','CALLE GERMANIES 7']);
+    $edificiId=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['66','PARKING GERMANIES','parking germanies','H12771119','CALLE GERMANIES 7']);
+    return ['edificio'=>$edificiId,'parking'=>(int)$db->pdo()->lastInsertId()];
+};
+$test('Fase 25 — caso real EXTINPLAN: NIF compartido H12771119 + "COM.PROP.GERMANIES 7-9 GARAJE" -> PARKING GERMANIES (garaje = parking), por CIF, sin depender del umbral de parecido',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedGermanies($db);
+    $decision=(new Salvest\Classifier($db))->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM.PROP.GERMANIES 7-9 GARAJE','direccion'=>'Calle Germanies-Maestro Serrano','codigo_postal'=>'12530'],'');
+    $assert((int)($decision['community']['id']??0)===$ids['parking'],json_encode($decision));
+    $assert($decision['evidence']===['field'=>'holder_cif','type'=>'shared_cif_distinctive_word']&&$decision['confidence']===100.0,json_encode($decision['evidence']));
+});
+$test('Fase 25 — el desempate funciona en los dos sentidos y con las variantes reales de las carpetas ("EDIFICIO GERMANIAS", "PK GERMANIAS")',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedGermanies($db);$classifier=new Salvest\Classifier($db);
+    $assert((int)($classifier->classify(['comunidad_cif'=>'H-12771119','nombre_comunidad'=>'EDIFICIO GERMANIAS'],'')['community']['id']??0)===$ids['edificio']);
+    $assert((int)($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'PK GERMANIAS'],'')['community']['id']??0)===$ids['parking']);
+    $assert((int)($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'CDAD PROP','direccion'=>'APARCAMIENTO C/ GERMANIES 7'],'')['community']['id']??0)===$ids['parking'],'la palabra puede venir en la dirección');
+});
+$test('Fase 25 — sin palabra distintiva, o con las de las dos a la vez, el CIF compartido sigue sin elegir ninguna (nunca al azar)',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies):void{
+    $db=$sqliteDb($classifierSchema);$seedGermanies($db);$classifier=new Salvest\Classifier($db);
+    $assert($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM. PROP. GERMANIES 7'],'')['community']===null,'solo "germanies 7": lo comparten las dos');
+    $assert($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'EDIFICIO Y GARAJE GERMANIES'],'')['community']===null,'las dos palabras a la vez: ambiguo');
+    $assert($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'GERMANIES'],'Asunto: factura parking germanies')['community']===null,'el texto del correo nunca desempata, solo el documento');
+});
+
 $test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo servicio nunca se eligen automáticamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',

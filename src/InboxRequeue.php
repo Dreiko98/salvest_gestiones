@@ -20,8 +20,9 @@ namespace Salvest;
  */
 final class InboxRequeue
 {
-    /** Statuses that already succeeded and must never be touched by either action. */
-    private const UNTOUCHABLE_STATUSES = ['classified', 'duplicate'];
+    /** Statuses that are already settled and must never be touched by either action — including a
+     * document the pipeline identified as not an invoice. */
+    private const UNTOUCHABLE_STATUSES = ['classified', 'duplicate', 'ignored_not_invoice'];
 
     /** Every status /Revisar itself lists as pending (see WebApp::reviews()'s SELECT) — both
      * actions are available from any of them, not just needs_review: most of a real backlog is
@@ -92,7 +93,7 @@ final class InboxRequeue
 
         $others = array_values(array_filter($siblings, static fn(array $row): bool => (int)$row['id'] !== $attachmentId));
         if ($others) {
-            $provenInvoice = array_filter($others, static fn(array $row): bool => in_array($row['status'], self::UNTOUCHABLE_STATUSES, true));
+            $provenInvoice = array_filter($others, static fn(array $row): bool => in_array($row['status'], ['classified', 'duplicate'], true));
             return ['ok' => false, 'message' => $provenInvoice
                 ? 'Este correo contiene al menos una factura ya clasificada; no se puede marcar como que no contiene ninguna.'
                 : 'Este correo tiene otros adjuntos todavía sin resolver; revísalos antes de descartar el correo entero.'];

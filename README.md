@@ -1,7 +1,7 @@
 # Salvest Gestiones — PHP/MySQL
 
-Aplicación web para recibir facturas desde varios buzones IMAP, extraer sus datos con
-OpenAI, clasificarlas por comunidad y archivarlas. Esta edición está diseñada para un
+Aplicación web para recibir facturas desde varios buzones IMAP, entenderlas con IA
+(Claude, con OpenAI como respaldo), clasificarlas por comunidad y archivarlas. Esta edición está diseñada para un
 hosting compartido PHP 8.2+ con MySQL 8 y tareas programadas; no requiere Docker ni un
 proceso residente.
 
@@ -16,7 +16,7 @@ cron de IONOS (cada 5 minutos)
         ▼
 bin/worker.php o public/cron.php
         ├── IMAP SSL de cada buzón
-        ├── OpenAI Responses API
+        ├── IA: Claude Messages API → OpenAI Responses API si falla
         ├── MySQL: configuración, auditoría e idempotencia
         ├── Google Drive: {código} - {comunidad}/Doc año en Vigor/{categoría}/ (año actual)
         ├── copia privada local en storage/invoices/
@@ -189,16 +189,20 @@ del año anterior a `Doc año en Vigor/{AAAA}/{CATEGORÍA}/`. El cierre queda re
 en MySQL (`drive_year_state` y `drive_year_rollovers`), se puede reanudar si se
 interrumpe y nunca sobrescribe un archivo existente.
 
-## OpenAI
+## IA
 
-Los PDF se envían como `input_file` y las imágenes como `input_image` mediante Responses
-API. La salida se limita con JSON Schema estricto y no se aceptan IDs de comunidad
-propuestos por el modelo. La clasificación contra los maestros se hace localmente.
+Los PDF se envían a Claude (Messages API, herramienta forzada) y, si una llamada falla,
+a OpenAI (Responses API, JSON Schema estricto) con el mismo contrato (`AiContracts`). La
+IA dice qué documento es y extrae sus datos; cuando el maestro no basta para decidir
+comunidad o proveedor, elige entre una lista cerrada de candidatos, y cualquier id fuera
+de esa lista se rechaza. El estado final lo decide solo `ClassificationPolicy`. El
+recorrido completo está en [FUNCIONAMIENTO_END_TO_END.md](FUNCIONAMIENTO_END_TO_END.md).
 
-Documentación oficial:
+Diagnóstico manual con la IA real, sin escribir en la base de datos:
 
-- [File inputs](https://developers.openai.com/api/docs/guides/file-inputs)
-- [Structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+```bash
+php bin/ai-diagnose.php documento.pdf --json
+```
 
 ## Pruebas
 
@@ -207,7 +211,12 @@ composer test
 find . -name '*.php' -print0 | xargs -0 -n1 php -l
 ```
 
-Las pruebas no contactan IONOS, OpenAI ni la base remota.
+Las pruebas no contactan IONOS, la IA ni la base remota. Las de MySQL solo se ejecutan
+con una base de pruebas explícita (su nombre debe contener "test"):
+
+```bash
+SALVEST_TEST_MYSQL="host=127.0.0.1;port=3306;dbname=salvest_test;user=root;password=" php tests/run.php
+```
 
 ## Copias de seguridad
 

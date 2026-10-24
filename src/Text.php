@@ -5,10 +5,27 @@ namespace Salvest;
 
 final class Text
 {
+    /** Transliteración fija de los caracteres que aparecen en castellano y valenciano. Se aplica
+     * antes de iconv() porque iconv translitera distinto según la plataforma: en Linux "ñ" → "n",
+     * en Windows "ñ" → "~n" (y "í" → "'i"), lo que partía palabras. Para estos caracteres el
+     * resultado es el mismo que daba iconv en Linux, así que nada de lo ya guardado cambia. */
+    private const LATIN = [
+        'á'=>'a','à'=>'a','â'=>'a','ä'=>'a','é'=>'e','è'=>'e','ê'=>'e','ë'=>'e','í'=>'i','ì'=>'i','î'=>'i','ï'=>'i',
+        'ó'=>'o','ò'=>'o','ô'=>'o','ö'=>'o','ú'=>'u','ù'=>'u','û'=>'u','ü'=>'u','ñ'=>'n','ç'=>'c',
+        'Á'=>'A','À'=>'A','Â'=>'A','Ä'=>'A','É'=>'E','È'=>'E','Ê'=>'E','Ë'=>'E','Í'=>'I','Ì'=>'I','Î'=>'I','Ï'=>'I',
+        'Ó'=>'O','Ò'=>'O','Ô'=>'O','Ö'=>'O','Ú'=>'U','Ù'=>'U','Û'=>'U','Ü'=>'U','Ñ'=>'N','Ç'=>'C','º'=>'o','ª'=>'a','·'=>'.',
+    ];
+
+    public static function ascii(string $value): string
+    {
+        $value = strtr($value, self::LATIN);
+        return iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
+    }
+
     public static function normalize(?string $value): string
     {
         $value = trim((string)$value);
-        $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
+        $ascii = self::ascii($value);
         $ascii = mb_strtolower($ascii, 'UTF-8');
         $words = preg_split('/[^a-z0-9]+/', $ascii, -1, PREG_SPLIT_NO_EMPTY) ?: [];
         $replacements = ['avinguda'=>'avenida','avda'=>'avenida','av'=>'avenida','carrer'=>'calle','placa'=>'plaza'];
@@ -38,7 +55,7 @@ final class Text
     public static function normalizeIdentifier(?string $value): string
     {
         $value = trim((string)$value);
-        $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
+        $ascii = self::ascii($value);
         return mb_strtolower((string)preg_replace('/[^a-zA-Z0-9]+/', '', $ascii), 'UTF-8');
     }
 

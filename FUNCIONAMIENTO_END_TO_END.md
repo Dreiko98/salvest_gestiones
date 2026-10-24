@@ -11,13 +11,17 @@ Salvest Gestiones automatiza estas tareas:
 1. Revisa varios buzones de correo mediante IMAP.
 2. Detecta los PDF adjuntos.
 3. Evita procesar dos veces el mismo correo o el mismo documento.
-4. Extrae los datos de la factura mediante la API de OpenAI.
-5. Identifica la comunidad usando el maestro de comunidades.
-6. Comprueba que el proveedor está asignado a esa comunidad.
-7. Determina la categoría a partir de esa relación configurada.
+4. Pide a la IA (Claude, con OpenAI como respaldo automático) que diga qué documento es
+   y extraiga sus datos. Lo que no es una factura (informes, partes, presupuestos,
+   certificados, contratos...) se descarta si la IA está segura.
+5. Identifica la comunidad: por NIF cuando es único; si no, la IA elige entre una lista
+   cerrada de candidatas del maestro.
+6. Identifica el proveedor de la misma forma: CIF único o nombre exacto deciden; si no,
+   la IA elige entre candidatos del maestro.
+7. Determina el servicio (la carpeta de Drive) a partir del maestro.
 8. Renombra y archiva el PDF en Google Drive.
 9. Mueve el correo a una carpeta IMAP adecuada.
-10. Registra el resultado completo en MySQL y lo muestra en el panel.
+10. Registra el resultado completo y su explicación en MySQL y lo muestra en el panel.
 
 El sistema no modifica ni renombra archivos o carpetas que ya existan en Drive. Solo
 crea los elementos que faltan y añade documentos nuevos.
@@ -35,8 +39,9 @@ Buzón IMAP
 Worker de Salvest
    ├── parser de correo y adjuntos
    ├── control de duplicados en MySQL
-   ├── extracción con OpenAI
-   ├── clasificación contra los maestros
+   ├── comprensión del documento con IA (Claude → OpenAI si falla)
+   ├── resolución de comunidad, proveedor y servicio contra los maestros
+   ├── política de clasificación (decide el estado final)
    ├── copia privada local
    ├── archivo definitivo en Google Drive
    └── organización del correo en IMAP
@@ -181,58 +186,86 @@ la regeneración de UID que puede ocurrir en un servidor IMAP.
 
 Cada adjunto recibe un hash SHA-256 calculado sobre sus bytes. Si el mismo PDF vuelve a
 llegar reenviado, en otro mensaje o con otro nombre, se registra como duplicado y no se
-extrae ni se sube otra vez.
+envía a la IA ni se sube otra vez. Si la primera vez se identificó como "no es una
+factura", la copia hereda esa decisión (`ignored_not_invoice`).
 
-## 7. Extracción con OpenAI
+## 7. Comprensión del documento
 
-El adjunto se guarda primero en una zona privada temporal. Después se envía a la API de
-OpenAI junto con contexto útil del correo: remitente, asunto, nombre del adjunto y
-cuerpo del mensaje.
+El adjunto se guarda primero en una zona privada temporal. Después se envía a la IA
+junto con contexto útil del correo: remitente, asunto, nombre del adjunto y cuerpo del
+mensaje. La IA principal es Claude; si una llamada concreta falla, la repite OpenAI
+automáticamente (`FallbackAiClient`). Ambas devuelven exactamente el mismo esquema JSON.
 
-La respuesta se exige mediante un esquema JSON estricto. Entre otros datos se extraen:
+La IA responde, entre otros datos:
 
-- Código, nombre, CIF y dirección de la comunidad cuando aparecen.
-- Proveedor y CIF del proveedor.
-- Fecha y número de factura.
-- Importe y moneda.
-- Tipo de servicio.
-- Identificadores auxiliares como CUPS, contrato o referencia de cliente.
+- Qué documento es (`document_type`: factura, rectificativa, justificante, presupuesto,
+  parte o informe técnico, informe o extracto, certificado, contrato u otro), si debe
+  procesarse como factura, con qué confianza y por qué.
+- Emisor (nombre y CIF) y cliente (nombre, NIF, dirección y código postal).
+- Número, fecha, importe, moneda y periodo facturado.
+- Servicio en texto libre y una categoría semántica de una lista cerrada.
 
-OpenAI propone datos; no decide por sí solo el ID interno de la comunidad. La decisión
-definitiva se hace localmente contra MySQL.
+La respuesta cruda se guarda íntegra en `extraction_json` y nunca se sobrescribe.
 
-## 8. Clasificación de la comunidad
+**Puerta de documento** (`ClassificationPolicy::documentGate`). La confianza sigue una
+rúbrica de tres tramos: ≥ 0,90 "el documento lo dice explícitamente", 0,70–0,89
+"evidencia fuerte", < 0,70 "débil". Por eso:
 
-Las señales se comprueban aproximadamente en este orden:
+- Un documento que no es factura se descarta (`ignored_not_invoice`) solo con
+  confianza ≥ 0,90. Por debajo, va a revisión: descartar una factura real sería un
+  error silencioso.
+- Una factura con confianza < 0,70 va a revisión.
+- Si la IA se contradice (tipo "presupuesto" pero "procésalo como factura") o el
+  archivo se llama "Presupuesto…", va a revisión.
 
-1. Código de comunidad exacto.
-2. CUPS, contrato o referencia de cliente exactos.
-3. CIF de la comunidad exacto.
-4. Dirección, nombre y alias mediante coincidencia aproximada.
+Un documento descartado no gasta más IA ni crea relaciones. Si un correo solo traía
+documentos descartados, queda como `ignored` y se queda en la bandeja de entrada.
 
-Las señales exactas producen confianza completa. La coincidencia aproximada debe
-superar el umbral configurado, actualmente 92 %. Si no lo supera, no se fuerza una
-comunidad.
+## 8. Comunidad
 
-Por eso un documento que mencione los códigos excluidos 100 o 200, o una comunidad
-desconocida, queda sin clasificar.
+1. **NIF único.** Si el NIF del cliente coincide con el de una sola comunidad activa,
+   esa es la comunidad, sin más preguntas.
+2. **NIF compartido** (por ejemplo, EDIFICI y PARKING GERMANIES). La IA recibe solo las
+   comunidades que comparten ese NIF y elige con el resto del documento (garaje =
+   parking, etc.).
+3. **Sin NIF o NIF desconocido.** El recuperador de candidatas propone como máximo 8
+   comunidades por nombre, alias, nombre de carpeta en Drive, palabras poco frecuentes,
+   código postal y similitud. La IA elige entre ellas o se abstiene.
 
-## 9. Resolución del proveedor
+La elección de la IA solo se acepta si el id está en la lista enviada y su confianza es
+≥ 0,70. Si no hay candidatas, la IA se abstiene o no llega al umbral, la factura queda
+`unclassified`.
 
-Una vez identificada la comunidad, el sistema solo busca entre los proveedores que
-están asignados a ella. Compara el proveedor extraído y el remitente con los nombres
-normalizados y exige una coincidencia mínima del 92 %.
+Ni los identificadores contractuales (CUPS, contrato) ni el texto del correo deciden ya
+la comunidad.
 
-Hay tres resultados posibles:
+## 9. Proveedor y servicio
 
-| Comunidad | Proveedor asignado | Resultado |
-|---|---|---|
-| Sí | Sí | Clasificada automáticamente |
-| Sí | No | Pendiente de revisión |
-| No | No aplicable | Sin clasificar |
+1. **CIF único** en todo el maestro: decide. Si lo comparten varios proveedores (por
+   ejemplo, INMECAS y H2O PLUS), la IA elige solo entre ellos.
+2. **Nombre o alias exacto**, de un solo proveedor: decide. Si hay varios exactos y solo
+   uno trabaja ya con la comunidad, gana ese.
+3. Si no, la IA elige entre como máximo 12 candidatos: los proveedores de la comunidad
+   y los globales que se parecen al emisor. Se rechaza si el CIF del documento
+   contradice el del proveedor elegido.
 
-Este paso impide que un proveedor con un nombre parecido se asigne a una comunidad con
-la que no tiene relación configurada.
+El **servicio** se toma, por este orden, del servicio principal del proveedor, de la
+categoría de la relación comunidad-proveedor, de la categoría de la IA y del texto
+libre de la IA. Gana la primera fuente que `ServiceCatalog` sabe traducir a una
+carpeta canónica (Ascensores → ASCENSOR, Luz → ELECTRICIDAD...). Si ninguna se puede
+traducir, va a revisión en lugar de archivarse en MANTENIMIENTO por descarte.
+
+**Autolink.** Si una factura se clasifica con un proveedor resuelto de forma
+determinista (CIF, nombre o alias exactos), que tiene servicio principal y que aún no
+estaba vinculado a esa comunidad, se crea la relación `community_suppliers`
+(`source_column = auto_global_resolution`). Nunca se aprende de una elección de la IA.
+
+| Comunidad | Proveedor | Servicio y fecha | Resultado |
+|---|---|---|---|
+| Sí | Sí | Válidos | `classified` |
+| Sí | Sí | Servicio sin carpeta o fecha inválida | `needs_review` |
+| Sí | No | — | `needs_review` |
+| No | — | — | `unclassified` |
 
 ## 10. Archivado del PDF
 
@@ -285,9 +318,11 @@ Después `(3)`, `(4)`, etc. Nunca se sobrescribe un archivo.
 
 Una vez tratados todos sus adjuntos:
 
-- Si todos están clasificados y pertenecen a una sola comunidad, el mensaje se marca
-  como leído y se mueve a `Facturas/{comunidad}`.
-- Si todos quedan sin comunidad, se mueve a `Facturas/Sin clasificar`.
+- Si todas sus facturas están clasificadas (o son duplicadas), el mensaje se marca como
+  leído y se mueve a `facturgerman/Facturas`, sea cual sea la comunidad.
+- Si todas quedan sin comunidad, se mueve a `facturgerman/Sin clasificar`.
+- Los documentos descartados como "no es una factura" no cuentan para esta decisión. Si
+  el correo solo traía documentos de ese tipo, se queda en la bandeja de entrada.
 - Si hay una comunidad posible pero falta resolver el proveedor, o hay resultados
   mezclados, se mueve a `Facturas/Pendientes de revisión`.
 - Si se produce un error técnico, se intenta mover a `Facturas/Errores`.
@@ -301,9 +336,7 @@ el resultado permanecen registrados, y se guarda la incidencia IMAP.
 Cada PDF se procesa de forma independiente. Después se toma una decisión para el
 mensaje completo:
 
-- Varios PDF de la misma comunidad y todos clasificados: correo a la carpeta de esa
-  comunidad.
-- PDF de comunidades distintas: correo a pendientes de revisión.
+- Todos clasificados, aunque sean de comunidades distintas: correo a `Facturas`.
 - Mezcla de clasificados y dudosos: correo a pendientes de revisión.
 - Error en un adjunto: correo a errores, sin perder el original del buzón.
 
@@ -314,15 +347,22 @@ MySQL conserva:
 - Buzón, UIDVALIDITY y UID.
 - Remitente, asunto, fecha y nombre original.
 - Hash SHA-256 y tamaño.
-- Datos extraídos por OpenAI.
+- Respuesta cruda de la IA (`extraction_json`), tipo y confianza del documento, y la
+  versión `proveedor:modelo` que la produjo.
 - Comunidad, proveedor, servicio y confianza.
+- La explicación completa de la decisión (`decision_json`): candidatas con sus señales,
+  elección y motivo de la IA, fuentes de servicio probadas, política y autolink.
 - Nombre y ruta final local.
 - ID y ruta del archivo de Drive.
 - Estado, destino IMAP y posibles errores.
 - Resumen de cada ejecución y consumo de tokens.
 
 Los estados intermedios del adjunto incluyen `downloaded` y `processing`. Los finales
-incluyen `classified`, `unclassified`, `needs_review`, `duplicate` y `error`.
+incluyen `classified`, `unclassified`, `needs_review`, `ignored_not_invoice`,
+`duplicate` y `error`.
+
+Para diagnosticar un PDF concreto con la IA real, sin escribir nada en la base de datos:
+`php bin/ai-diagnose.php documento.pdf [--provider=claude|openai] [--json]`.
 
 Las contraseñas IMAP, claves de API y tokens OAuth nunca deben escribirse en logs ni
 subirse a Git.
@@ -361,7 +401,8 @@ el cierre anual.
 ## 16. Comportamiento ante fallos
 
 - **Un buzón no autentica:** se registra el error y continúa el siguiente buzón.
-- **OpenAI falla:** el adjunto queda en error y el correo se deriva a errores.
+- **Claude falla:** la misma llamada la repite OpenAI. Si fallan las dos, el adjunto
+  queda en error y el correo se deriva a errores.
 - **Drive falla:** no se afirma que la factura esté archivada; se registra el error.
 - **Movimiento IMAP falla tras archivar:** se conserva como incidencia, sin duplicar el
   PDF en Drive.

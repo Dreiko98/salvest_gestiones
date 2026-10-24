@@ -15,8 +15,8 @@ return [
         'host' => 'MYSQL_HOST', 'port' => 3306, 'name' => 'MYSQL_DATABASE',
         'user' => 'MYSQL_USER', 'password' => 'MYSQL_PASSWORD', 'charset' => 'utf8mb4',
     ],
-    // Fase 8: Claude es el extractor primario; OpenAI queda como fallback automático (ver
-    // FallbackExtractor) si una llamada concreta a Claude falla — ambas claves son necesarias.
+    // Claude es la IA principal; OpenAI queda como respaldo automático (ver
+    // FallbackAiClient) si una llamada concreta a Claude falla — ambas claves son necesarias.
     'anthropic' => ['api_key' => 'ANTHROPIC_API_KEY', 'model' => 'claude-sonnet-5', 'timeout_seconds' => 120],
     'openai' => ['api_key' => 'OPENAI_API_KEY', 'model' => 'gpt-5.6-luna', 'timeout_seconds' => 120],
     'imap' => [

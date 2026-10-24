@@ -49,11 +49,12 @@ final class DriveInvoiceArchiver
         return$code.' - '.trim((string)$community['official_name']);
     }
 
+    /** La traducción vive en ServiceCatalog. MANTENIMIENTO solo queda como último recurso para la
+     * confirmación manual; el pipeline automático nunca llega aquí con un servicio sin carpeta,
+     * porque ClassificationPolicy lo manda antes a revisión. */
     public static function category(string $value):string
     {
-        $normalized=Text::normalize($value);return match($normalized){
-            'electricidad','luz'=>'ELECTRICIDAD','facsa','agua'=>'AGUA','extintores','extincas','extncas'=>'EXTINTORES',
-            'ascensor'=>'ASCENSOR','limpieza'=>'LIMPIEZA','jardineria'=>'JARDINERIA','piscina'=>'PISCINA','descalcificador'=>'DESCALCIFICADOR',default=>'MANTENIMIENTO'};
+        return ServiceCatalog::folderFor($value)??'MANTENIMIENTO';
     }
 
     public static function token(string $value):string

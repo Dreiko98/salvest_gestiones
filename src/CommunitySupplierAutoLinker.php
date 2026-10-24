@@ -7,7 +7,7 @@ namespace Salvest;
  * Fase 7: the only place in the codebase that ever INSERTs into `community_suppliers`
  * automatically. Deliberately narrow — it never decides WHETHER a relation should be learned
  * (that eligibility check — global source, unambiguous, active supplier, a real master-
- * configured service — lives in InvoiceRouter::route(), which already has everything it needs
+ * configured service — lives in InvoiceProcessor::autoLink(), which already has everything it needs
  * to decide that without touching the database itself). This class only knows how to link two
  * IDs that already exist, safely: never creates a supplier or a community, never touches an
  * existing relation, never guesses a category — the caller must already know it.
@@ -46,12 +46,11 @@ final class CommunitySupplierAutoLinker
      * `service_types.name` is Title Case with accents ("Agua", "Jardinería"). Autolinked rows
      * follow the existing historical convention, not the master's cosmetic casing, so a mixed
      * community_suppliers table stays consistent for anything that already reads `category` as
-     * a plain key (Classifier::resolveSupplierInCommunity()'s community+service tier normalizes
-     * it anyway, so this is about consistency for humans/diagnostics, not a functional need). */
+     * a plain key. Since the rebuild, InvoiceProcessor already passes the canonical Drive folder
+     * (ServiceCatalog::folderFor()), so "Luz" is learnt as ELECTRICIDAD, never as LUZ. */
     public static function canonicalCategory(string $serviceTypeName): string
     {
-        $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $serviceTypeName) ?: $serviceTypeName;
-        return mb_strtoupper($ascii, 'UTF-8');
+        return mb_strtoupper(Text::ascii($serviceTypeName), 'UTF-8');
     }
 
     /**

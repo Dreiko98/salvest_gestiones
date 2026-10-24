@@ -38,9 +38,9 @@ SQL;
 // so Worker's real MySQL locking code can be exercised deterministically.
 $workerSchema=<<<SQL
 CREATE TABLE mailboxes(id INTEGER PRIMARY KEY AUTOINCREMENT,descriptive_name TEXT,email TEXT,imap_host TEXT,imap_port INTEGER,use_ssl INTEGER,username TEXT,encrypted_password TEXT,input_folder TEXT,active INTEGER DEFAULT 1,process_existing_on_activate INTEGER DEFAULT 0,baseline_uidvalidity TEXT,baseline_uid INTEGER,baseline_captured_at TEXT,last_connection_at TEXT,last_connection_ok INTEGER,last_error TEXT);
-CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
+CREATE TABLE processing_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,run_uuid TEXT,trigger_type TEXT,triggered_by_user_id INTEGER,started_at TEXT,finished_at TEXT,status TEXT,mailboxes_count INTEGER DEFAULT 0,messages_reviewed INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,classified_count INTEGER DEFAULT 0,unclassified_count INTEGER DEFAULT 0,needs_review_count INTEGER DEFAULT 0,duplicate_count INTEGER DEFAULT 0,not_invoice_count INTEGER DEFAULT 0,error_count INTEGER DEFAULT 0,openai_input_tokens INTEGER DEFAULT 0,openai_output_tokens INTEGER DEFAULT 0,error_message TEXT);
 CREATE TABLE audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,action TEXT,entity_type TEXT,entity_id TEXT,new_values_json TEXT,ip_address TEXT,created_at TEXT);
-CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,requeued_at TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT,UNIQUE(mailbox_id,uidvalidity,message_uid,attachment_sha256));
+CREATE TABLE processed_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,original_filename TEXT,attachment_sha256 TEXT,mime_type TEXT,size_bytes INTEGER,status TEXT,processed_at TEXT,community_id INTEGER,supplier_id INTEGER,document_type TEXT,document_confidence TEXT,provider TEXT,raw_supplier_name TEXT,provider_cif TEXT,service_type TEXT,supply_address TEXT,amount TEXT,currency TEXT,invoice_number TEXT,invoice_date TEXT,confidence TEXT,final_filename TEXT,output_path TEXT,extraction_json TEXT,decision_json TEXT,debug_trace_json TEXT,requeued_at TEXT,error_message TEXT,extractor_version TEXT,drive_file_id TEXT,drive_path TEXT,drive_status TEXT,UNIQUE(mailbox_id,uidvalidity,message_uid,attachment_sha256));
 CREATE TABLE processed_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,mailbox_id INTEGER,uidvalidity TEXT,message_uid TEXT,message_id_header TEXT,sender TEXT,subject TEXT,received_at TEXT,status TEXT,document_count INTEGER DEFAULT 0,imap_destination TEXT,imap_move_status TEXT,error_message TEXT,processed_at TEXT);
 CREATE TABLE communities(id INTEGER PRIMARY KEY AUTOINCREMENT,official_name TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE suppliers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,official_name TEXT,active INTEGER DEFAULT 1);
@@ -141,6 +141,127 @@ $requestWebApp=static function(Salvest\WebApp $webApp,string $method,string $rou
     ob_start();$webApp->run();$html=ob_get_clean();
     restore_error_handler();
     return$html;
+};
+
+// ---- Dobles del pipeline reconstruido (comprensión con IA + resolvedores + política) ----
+/** Comprensión con el formato nuevo a partir de una factura escrita con las claves antiguas
+ * (proveedor, proveedor_cif, comunidad_cif, nombre_comunidad, direccion, tipo_servicio,
+ * fecha_factura...). Así los casos reales que ya existían conservan exactamente sus datos. */
+$understandingFromLegacy=static function(array $invoice):array{
+    $type=$invoice['document_type']??'invoice';
+    $hint=isset($invoice['tipo_servicio'])?Salvest\Text::normalize((string)$invoice['tipo_servicio']):null;
+    return [
+        'document_type'=>$type,
+        'should_process_as_invoice'=>$invoice['should_process_as_invoice']??in_array($type,['invoice','credit_note'],true),
+        'document_confidence'=>$invoice['document_confidence']??0.97,
+        'document_reason'=>$invoice['document_reason']??'Factura con emisor, cliente, número, fecha e importe.',
+        'issuer'=>['name'=>$invoice['proveedor']??null,'tax_id'=>$invoice['proveedor_cif']??null],
+        'customer'=>['name'=>$invoice['nombre_comunidad']??null,'tax_id'=>$invoice['comunidad_cif']??null,'address'=>$invoice['direccion']??null,'postal_code'=>$invoice['codigo_postal']??null],
+        'invoice'=>['number'=>$invoice['numero_factura']??'F-1','date'=>array_key_exists('fecha_factura',$invoice)?$invoice['fecha_factura']:'2026-09-15',
+            'total_amount'=>$invoice['importe']??100.0,'currency'=>'EUR','billing_period'=>null],
+        'service'=>['raw'=>$hint,'semantic_category'=>$invoice['semantic_category']??(in_array($hint,Salvest\AiContracts::SERVICE_CATEGORIES,true)?$hint:null)],
+        'supply_identifiers'=>['cups'=>$invoice['cups']??null,'contract_number'=>$invoice['numero_contrato']??null,'customer_reference'=>$invoice['referencia_cliente']??null],
+    ];
+};
+/** Elección "competente" de la IA falsa: la candidata cuyo nombre, alias o dirección aparece en
+ * el texto del documento o se le parece mucho; si no hay una sola, se abstiene. Emula a un modelo
+ * razonable para los casos de siempre; los casos semánticos (garaje = parking) se fijan a mano. */
+$smartChoice=static function(array $candidates,array $understanding):array{
+    $texts=array_values(array_filter(array_map([Salvest\Text::class,'normalize'],[$understanding['issuer']['name']??null,$understanding['customer']['name']??null,$understanding['customer']['address']??null]),static fn(string $t):bool=>$t!==''));
+    $hits=[];
+    foreach($candidates as $candidate){
+        $names=array_merge(array_filter([$candidate['nombre']??null,$candidate['nombre_comercial']??null,$candidate['razon_social']??null,$candidate['direccion']??null,$candidate['nombre_carpeta_drive']??null]),$candidate['alias']??[]);
+        foreach($names as $name){
+            $normalized=Salvest\Text::normalizeCompanyName((string)$name);
+            foreach($texts as $text){
+                if($normalized!==''&&(Salvest\Text::containsWholeWords(Salvest\Text::normalizeCompanyName($text),$normalized)||Salvest\Text::containsAllWords(Salvest\Text::normalizeCompanyName($text),$normalized)||Salvest\Text::similarity($text,(string)$name)>=80)){$hits[$candidate['id']]=true;break 2;}
+            }
+        }
+    }
+    return count($hits)===1?['id'=>array_key_first($hits),'confidence'=>0.9,'reason'=>'coincide con el documento']:['id'=>null,'confidence'=>0.3,'reason'=>'no se puede distinguir'];
+};
+/** IA falsa con respuesta por tarea. Para las elecciones acepta: 'smart', 'abstain', 'fail'
+ * (lanza, como un proveedor caído), un id, ['id'=>..,'confidence'=>..] o un callable(candidatos). */
+$fakeAi=static function(array $understanding,mixed $community='smart',mixed $supplier='smart')use($smartChoice):Salvest\AiClient{
+    return new class($understanding,$community,$supplier,$smartChoice) implements Salvest\AiClient{
+        public array $calls=[];
+        public function __construct(private array $understanding,private mixed $community,private mixed $supplier,private $smartChoice){}
+        public function tasks():array{return array_column($this->calls,'task');}
+        public function structured(string $task,string $instructions,array $schema,?string $pdfPath,string $userText,array $options=[]):Salvest\AiResponse{
+            $candidates=null;
+            if($task!==Salvest\AiContracts::UNDERSTAND_TASK){
+                $candidates=json_decode(substr($userText,strpos($userText,"(lista cerrada):\n")+strlen("(lista cerrada):\n")),true);
+            }
+            $this->calls[]=['task'=>$task,'candidates'=>$candidates,'instructions'=>$instructions,'schema'=>$schema,'text'=>$userText];
+            if($task===Salvest\AiContracts::UNDERSTAND_TASK)return new Salvest\AiResponse($this->understanding,'fake','fake-model',100,20,5);
+            $spec=$task===Salvest\AiContracts::COMMUNITY_TASK?$this->community:$this->supplier;
+            $field=$task===Salvest\AiContracts::COMMUNITY_TASK?'community_id':'supplier_id';
+            if($spec==='fail')throw new RuntimeException('proveedor de IA caído');
+            $choice=match(true){
+                $spec==='smart'=>($this->smartChoice)($candidates,$this->understanding),
+                $spec==='abstain'=>['id'=>null,'confidence'=>0.3,'reason'=>'no se puede distinguir'],
+                is_int($spec)=>['id'=>$spec,'confidence'=>0.95,'reason'=>'elegido en el test'],
+                is_callable($spec)=>$spec($candidates),
+                default=>$spec,
+            };
+            return new Salvest\AiResponse([$field=>$choice['id'],'confidence'=>$choice['confidence'],'reason'=>$choice['reason']??''],'fake','fake-model',50,10,3);
+        }
+    };
+};
+/** Adaptador de forma para los casos reales escritos contra el antiguo InvoiceRouter::route():
+ * misma llamada, pero ejecuta el pipeline nuevo (comprensión → comunidad → proveedor → servicio →
+ * política). El 4º argumento, la antigua "llamada restringida" fn(candidatos, comunidad): ?int, se
+ * convierte en la elección de proveedor de la IA; sin él, la IA falsa elige como un modelo
+ * razonable ($smartChoice). Las evidencias se devuelven con los nombres nuevos (source/outcome). */
+$routeCompat=static function(Salvest\Database $db,bool $autoLink=false)use($fakeAi,$understandingFromLegacy):object{
+    return new class($db,$autoLink,$fakeAi,$understandingFromLegacy){
+        public ?object $ai=null;
+        public function __construct(private Salvest\Database $db,private bool $autoLink,private $fakeAi,private $fromLegacy){}
+        public function route(array $invoice,string $sender='',string $context='',?callable $restricted=null,?callable $trace=null):array{
+            $supplierChoice=$restricted===null?'smart':static function(array $candidates)use($restricted):array{
+                $id=$restricted($candidates,[]);
+                return['id'=>$id,'confidence'=>0.95,'reason'=>'elegido por la llamada del test'];
+            };
+            $this->ai=($this->fakeAi)(($this->fromLegacy)($invoice),'smart',$supplierChoice);
+            $r=Salvest\Worker::processor($this->db,new Salvest\DocumentIntelligence($this->ai),null,$this->autoLink)->process('documento.pdf','factura.pdf','Remitente: '.$sender."\n".$context,$sender);
+            $c=$r['classification'];
+            $supplier=$r['supplier'];
+            if($supplier!==null&&isset($c['supplier']))$supplier['category']=$this->db->one('SELECT category FROM community_suppliers WHERE community_id=? AND supplier_id=?',[(int)($r['community']['id']??0),(int)$supplier['id']])['category']??null;
+            return['status'=>$r['status'],'supplier'=>$supplier,'reason'=>$r['reason'],'raw_supplier_name'=>$r['legacy']['raw_supplier_name'],'service'=>$r['service']['name'],'service_folder'=>$r['service']['folder'],
+                'decision'=>['community'=>$r['community'],'evidence'=>['source'=>$c['community']['source'],'outcome'=>$c['community']['outcome']]],
+                'evidence'=>['community'=>['source'=>$c['community']['source']],'supplier'=>['source'=>$c['supplier']['source'],'outcome'=>$c['supplier']['outcome'],'candidates'=>$c['supplier']['candidates']],
+                    'service'=>['source'=>$r['service']['source']]],
+                'supplier_ambiguous'=>in_array($c['supplier']['outcome'],['ai_abstained','ai_low_confidence'],true)&&count($c['supplier']['candidates'])>1,
+                'autolink'=>$c['autolink'],'ai_tasks'=>$this->ai->tasks(),'result'=>$r];
+        }
+    };
+};
+/** SupplierResolver sin comunidad; $choose=null = sin IA (solo deterministas). */
+$resolveSupplier=static fn(Salvest\Database $db,?string $name,?string $taxId,string $sender='facturas@x.example',?array $community=null,?callable $choose=null):array
+    =>(new Salvest\SupplierResolver($db,new Salvest\SupplierCandidateRetriever($db)))->resolve(['issuer'=>['name'=>$name,'tax_id'=>$taxId]],$community,$sender,$choose);
+/** CommunityResolver sobre una comprensión con solo los datos del cliente. $choice: 'smart',
+ * 'abstain', null (sin IA), un id, ['id'=>..,'confidence'=>..] o callable(candidatos). */
+$resolveCommunity=static function(Salvest\Database $db,array $customer,mixed $choice='smart')use($smartChoice):array{
+    $resolver=new Salvest\CommunityResolver($db,new Salvest\CommunityCandidateRetriever($db));
+    $understanding=['customer'=>$customer+['name'=>null,'tax_id'=>null,'address'=>null,'postal_code'=>null],'issuer'=>['name'=>null,'tax_id'=>null]];
+    $choose=$choice===null?null:static function(array $candidates)use($choice,$smartChoice,$understanding):array{
+        $raw=match(true){
+            $choice==='smart'=>$smartChoice($candidates,$understanding),
+            $choice==='abstain'=>['id'=>null,'confidence'=>0.3,'reason'=>'no se puede distinguir'],
+            is_int($choice)=>['id'=>$choice,'confidence'=>0.95,'reason'=>'elegido en el test'],
+            is_callable($choice)=>$choice($candidates),
+            default=>$choice,
+        };
+        return Salvest\DocumentIntelligence::validateChoice(['community_id'=>$raw['id'],'confidence'=>$raw['confidence'],'reason'=>$raw['reason']??''],'community_id',array_column($candidates,'id'));
+    };
+    return $resolver->resolve($understanding,$choose);
+};
+/** Ejecuta el pipeline completo (sin Drive, sin IMAP, sin disco) sobre una base de prueba. */
+$pipeline=static function(Salvest\Database $db,array $invoice,string $sender='facturas@proveedor.example',mixed $community='smart',mixed $supplier='smart',string $filename='factura.pdf',bool $autoLink=true)use($fakeAi,$understandingFromLegacy):array{
+    $ai=$fakeAi(array_key_exists('document_type',$invoice)&&isset($invoice['issuer'])?$invoice:$understandingFromLegacy($invoice),$community,$supplier);
+    $result=Salvest\Worker::processor($db,new Salvest\DocumentIntelligence($ai),null,$autoLink)->process('documento.pdf',$filename,'Remitente: '.$sender,$sender);
+    $result['ai']=$ai;
+    return$result;
 };
 
 $test('normalización y slug',static function()use($assert):void{
@@ -385,8 +506,10 @@ $test('ocultar campos: los valores existentes de comunidad viajan ocultos y no s
     $assert(!str_contains($html,'Otras direcciones conocidas'),'la etiqueta visible debe haber desaparecido');
     $assert(!str_contains($html,'Identificadores de contrato'),'la etiqueta visible debe haber desaparecido');
     $assert(str_contains($html,'name="cif" value="B12345678"') && str_contains($html,'<label class="mono"') === false && str_contains($html,'CIF<input class="mono" name="cif" value="B12345678"'),'el CIF de comunidad sigue siendo editable, no se pidió ocultarlo');
-    $still=(new Salvest\Classifier($db))->classify(['cups'=>'ES0021000000000001JN']);
-    $assert($still['community']!==null && (int)$still['community']['id']===$id,'el identificador ocultado en la UI debe seguir siendo utilizable por el Classifier');
+    // Reconstrucción: los identificadores contractuales ya no deciden la comunidad (decisión
+    // explícita, se revisarán más adelante), pero siguen guardados y viajando en el formulario.
+    $kept=$db->one('SELECT value FROM community_identifiers WHERE community_id=?',[$id]);
+    $assert($kept!==null && $kept['value']==='ES0021000000000001JN','el identificador ocultado en la UI se conserva en la base de datos');
 });
 $test('/Proveedores: el CIF ahora es visible/editable (cambio deliberado de esta mini-fase); los aliases siguen ocultos y no se borran',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
@@ -409,36 +532,43 @@ $test('/Proveedores: el CIF ahora es visible/editable (cambio deliberado de esta
     $assert(str_contains($html,'<input type="hidden" name="aliases" value="iberdrola.es">'),'el alias existente debe seguir viajando oculto (Fase 5, no esta mini-fase)');
     $assert(!str_contains($html,'<textarea name="aliases"'),'los aliases siguen sin ser editables en el alta/edición cotidiana');
     $assert(!str_contains($html,'Otros nombres o dominios conocidos'),'la etiqueta visible de aliases sigue sin aparecer');
-    $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'A12345678'],'facturas@otra-cosa.example');
-    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id,'el CIF ocultado en la UI debe seguir siendo utilizable por el Classifier');
-    $resolvedByAlias=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'Nombre distinto','proveedor_cif'=>''],'facturas@iberdrola.es');
-    $assert($resolvedByAlias['supplier']!==null && (int)$resolvedByAlias['supplier']['id']===$id,'el alias/dominio ocultado en la UI debe seguir siendo utilizable por el Classifier');
+    $resolver=new Salvest\SupplierResolver($db,new Salvest\SupplierCandidateRetriever($db));
+    $resolved=$resolver->resolve(['issuer'=>['name'=>null,'tax_id'=>'A12345678']],null,'facturas@otra-cosa.example',null);
+    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id && $resolved['source']==='tax_id_exact','el CIF ocultado en la UI debe seguir siendo utilizable por el resolvedor');
+    $resolvedByAlias=$resolver->resolve(['issuer'=>['name'=>'Nombre distinto','tax_id'=>null]],null,'facturas@iberdrola.es',null);
+    $assert($resolvedByAlias['supplier']!==null && (int)$resolvedByAlias['supplier']['id']===$id && $resolvedByAlias['source']==='alias_exact','el alias/dominio ocultado en la UI debe seguir siendo utilizable por el resolvedor: '.json_encode($resolvedByAlias['outcome']));
 });
-$test('Classifier sigue clasificando por identificador de contrato (CUPS)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$communityResolver=static fn(Salvest\Database $db):Salvest\CommunityResolver=>new Salvest\CommunityResolver($db,new Salvest\CommunityCandidateRetriever($db));
+$test('Reconstrucción — los identificadores contractuales (CUPS, contrato) ya no deciden la comunidad: decisión explícita de esta fase; sin otra señal no hay candidatas',static function()use($assert,$sqliteDb,$classifierSchema,$communityResolver):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['02','CP DOS',Salvest\Text::normalize('CP DOS'),'','Calle Dos 2','46002','Valencia','02 - CP DOS']);
     $id=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_identifiers(community_id,identifier_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$id,'contract','C-9988',Salvest\Text::normalize('C-9988')]);
-    $result=(new Salvest\Classifier($db))->classify(['numero_contrato'=>'C-9988']);
-    $assert($result['community']!==null && (int)$result['community']['id']===$id && $result['confidence']===100.0);
+    $calls=0;
+    $result=$communityResolver($db)->resolve(['customer'=>['name'=>null,'tax_id'=>null,'address'=>null],'supply_identifiers'=>['contract_number'=>'C-9988']],function()use(&$calls){$calls++;return['id'=>null,'confidence'=>0.0,'reason'=>'','valid'=>true,'rejected_id'=>null];});
+    $assert($result['community']===null && $result['outcome']==='no_candidates' && $calls===0,'sin NIF, nombre ni dirección no hay candidatas y no se llama a la IA: '.json_encode($result['outcome']));
 });
-$test('Classifier sigue clasificando por CIF de comunidad',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('NIF de comunidad único: resuelve directamente, confianza 1 y sin llamar a la IA',static function()use($assert,$sqliteDb,$classifierSchema,$communityResolver):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['03','CP TRES',Salvest\Text::normalize('CP TRES'),'B99999999','Calle Tres 3','46003','Valencia','03 - CP TRES']);
     $id=(int)$db->pdo()->lastInsertId();
-    $result=(new Salvest\Classifier($db))->classify(['comunidad_cif'=>'B99999999']);
-    $assert($result['community']!==null && (int)$result['community']['id']===$id && $result['evidence']['field']==='holder_cif');
+    $result=$communityResolver($db)->resolve(['customer'=>['name'=>'OTRA COSA DISTINTA','tax_id'=>'B-99999999','address'=>'Calle Inventada 9']],static fn()=>throw new RuntimeException('no debe llamarse a la IA'));
+    $assert($result['community']!==null && (int)$result['community']['id']===$id && $result['source']==='tax_id_exact' && $result['confidence']===1.0,
+        'un NIF exacto decide aunque el nombre y la dirección no coincidan: '.json_encode($result['outcome']));
 });
-$test('Classifier sigue clasificando comunidades por dirección alias (fuzzy)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('comunidades por dirección alias: el alias propone la candidata y la IA la confirma',static function()use($assert,$sqliteDb,$classifierSchema,$communityResolver,$smartChoice):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['04','CP CUATRO',Salvest\Text::normalize('CP CUATRO'),'','Calle Falsa 123','46004','Valencia','04 - CP CUATRO']);
     $id=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$id,'address','Avenida Real 45',Salvest\Text::normalize('Avenida Real 45')]);
-    $result=(new Salvest\Classifier($db))->classify(['direccion'=>'Avenida Real 45']);
-    $assert($result['community']!==null && (int)$result['community']['id']===$id,'debe encontrar la comunidad a través del alias de dirección, no de la dirección principal');
+    $understanding=['customer'=>['name'=>null,'tax_id'=>null,'address'=>'Avenida Real 45']];
+    $result=$communityResolver($db)->resolve($understanding,static fn(array $candidates):array=>Salvest\DocumentIntelligence::validateChoice(
+        ['community_id'=>$smartChoice($candidates,$understanding)['id'],'confidence'=>0.9,'reason'=>'alias'],'community_id',array_column($candidates,'id')));
+    $assert($result['community']!==null && (int)$result['community']['id']===$id && $result['source']==='ai_after_retrieval','debe encontrar la comunidad a través del alias de dirección: '.json_encode($result['candidates']));
+    $assert(in_array('Avenida Real 45',$result['candidates'][0]['alias']??[],true),'la IA recibe el alias de la candidata');
 });
 
 $test('ejecutar bot ahora: happy path, usa el mismo Worker y registra trigger_type=manual y el usuario',static function()use($assert,$sqliteDbWithLock,$workerConfig,$makeWebApp,$requestWebApp):void{
@@ -682,7 +812,7 @@ $test('edición: transición 0→1 permite procesar el histórico sin necesitar 
     $assert($result===['1','2','999'],'con la opción activada el Worker ya no debe filtrar nada, ni siquiera lo anterior al viejo baseline: '.json_encode($result));
 });
 
-$test('caso Iberdrola: MySQL corrige el "Agua" incorrecto de OpenAI usando CIF titular + CIF proveedor + tipo configurado',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('caso Iberdrola: MySQL corrige el "Agua" incorrecto de OpenAI usando CIF titular + CIF proveedor + tipo configurado',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['23','PK ILLES BALEARS 23',Salvest\Text::normalize('PK ILLES BALEARS 23'),'H12645537','Illes Balears 23','07001','Palma','23 - PK ILLES BALEARS 23']);
@@ -705,18 +835,18 @@ $test('caso Iberdrola: MySQL corrige el "Agua" incorrecto de OpenAI usando CIF t
     $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>'A95758389','nombre_comunidad'=>'PK ILLES BALEARS 23',
         'comunidad_cif'=>'H12645537','direccion'=>'','cups'=>'ES0021000011499086BA','numero_contrato'=>'763322520',
         'tipo_servicio'=>'agua','fecha_factura'=>'2026-08-01','importe'=>123.45,'numero_factura'=>'F-2026-001'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@iberdrola.es');
 
     $assert($route['status']==='classified','el caso real debe quedar clasificado automáticamente: '.json_encode($route));
     $assert((int)$route['decision']['community']['id']===$communityId,'la comunidad debe ser PK ILLES BALEARS 23, no la del CUPS señuelo');
-    $assert($route['decision']['evidence']['field']==='holder_cif','la comunidad debe resolverse por CIF titular, con prioridad sobre CUPS/contrato');
+    $assert($route['decision']['evidence']['source']==='tax_id_exact','la comunidad debe resolverse por CIF titular, con prioridad sobre CUPS/contrato');
     $assert((int)$route['supplier']['id']===$supplierId && $route['supplier']['official_name']==='IBERDROLA CLIENTES, S.A.U.','el proveedor debe ser Iberdrola');
-    $assert($route['evidence']['supplier']['field']==='supplier_cif','el proveedor debe resolverse por su propio CIF, nunca el de la comunidad');
+    $assert($route['evidence']['supplier']['source']==='tax_id_exact','el proveedor debe resolverse por su propio CIF, nunca el de la comunidad');
     $assert($route['service']==='ELECTRICIDAD','MySQL debe corregir el "agua" erróneo de OpenAI: '.$route['service']);
-    $assert($route['evidence']['service']['field']==='supplier_main_service_type','el servicio debe venir del tipo configurado del proveedor, no de la sugerencia de OpenAI');
+    $assert($route['evidence']['service']['source']==='supplier_main_service','el servicio debe venir del tipo configurado del proveedor, no de la sugerencia de OpenAI');
     $assert($route['reason']===null,'un caso correctamente asociado no debe llevar motivo de revisión');
 });
-$test('Fase 6 — proveedor reconocido globalmente pero no asociado a la comunidad: clasifica con el fallback global, sin crear ninguna relación community_suppliers',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — proveedor reconocido globalmente pero no asociado a la comunidad: clasifica con el fallback global, sin crear ninguna relación community_suppliers',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['30','CP TREINTA',Salvest\Text::normalize('CP TREINTA'),'H99999999','Calle Treinta','46030','Valencia','30 - CP TREINTA']);
@@ -728,10 +858,10 @@ $test('Fase 6 — proveedor reconocido globalmente pero no asociado a la comunid
     // Nótese: no hay fila en community_suppliers vinculando a este proveedor con esta comunidad.
     $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>'A95758389','comunidad_cif'=>'H99999999','tipo_servicio'=>'agua'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@iberdrola.es');
     $assert($route['status']==='classified','Fase 6: un proveedor reconocido de forma inequívoca a nivel global debe clasificar, aunque no exista todavía community_suppliers: '.json_encode($route));
     $assert($route['supplier']!==null && $route['supplier']['cif']==='A95758389','debe usarse el proveedor global resuelto');
-    $assert($route['evidence']['supplier']['source']==='global','la evidencia debe dejar constancia de que vino del fallback global, no de la comunidad');
+    $assert($route['evidence']['supplier']['source']==='tax_id_exact'&&$route['result']['classification']['supplier']['linked']===false,'la evidencia debe dejar constancia de que se resolvió por CIF sin estar vinculado a la comunidad');
     $assert($route['service']==='ELECTRICIDAD','el servicio debe salir de supplier.main_service_type_id, con relation=null');
     $assert($route['reason']===null,'una clasificación correcta no debe llevar motivo de revisión');
     $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
@@ -754,50 +884,50 @@ $makeCommunityWithSupplier=static function(Salvest\Database $db,string $communit
     return['communityId'=>$communityId,'supplierId'=>$supplierId,'communityCif'=>$communityCif];
 };
 
-$test('resolución contextual: IBERDROLA (sin CIF) reconoce "IBERDROLA CLIENTES, S.A.U." por contención de nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('resolución contextual: IBERDROLA (sin CIF) reconoce "IBERDROLA CLIENTES, S.A.U." por contención de nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'23','PK ILLES BALEARS 23','IBERDROLA','ELECTRICIDAD');
     $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@iberdrola.es');
     $assert($route['status']==='classified','el caso real (sin CIF de proveedor en el maestro) debe clasificar solo: '.json_encode($route));
     $assert((int)$route['supplier']['id']===$fixture['supplierId'],'debe resolver al proveedor IBERDROLA');
-    $assert($route['evidence']['supplier']['field']==='proveedor'&&$route['evidence']['supplier']['type']==='name_containment','debe quedar constancia de que fue por contención de nombre, no CIF');
+    $assert($route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('containment',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),'debe quedar constancia de que fue por contención de nombre, no CIF');
     $assert($route['service']==='ELECTRICIDAD','debe corregir el "agua" de OpenAI usando el tipo configurado del proveedor: '.$route['service']);
-    $assert($route['evidence']['service']['field']==='supplier_main_service_type');
+    $assert($route['evidence']['service']['source']==='supplier_main_service');
 });
-$test('resolución contextual: IBERDROLA vs "IBERDROLA CLIENTES" sin forma societaria también contiene el nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('resolución contextual: IBERDROLA vs "IBERDROLA CLIENTES" sin forma societaria también contiene el nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'24','CP VEINTICUATRO','IBERDROLA','ELECTRICIDAD');
     $invoice=['proveedor'=>'IBERDROLA CLIENTES','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@iberdrola.es');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
 });
-$test('resolución contextual: formas societarias distintas (maestro S.L., factura S.A.) igualan por nombre comercial',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('resolución contextual: formas societarias distintas (maestro S.L., factura S.A.) igualan por nombre comercial',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'25','CP VEINTICINCO','AGUAS DEL LEVANTE, S.L.','AGUA');
     $invoice=['proveedor'=>'AGUAS DEL LEVANTE, S.A.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@aguaslevante.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@aguaslevante.es');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],'S.L. en el maestro y S.A. en la factura deben considerarse el mismo nombre comercial: '.json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact','tras quitar la forma societaria ambos nombres deben quedar idénticos, no solo contenidos');
+    $assert($route['evidence']['supplier']['source']==='name_exact','tras quitar la forma societaria ambos nombres deben quedar idénticos, no solo contenidos');
 });
-$test('resolución contextual: mayúsculas, tildes y puntuación no impiden la coincidencia exacta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('resolución contextual: mayúsculas, tildes y puntuación no impiden la coincidencia exacta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'26','CP VEINTISEIS','Jardinería Compañía, S.L.','JARDINERIA');
     $invoice=['proveedor'=>'JARDINERIA COMPAÑIA SL','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@jardineria.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@jardineria.es');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
 });
-$test('resolución contextual: alias de proveedor dentro de la comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('resolución contextual: alias de proveedor dentro de la comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'27','CP VEINTISIETE','Descalcificadores Este S.L.','DESCALCIFICADOR');
     $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
         [$fixture['supplierId'],'name','AQUATREAT',Salvest\Text::normalize('AQUATREAT')]);
     $invoice=['proveedor'=>'AQUATREAT','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@aquatreat.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@aquatreat.example');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
-    $assert($route['evidence']['supplier']['field']==='alias','debe quedar constancia de que fue por alias: '.json_encode($route['evidence']['supplier']));
+    $assert($route['evidence']['supplier']['source']==='alias_exact','debe quedar constancia de que fue por alias: '.json_encode($route['evidence']['supplier']));
 });
-$test('resolución contextual: dos proveedores igualmente plausibles van a revisión, no se adivina',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('resolución contextual: dos proveedores igualmente plausibles van a revisión, no se adivina',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['28','CP VEINTIOCHO',Salvest\Text::normalize('CP VEINTIOCHO'),'Z28000000','Calle 28','46028','Valencia','28 - CP VEINTIOCHO']);
@@ -809,22 +939,23 @@ $test('resolución contextual: dos proveedores igualmente plausibles van a revis
         $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'MANTENIMIENTO']);
     }
     $invoice=['proveedor'=>'PROVEEDOR ALFA PROVEEDOR BETA','proveedor_cif'=>null,'comunidad_cif'=>'Z28000000','tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@ambiguo.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@ambiguo.example');
     $assert($route['status']==='needs_review','ante dos candidatos igual de plausibles no debe adivinar: '.json_encode($route));
     $assert($route['supplier']===null);
-    $assert(str_contains((string)$route['reason'],'Varios proveedores'),'el motivo debe explicar que hay varios candidatos: '.$route['reason']);
+    $assert(str_contains((string)$route['reason'],'varios proveedores posibles'),'el motivo debe explicar que hay varios candidatos: '.$route['reason']);
+    $assert(count($route['evidence']['supplier']['candidates'])===2&&$route['ai_tasks']===['comprender_documento','elegir_proveedor'],'la IA recibe los dos candidatos y se abstiene: '.json_encode($route['ai_tasks']));
 });
-$test('resolución contextual: si hay CIF de proveedor disponible, sigue ganando a un nombre que no coincide',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('resolución contextual: si hay CIF de proveedor disponible, sigue ganando a un nombre que no coincide',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'29','CP VEINTINUEVE','IBERDROLA','ELECTRICIDAD','A95758389');
     // El nombre extraído no se parece en nada al maestro, pero el CIF sí coincide exactamente.
     $invoice=['proveedor'=>'Suministradora Eléctrica Desconocida SL','proveedor_cif'=>'A95758389','comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@otra.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@otra.example');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],'el CIF debe ganar aunque el nombre extraído no se parezca al maestro: '.json_encode($route));
-    $assert($route['evidence']['supplier']['field']==='supplier_cif' && $route['evidence']['supplier']['type']==='exact');
+    $assert($route['evidence']['supplier']['source']==='tax_id_exact');
     $assert($route['service']==='ELECTRICIDAD');
 });
-$test('inferencia comunidad+servicio: caso real MENENDEZ YPELAYO 10 / CRISLA — único proveedor de LIMPIEZA se infiere sin coincidencia de nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('inferencia comunidad+servicio: caso real MENENDEZ YPELAYO 10 / CRISLA — único proveedor de LIMPIEZA se infiere sin coincidencia de nombre',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'82','MENENDEZ YPELAYO 10','CRISLA','LIMPIEZA',null,'H12557229');
     // OpenAI no acertó el nombre del proveedor (extrajo un texto que no contiene "CRISLA" en
@@ -832,45 +963,48 @@ $test('inferencia comunidad+servicio: caso real MENENDEZ YPELAYO 10 / CRISLA —
     $invoice=['proveedor'=>'Servicios Generales de Mantenimiento Ibérica','proveedor_cif'=>'B12534228','comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
     // Nótese: aunque el nombre y el CIF del proveedor no están en el maestro (como en la
     // realidad: suppliers.cif es NULL), la inferencia comunidad+servicio debe bastar igualmente.
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
-    $assert($route['status']==='classified','comunidad+servicio con un único proveedor compatible debe clasificar: '.json_encode($route));
+    // Reconstrucción: "único proveedor del servicio en la comunidad" ya no decide sin IA; CRISLA
+    // llega a la IA como candidato vinculado a la comunidad (con su servicio) y la IA lo elige.
+    $route=$routeCompat($db)->route($invoice,'facturas@crisla.example','',static fn(array $candidates):?int=>$fixture['supplierId']);
+    $assert($route['status']==='classified','con CRISLA entre los candidatos y elegido por la IA debe clasificar: '.json_encode($route));
     $assert((int)$route['supplier']['id']===$fixture['supplierId'],'debe resolver a CRISLA');
-    $assert($route['evidence']['supplier']['field']==='community_service' && $route['evidence']['supplier']['type']==='community_service_unique_supplier','debe quedar constancia de la señal usada: '.json_encode($route['evidence']['supplier']));
+    $crisla=$route['evidence']['supplier']['candidates'][0]??[];
+    $assert($route['evidence']['supplier']['source']==='ai_after_retrieval' && ($crisla['ya_trabaja_con_la_comunidad']??false)===true && ($crisla['servicio_principal']??null)==='LIMPIEZA','la IA ve que CRISLA ya trabaja con la comunidad y su servicio: '.json_encode($route['evidence']['supplier']));
     $assert($route['service']==='LIMPIEZA');
 });
-$test('Fase 20 — inferencia comunidad+servicio: caso real SANCHEZ/IBERDROLA — si el documento trae un CIF de proveedor y el único candidato tiene OTRO CIF en el maestro, nunca se elige (antes: presupuesto de MONTAJES ELECTRICOS O. SANCHEZ archivado como IBERDROLA)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('Fase 20 — inferencia comunidad+servicio: caso real SANCHEZ/IBERDROLA — si el documento trae un CIF de proveedor y el único candidato tiene OTRO CIF en el maestro, nunca se elige (antes: presupuesto de MONTAJES ELECTRICOS O. SANCHEZ archivado como IBERDROLA)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'24','URBANIZACION LA PALMERA','IBERDROLA CLIENTES, S.A.U.','ELECTRICIDAD','A95758389','H12351482');
     $invoice=['proveedor'=>'MONTAJES ELECTRICOS O. SANCHEZ S.L.','proveedor_cif'=>'B12632105','comunidad_cif'=>'H12351482','tipo_servicio'=>'electricidad'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'sanchez@example.com');
+    $route=$routeCompat($db)->route($invoice,'sanchez@example.com');
     $assert($route['supplier']===null,'no debe resolverse a IBERDROLA con un CIF de documento distinto: '.json_encode($route['supplier']));
     $assert($route['status']==='needs_review','comunidad conocida pero proveedor sin resolver -> revisión: '.$route['status']);
 });
-$test('Fase 20 — reintento restringido con IA: si la IA elige un proveedor cuyo CIF contradice el del documento, la elección se descarta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('Fase 20 — reintento restringido con IA: si la IA elige un proveedor cuyo CIF contradice el del documento, la elección se descarta',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'24','URBANIZACION LA PALMERA','IBERDROLA CLIENTES, S.A.U.','ELECTRICIDAD','A95758389','H12351482');
     $invoice=['proveedor'=>'MONTAJES ELECTRICOS O. SANCHEZ S.L.','proveedor_cif'=>'B12632105','comunidad_cif'=>'H12351482','tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'sanchez@example.com','',static fn(array $candidates,array $community):int=>$fixture['supplierId']);
+    $route=$routeCompat($db)->route($invoice,'sanchez@example.com','',static fn(array $candidates,array $community):int=>$fixture['supplierId']);
     $assert($route['supplier']===null,'la elección de la IA con CIF contradictorio debe descartarse: '.json_encode($route['supplier']));
 });
-$test('Fase 20 — Worker::looksLikeQuote(): presupuestos por tipo_documento o por nombre de archivo; nunca una factura normal',static function()use($assert):void{
-    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>'presupuesto'],'documento.pdf'),'la IA dice presupuesto');
-    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>'Presupuesto'],'x.pdf'),'sin importar mayúsculas');
-    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>null],'Presupuesto  1-000035.pdf'),'caso real: nombre de archivo de Rafael Guijarro');
-    $assert(Salvest\Worker::looksLikeQuote(['tipo_documento'=>'factura'],'PRE 266.pdf'),'caso real: nombre de archivo de O. Sanchez, aunque la IA se equivoque');
-    $assert(Salvest\Worker::looksLikeQuote([],'Pressupost_12.pdf'));
-    $assert(!Salvest\Worker::looksLikeQuote(['tipo_documento'=>'factura'],'Factura H-12286035 1-000167.pdf'),'una factura normal nunca');
-    $assert(!Salvest\Worker::looksLikeQuote(['tipo_documento'=>'otro'],'INFORME CERTIFICADO I22921.PDF'),'un parte/informe no es presupuesto: sigue archivándose como hasta ahora');
-    $assert(!Salvest\Worker::looksLikeQuote([],'Prestaciones premium.pdf'),'"pre" solo cuenta como palabra completa');
+$test('Fase 20 — ClassificationPolicy::filenameSuggestsQuote(): el nombre del archivo delata un presupuesto como palabra completa; nunca una factura normal',static function()use($assert):void{
+    $assert(Salvest\ClassificationPolicy::filenameSuggestsQuote('Presupuesto  1-000035.pdf'),'caso real: nombre de archivo de Rafael Guijarro');
+    $assert(Salvest\ClassificationPolicy::filenameSuggestsQuote('PRE 266.pdf'),'caso real: nombre de archivo de O. Sanchez');
+    $assert(Salvest\ClassificationPolicy::filenameSuggestsQuote('Pressupost_12.pdf'));
+    $assert(Salvest\ClassificationPolicy::filenameSuggestsQuote('Proforma 7.pdf'));
+    $assert(!Salvest\ClassificationPolicy::filenameSuggestsQuote('Factura H-12286035 1-000167.pdf'),'una factura normal nunca');
+    $assert(!Salvest\ClassificationPolicy::filenameSuggestsQuote('INFORME CERTIFICADO I22921.PDF'));
+    $assert(!Salvest\ClassificationPolicy::filenameSuggestsQuote('Prestaciones premium.pdf'),'"pre" solo cuenta como palabra completa');
 });
-$test('Fase 20 — Worker: un presupuesto degrada a needs_review ANTES de archivarlo, con motivo propio (guarda de regresión de código)',static function()use($assert):void{
-    $source=file_get_contents(__DIR__.'/../src/Worker.php');
-    $quotePos=strpos($source,'$isQuote=');$archiverPos=strpos($source,'$target = $this->archiver->archive(');
-    $assert($quotePos!==false&&$archiverPos!==false&&$quotePos<$archiverPos,'la comprobación de presupuesto debe ir antes de archivar');
-    $assert(str_contains($source,"'quote_document'"),'blockingFactor debe distinguir el caso presupuesto');
-    foreach(['src/ClaudeExtractor.php','src/OpenAIExtractor.php'] as $file){
-        $assert(str_contains(file_get_contents(__DIR__.'/../'.$file),"'tipo_documento'"),"$file debe pedir tipo_documento a la IA");
-    }
+$test('Fase 20 → reconstrucción — un presupuesto nunca se archiva como factura: la IA lo identifica (budget) y con certeza queda como no factura; una "factura" cuyo archivo se llama Presupuesto va a revisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'24','URBANIZACION LA PALMERA','RAFAEL GUIJARRO PRADES','LIMPIEZA','11111111H','H12351482');
+    $budget=$pipeline($db,['document_type'=>'budget','document_confidence'=>0.96,'proveedor'=>'RAFAEL GUIJARRO PRADES','proveedor_cif'=>'11111111H','comunidad_cif'=>'H12351482'],'rafa@example.com','smart','smart','Presupuesto  1-000035.pdf');
+    $assert($budget['status']==='ignored_not_invoice' && $budget['reason_code']==='not_invoice','un presupuesto con certeza alta no es factura: '.$budget['status']);
+    $assert($budget['community']===null && $budget['ai']->tasks()===['comprender_documento'],'un documento descartado no gasta más IA ni se resuelve');
+    $byName=$pipeline($db,['proveedor'=>'RAFAEL GUIJARRO PRADES','proveedor_cif'=>'11111111H','comunidad_cif'=>'H12351482'],'rafa@example.com','smart','smart','Presupuesto 1-000037.pdf');
+    $assert($byName['status']==='needs_review' && $byName['reason_code']==='quote_filename','la IA dice factura pero el archivo dice presupuesto: revisión: '.$byName['status']);
+    $assert(in_array('budget',Salvest\AiContracts::DOCUMENT_TYPES,true),'el contrato de la IA distingue presupuestos');
 });
 $test('Fase 20 — Text::normalize() quita el marcador de número delante de una cifra (N-12, Nº 1, núm. 5, nº12), y nada más',static function()use($assert):void{
     $assert(Salvest\Text::normalize('MEDITERRANEO N-12')==='mediterraneo 12');
@@ -881,50 +1015,48 @@ $test('Fase 20 — Text::normalize() quita el marcador de número delante de una
     $assert(Salvest\Text::normalize('No hay nada')==='no hay nada','"no" sin número detrás se queda');
     $assert(Salvest\Text::normalize('Plaza N')==='plaza n','"n" al final se queda');
 });
-$test('Fase 20 — casos reales de Rafael Guijarro: "C.P. MEDITERRANEO N-12" y "C.P. LES ERES N-3" resuelven su comunidad',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 20 — casos reales de Rafael Guijarro: "C.P. MEDITERRANEO N-12" y "C.P. LES ERES N-3" llegan como candidatas y se resuelven (el NIF mal escrito no estorba)',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['90','AVDA. MEDITERRANEA 12',Salvest\Text::normalize('AVDA. MEDITERRANEA 12'),'H12278057','AVDA MEDITERRANEA 12']);
     $mediterraneoId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$mediterraneoId,'address','MEDITERRANEO 12',Salvest\Text::normalize('MEDITERRANEO 12')]);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['01','LES ERES 3',Salvest\Text::normalize('LES ERES 3'),'H12805990','CALLE LES ERES 3']);
     $leseresId=(int)$db->pdo()->lastInsertId();
-    $classifier=new Salvest\Classifier($db);
-    $a=$classifier->classify(['nombre_comunidad'=>'C.P. MEDITERRANEO N-12','direccion'=>'MEDITERRANEO N-12'],'');
-    $assert((int)($a['community']['id']??0)===$mediterraneoId,json_encode($a));
-    // El NIF del documento real venía mal escrito ("H-1285990", le falta un dígito): no debe
-    // estorbar, la dirección basta.
-    $b=$classifier->classify(['nombre_comunidad'=>'C.P. LES ERES N-3','direccion'=>'LES ERES N-3','comunidad_cif'=>'H-1285990'],'');
-    $assert((int)($b['community']['id']??0)===$leseresId,json_encode($b));
+    $a=$resolveCommunity($db,['name'=>'C.P. MEDITERRANEO N-12','address'=>'MEDITERRANEO N-12']);
+    $assert((int)($a['community']['id']??0)===$mediterraneoId && $a['source']==='ai_after_retrieval',json_encode($a['candidates']));
+    $b=$resolveCommunity($db,['name'=>'C.P. LES ERES N-3','address'=>'LES ERES N-3','tax_id'=>'H-1285990']);
+    $assert((int)($b['community']['id']??0)===$leseresId && $b['tax_id']['matches']===0,'el NIF erróneo no coincide con nada y se recurre a candidatas: '.json_encode($b['candidates']));
 });
-$test('Fase 23 — caso real FACSA Tarancón: la IA puso el CIF de la comunidad como CIF del proveedor y dejó comunidad_cif vacío -> se recoloca y la factura se clasifica sola',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('Fase 23 — caso real FACSA Tarancón: la IA puso el CIF de la comunidad como CIF del proveedor y dejó comunidad_cif vacío -> se recoloca y la factura se clasifica sola',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'67','CARDENAL VTE. ENRIQUE TARANCON','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua','A12000022','H12542460');
     $invoice=['proveedor'=>'SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','proveedor_cif'=>'H12542460','comunidad_cif'=>null,
         'nombre_comunidad'=>'CDAD PROP AV CARDENAL V ENRIQUE TARANCON','direccion'=>'CARRER MARE TERESA DE CALCUTA 18 - C.G. S.E., BURRIANA','tipo_servicio'=>'agua'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@facsa.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@facsa.example');
     $assert((int)($route['decision']['community']['id']??0)===$fixture['communityId'],'debe resolver la comunidad por su CIF: '.json_encode($route['decision']));
-    $assert($route['decision']['evidence']===['field'=>'holder_cif','type'=>'exact'],json_encode($route['decision']['evidence']));
+    $assert($route['decision']['evidence']===['source'=>'tax_id_exact','outcome'=>'resolved'],json_encode($route['decision']['evidence']));
+    $assert($route['result']['classification']['corrections']===['issuer_tax_id_moved_to_customer'],'la corrección queda registrada: '.json_encode($route['result']['classification']['corrections']));
     $assert((int)($route['supplier']['id']??0)===$fixture['supplierId']&&$route['status']==='classified',json_encode([$route['status'],$route['supplier']]));
 });
-$test('Fase 23 — reassignMisplacedHolderCif(): solo actúa si el CIF del "proveedor" es de una comunidad nuestra; si comunidad_cif ya venía, se respeta',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 23 — CIF de comunidad leído como CIF del emisor: se mueve al cliente si estaba vacío, se descarta del emisor si ya venía, y un CIF de proveedor real nunca se toca',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
     $db=$sqliteDb($classifierSchema);
-    $db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,1)',['XILXES 14','xilxes 14','H12725404','CALLE XILXES 14']);
-    $classifier=new Salvest\Classifier($db);
-    $assert($classifier->reassignMisplacedHolderCif(['proveedor_cif'=>'H-12725404','comunidad_cif'=>null])===['proveedor_cif'=>null,'comunidad_cif'=>'H-12725404']);
-    $assert($classifier->reassignMisplacedHolderCif(['proveedor_cif'=>'H12725404','comunidad_cif'=>'H12725404'])===['proveedor_cif'=>null,'comunidad_cif'=>'H12725404']);
-    $normal=['proveedor_cif'=>'A12000022','comunidad_cif'=>'H12725404'];
-    $assert($classifier->reassignMisplacedHolderCif($normal)===$normal,'un CIF de proveedor de verdad nunca se toca');
+    $fixture=$makeCommunityWithSupplier($db,'03','XILXES 14','FACSA','Agua','A12000022','H12725404');
+    $moved=$pipeline($db,['proveedor'=>'FACSA','proveedor_cif'=>'H-12725404','comunidad_cif'=>null]);
+    $assert($moved['understanding']['customer']['tax_id']==='H-12725404' && $moved['understanding']['issuer']['tax_id']===null && $moved['classification']['corrections']===['issuer_tax_id_moved_to_customer'],json_encode($moved['classification']['corrections']));
+    $both=$pipeline($db,['proveedor'=>'FACSA','proveedor_cif'=>'H12725404','comunidad_cif'=>'H12725404']);
+    $assert($both['understanding']['issuer']['tax_id']===null && $both['classification']['corrections']===['issuer_tax_id_was_a_community_tax_id'],json_encode($both['classification']['corrections']));
+    $normal=$pipeline($db,['proveedor'=>'FACSA','proveedor_cif'=>'A12000022','comunidad_cif'=>'H12725404']);
+    $assert($normal['understanding']['issuer']['tax_id']==='A12000022' && $normal['classification']['corrections']===[],'un CIF de proveedor de verdad nunca se toca');
 });
-$test('Fase 23 — dos comunidades con el mismo CIF (caso real EDIFICI/PARKING GERMANIES): el CIF no decide; decide el nombre, y sin nombre no se elige ninguna',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 23 — dos comunidades con el mismo CIF (caso real EDIFICI/PARKING GERMANIES): el CIF no decide solo; la IA elige entre exactamente esas dos, y sin evidencia no se elige ninguna',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,1)',['EDIFICI GERMANIES','edifici germanies','H12771119','CALLE GERMANIES 7']);
     $edificiId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO communities(official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,1)',['PARKING GERMANIES','parking germanies','H12771119','CALLE GERMANIES 7']);
-    $classifier=new Salvest\Classifier($db);
-    $none=$classifier->classify(['comunidad_cif'=>'H12771119'],'');
-    $assert($none['community']===null,'sin nombre ni dirección no debe elegir ninguna de las dos al azar: '.json_encode($none));
-    $named=$classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM. PROP. EDIFICI GERMANIES'],'');
-    $assert((int)($named['community']['id']??0)===$edificiId,json_encode($named));
+    $none=$resolveCommunity($db,['tax_id'=>'H12771119']);
+    $assert($none['community']===null && $none['outcome']==='ai_abstained' && count($none['candidates'])===2,'sin nombre ni dirección no debe elegir ninguna de las dos al azar: '.json_encode($none['outcome']));
+    $named=$resolveCommunity($db,['tax_id'=>'H12771119','name'=>'COM. PROP. EDIFICI GERMANIES']);
+    $assert((int)($named['community']['id']??0)===$edificiId && $named['source']==='ai_after_shared_tax_id',json_encode($named['outcome']));
 });
 $seedGermanies=static function(Salvest\Database $db):array{
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['65','EDIFICI GERMANIES','edifici germanies','H12771119','CALLE GERMANIES 7']);
@@ -932,26 +1064,32 @@ $seedGermanies=static function(Salvest\Database $db):array{
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['66','PARKING GERMANIES','parking germanies','H12771119','CALLE GERMANIES 7']);
     return ['edificio'=>$edificiId,'parking'=>(int)$db->pdo()->lastInsertId()];
 };
-$test('Fase 25 — caso real EXTINPLAN: NIF compartido H12771119 + "COM.PROP.GERMANIES 7-9 GARAJE" -> PARKING GERMANIES (garaje = parking), por CIF, sin depender del umbral de parecido',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies):void{
+$test('Caso B real (EXTINPLAN 2270): NIF compartido H12771119 + "COM.PROP.GERMANIES 7-9 GARAJE" -> la IA recibe exactamente EDIFICI y PARKING GERMANIES y elige PARKING (garaje = parking sin reglas fijas)',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);$ids=$seedGermanies($db);
-    $decision=(new Salvest\Classifier($db))->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM.PROP.GERMANIES 7-9 GARAJE','direccion'=>'Calle Germanies-Maestro Serrano','codigo_postal'=>'12530'],'');
-    $assert((int)($decision['community']['id']??0)===$ids['parking'],json_encode($decision));
-    $assert($decision['evidence']===['field'=>'holder_cif','type'=>'shared_cif_distinctive_word']&&$decision['confidence']===100.0,json_encode($decision['evidence']));
+    $seen=null;
+    $decision=$resolveCommunity($db,['tax_id'=>'H12771119','name'=>'COM.PROP.GERMANIES 7-9 GARAJE','address'=>'Calle Germanies-Maestro Serrano','postal_code'=>'12530'],
+        function(array $candidates)use(&$seen,$ids){$seen=$candidates;return['id'=>$ids['parking'],'confidence'=>0.88,'reason'=>'GARAJE equivale a PARKING'];});
+    $assert((int)($decision['community']['id']??0)===$ids['parking'] && $decision['source']==='ai_after_shared_tax_id' && $decision['confidence']===0.88,json_encode($decision['outcome']));
+    $names=array_column($seen,'nombre');sort($names);
+    $assert($names===['EDIFICI GERMANIES','PARKING GERMANIES'],'la IA recibe exactamente las dos que comparten NIF: '.json_encode($names));
+    $assert(!(new ReflectionClass(Salvest\CommunityResolver::class))->hasMethod('pickByDistinctiveWord'),'la equivalencia garaje = parking ya no está escrita a mano en el código');
 });
-$test('Fase 25 — el desempate funciona en los dos sentidos y con las variantes reales de las carpetas ("EDIFICIO GERMANIAS", "PK GERMANIAS")',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies):void{
-    $db=$sqliteDb($classifierSchema);$ids=$seedGermanies($db);$classifier=new Salvest\Classifier($db);
-    $assert((int)($classifier->classify(['comunidad_cif'=>'H-12771119','nombre_comunidad'=>'EDIFICIO GERMANIAS'],'')['community']['id']??0)===$ids['edificio']);
-    $assert((int)($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'PK GERMANIAS'],'')['community']['id']??0)===$ids['parking']);
-    $assert((int)($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'CDAD PROP','direccion'=>'APARCAMIENTO C/ GERMANIES 7'],'')['community']['id']??0)===$ids['parking'],'la palabra puede venir en la dirección');
+$test('NIF compartido: la elección de la IA solo se acepta con confianza suficiente; por debajo del umbral, sin comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedGermanies($db);
+    $low=$resolveCommunity($db,['tax_id'=>'H12771119','name'=>'GERMANIAS'],['id'=>$ids['edificio'],'confidence'=>0.69,'reason'=>'quizá']);
+    $assert($low['community']===null && $low['outcome']==='ai_low_confidence','0.69 está por debajo de '.Salvest\ClassificationPolicy::AI_CHOICE_MIN_CONFIDENCE.': '.json_encode($low['outcome']));
+    $edge=$resolveCommunity($db,['tax_id'=>'H12771119','name'=>'EDIFICIO GERMANIAS'],['id'=>$ids['edificio'],'confidence'=>0.70,'reason'=>'edificio']);
+    $assert((int)($edge['community']['id']??0)===$ids['edificio'],'0.70 es el borde inferior del tramo "evidencia fuerte": se acepta');
 });
-$test('Fase 25 — sin palabra distintiva, o con las de las dos a la vez, el CIF compartido sigue sin elegir ninguna (nunca al azar)',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies):void{
-    $db=$sqliteDb($classifierSchema);$seedGermanies($db);$classifier=new Salvest\Classifier($db);
-    $assert($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'COM. PROP. GERMANIES 7'],'')['community']===null,'solo "germanies 7": lo comparten las dos');
-    $assert($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'EDIFICIO Y GARAJE GERMANIES'],'')['community']===null,'las dos palabras a la vez: ambiguo');
-    $assert($classifier->classify(['comunidad_cif'=>'H12771119','nombre_comunidad'=>'GERMANIES'],'Asunto: factura parking germanies')['community']===null,'el texto del correo nunca desempata, solo el documento');
+$test('Caso C y F: NIF compartido que la IA no puede distinguir -> sin comunidad; un id fuera de las candidatas se rechaza',static function()use($assert,$sqliteDb,$classifierSchema,$seedGermanies,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedGermanies($db);
+    $abstain=$resolveCommunity($db,['tax_id'=>'H12771119','name'=>'COM. PROP. GERMANIES 7'],'abstain');
+    $assert($abstain['community']===null && $abstain['outcome']==='ai_abstained',json_encode($abstain['outcome']));
+    $invented=$resolveCommunity($db,['tax_id'=>'H12771119','name'=>'GERMANIES'],['id'=>999,'confidence'=>0.99,'reason'=>'inventado']);
+    $assert($invented['community']===null && $invented['outcome']==='ai_invalid_candidate' && $invented['ai']['rejected_id']===999,'un id inventado se rechaza: '.json_encode($invented['ai']));
 });
 
-$test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo servicio nunca se eligen automáticamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo servicio nunca se eligen automáticamente',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['31','CP TREINTAYUNO',Salvest\Text::normalize('CP TREINTAYUNO'),'H31000000','Calle 31','46031','Valencia','31 - CP TREINTAYUNO']);
@@ -964,11 +1102,11 @@ $test('inferencia comunidad+servicio: dos proveedores compatibles con el mismo s
     }
     // El nombre extraído no coincide con ninguno de los dos, así que solo queda la señal comunidad+servicio — y hay dos.
     $invoice=['proveedor'=>'Proveedor de Limpieza No Identificado','proveedor_cif'=>null,'comunidad_cif'=>'H31000000','tipo_servicio'=>'limpieza'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@limpieza.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@limpieza.example');
     $assert($route['status']==='needs_review','con dos proveedores compatibles no debe elegirse ninguno automáticamente: '.json_encode($route));
     $assert($route['supplier']===null);
 });
-$test('inferencia comunidad+servicio: un proveedor identificado explícitamente por nombre tiene prioridad sobre esta señal',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('inferencia comunidad+servicio: un proveedor identificado explícitamente por nombre tiene prioridad sobre esta señal',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['32','CP TREINTAYDOS',Salvest\Text::normalize('CP TREINTAYDOS'),'H32000000','Calle 32','46032','Valencia','32 - CP TREINTAYDOS']);
@@ -982,28 +1120,28 @@ $test('inferencia comunidad+servicio: un proveedor identificado explícitamente 
     // Ambos proveedores comparten servicio (la nueva señal por sí sola sería ambigua), pero
     // el nombre extraído coincide exactamente con uno de ellos: la coincidencia de nombre debe ganar.
     $invoice=['proveedor'=>'LIMPIEZAS NORTE','proveedor_cif'=>null,'comunidad_cif'=>'H32000000','tipo_servicio'=>'limpieza'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@limpiezasnorte.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@limpiezasnorte.example');
     $assert($route['status']==='classified','la coincidencia de nombre explícita debe primar sobre la inferencia comunidad+servicio: '.json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact','no debe usarse la señal comunidad+servicio cuando el nombre ya resolvió el proveedor: '.json_encode($route['evidence']['supplier']));
+    $assert($route['evidence']['supplier']['source']==='name_exact','no debe usarse la señal comunidad+servicio cuando el nombre ya resolvió el proveedor: '.json_encode($route['evidence']['supplier']));
 });
-$test('inferencia comunidad+servicio: proveedor confirmado por nombre pero con servicio erróneo de OpenAI — gana el servicio configurado en BD',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('inferencia comunidad+servicio: proveedor confirmado por nombre pero con servicio erróneo de OpenAI — gana el servicio configurado en BD',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'33','CP TREINTAYTRES','CRISLA','LIMPIEZA');
     // OpenAI acertó el nombre del proveedor pero se equivocó de servicio ("agua" en vez de limpieza).
     $invoice=['proveedor'=>'CRISLA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@crisla.example');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact','el proveedor se resolvió por nombre, no por la señal comunidad+servicio');
+    $assert($route['evidence']['supplier']['source']==='name_exact','el proveedor se resolvió por nombre, no por la señal comunidad+servicio');
     $assert($route['service']==='LIMPIEZA','el servicio configurado del proveedor en BD debe corregir el "agua" erróneo de OpenAI: '.$route['service']);
-    $assert($route['evidence']['service']['field']==='supplier_main_service_type');
+    $assert($route['evidence']['service']['source']==='supplier_main_service');
 });
-$test('inferencia comunidad+servicio: ningún proveedor compatible con el servicio va a revisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('inferencia comunidad+servicio: ningún proveedor compatible con el servicio va a revisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     // Esta comunidad solo tiene un proveedor de ELECTRICIDAD; la factura dice ser de LIMPIEZA
     // y el nombre extraído no coincide con nada, así que ningún proveedor es compatible.
     $fixture=$makeCommunityWithSupplier($db,'34','CP TREINTAYCUATRO','IBERDROLA','ELECTRICIDAD');
     $invoice=['proveedor'=>'Proveedor de Limpieza Desconocido','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@desconocido.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@desconocido.example');
     $assert($route['status']==='needs_review','sin ningún proveedor compatible con el servicio no debe clasificarse: '.json_encode($route));
     $assert($route['supplier']===null);
 });
@@ -1028,15 +1166,15 @@ $test('panel Revisar: el <select> de comunidad refleja el community_id ya resuel
     $assert(str_contains($html,'Texto detectado<strong>GARCIA-MARIN CONSULTORES, S.L.U.</strong>'),'el texto bruto de OpenAI debe verse por separado, nunca como "el proveedor"');
 });
 
-$test('segunda llamada restringida: si el primer intento ya resuelve, la segunda llamada nunca se invoca',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('segunda llamada restringida: si el primer intento ya resuelve, la segunda llamada nunca se invoca',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'40','CP CUARENTA','IBERDROLA','ELECTRICIDAD');
     $invoice=['proveedor'=>'IBERDROLA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
     $resolver=function()use($assert):?int{$assert(false,'no debe llamarse a la segunda inspección si el primer intento ya resolvió');return null;};
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es','',$resolver);
+    $route=$routeCompat($db)->route($invoice,'facturas@iberdrola.es','',$resolver);
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],json_encode($route));
 });
-$test('segunda llamada restringida: recibe exactamente los proveedores de esa comunidad, y resuelve si acierta',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('segunda llamada restringida: recibe exactamente los proveedores de esa comunidad, y resuelve si acierta',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['41','CP BENICARLO 8',Salvest\Text::normalize('CP BENICARLO 8'),'B41000000','Calle Benicarló','12580','Benicarló','41 - CP BENICARLO 8']);
@@ -1058,34 +1196,35 @@ $test('segunda llamada restringida: recibe exactamente los proveedores de esa co
         $seenCandidates=$candidates;$seenCommunity=$community;
         return $ids[1]; // "Mantenimientos García SL"
     };
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@garciamarin.example','',$resolver);
+    $router=$routeCompat($db);$route=$router->route($invoice,'facturas@garciamarin.example','',$resolver);
+    $supplierCall=array_values(array_filter($router->ai->calls,static fn(array $c):bool=>$c['task']==='elegir_proveedor'))[0]??null;
     $assert($seenCandidates!==null,'la segunda inspección sí debe invocarse cuando el primer intento no resuelve nada');
     $seenIds=array_column($seenCandidates,'id');sort($seenIds);$expectedIds=$ids;sort($expectedIds);
     $assert(count($seenCandidates)===3 && $seenIds===$expectedIds,'debe recibir exactamente los proveedores de esa comunidad, en la lista cerrada: '.json_encode($seenCandidates));
-    $assert($seenCommunity['official_name']==='CP BENICARLO 8','debe recibir la comunidad ya resuelta como contexto');
+    $assert($supplierCall!==null&&str_contains($supplierCall['text'],'Comunidad destinataria ya confirmada: CP BENICARLO 8'),'debe recibir la comunidad ya resuelta como contexto');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$ids[1],'debe clasificar con lo que devolvió la segunda inspección: '.json_encode($route));
-    $assert($route['evidence']['supplier']['type']==='restricted_openai_retry','debe quedar constancia de que fue por la segunda llamada restringida');
+    $assert($route['evidence']['supplier']['source']==='ai_after_retrieval','debe quedar constancia de que lo eligió la IA entre candidatos');
     $assert($route['service']==='EXTINTORES');
 });
-$test('segunda llamada restringida: si devuelve un id fuera de la lista, se rechaza y no se fuerza nada',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('segunda llamada restringida: si devuelve un id fuera de la lista, se rechaza y no se fuerza nada',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'42','CP CUARENTA Y DOS','PROVEEDOR REAL','MANTENIMIENTO');
     $invoice=['proveedor'=>'Nombre irreconocible SL','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
     $resolver=static fn():?int=>999999; // id que no pertenece a los proveedores de esta comunidad
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@desconocido.example','',$resolver);
+    $route=$routeCompat($db)->route($invoice,'facturas@desconocido.example','',$resolver);
     $assert($route['status']==='needs_review','un id fuera de la lista cerrada nunca debe forzar una clasificación: '.json_encode($route));
     $assert($route['supplier']===null);
 });
-$test('segunda llamada restringida: si tampoco resuelve (null), va a revisión sin inventar proveedor',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('segunda llamada restringida: si tampoco resuelve (null), va a revisión sin inventar proveedor',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'43','CP CUARENTA Y TRES','PROVEEDOR REAL','MANTENIMIENTO');
     $invoice=['proveedor'=>'Nombre irreconocible SL','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
     $resolver=static fn():?int=>null;
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@desconocido.example','',$resolver);
+    $route=$routeCompat($db)->route($invoice,'facturas@desconocido.example','',$resolver);
     $assert($route['status']==='needs_review' && $route['supplier']===null,json_encode($route));
     $assert($route['raw_supplier_name']==='Nombre irreconocible SL','el texto bruto debe seguir disponible para el panel de revisión, nunca convertido en proveedor final');
 });
-$test('segunda llamada restringida: con dos candidatos ambiguos en el primer intento, no se llega a invocar la segunda',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Reconstrucción — dos candidatos que el nombre no distingue: la IA desambigua entre ellos (antes iban a revisión sin preguntar); si se abstiene, revisión',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['44','CP CUARENTA Y CUATRO',Salvest\Text::normalize('CP CUARENTA Y CUATRO'),'Z44000000','Calle 44','46044','Valencia','44 - CP CUARENTA Y CUATRO']);
@@ -1097,9 +1236,11 @@ $test('segunda llamada restringida: con dos candidatos ambiguos en el primer int
         $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'MANTENIMIENTO']);
     }
     $invoice=['proveedor'=>'PROVEEDOR ALFA PROVEEDOR BETA','proveedor_cif'=>null,'comunidad_cif'=>'Z44000000','tipo_servicio'=>'desconocido'];
-    $resolver=function()use($assert):?int{$assert(false,'un caso ambiguo debe ir a revisión directamente, sin gastar una segunda llamada a OpenAI');return null;};
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@ambiguo.example','',$resolver);
-    $assert($route['status']==='needs_review');
+    $seen=null;
+    $resolver=function(array $candidates)use(&$seen):?int{$seen=$candidates;return null;};
+    $route=$routeCompat($db)->route($invoice,'facturas@ambiguo.example','',$resolver);
+    $assert(is_array($seen)&&count($seen)===2,'la IA recibe los dos candidatos');
+    $assert($route['status']==='needs_review'&&$route['supplier']===null&&$route['evidence']['supplier']['outcome']==='ai_abstained','si la IA no elige, revisión: '.json_encode($route['evidence']['supplier']['outcome']));
 });
 
 $test('Text::normalizeIdentifier(): H-12815601, H12815601, H 12815601 y h12815601 son el mismo CIF',static function()use($assert):void{
@@ -1108,25 +1249,21 @@ $test('Text::normalizeIdentifier(): H-12815601, H12815601, H 12815601 y h1281560
         $assert(Salvest\Text::normalizeIdentifier($value)===$canonical,"\"$value\" debería normalizar a \"$canonical\", dio \"".Salvest\Text::normalizeIdentifier($value).'"');
     }
 });
-$test('caso real BERNAT GUILLEM DETENÇA 39: el guion del CIF del PDF no debe impedir la coincidencia con el maestro',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('caso real BERNAT GUILLEM DETENÇA 39: el guion del CIF del PDF no debe impedir la coincidencia con el maestro',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
-    // El maestro guarda el CIF tal cual lo dieron de alta, sin guion.
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['39','BERNAT GUILLEM DETENÇA 39',Salvest\Text::normalize('BERNAT GUILLEM DETENÇA 39'),'H12815601','Carrer Bernat Guillem Detença 39','07000','Palma','39 - BERNAT GUILLEM DETENCA 39']);
     $communityId=(int)$db->pdo()->lastInsertId();
-    // El PDF real lo trae con guion.
-    $result=(new Salvest\Classifier($db))->classify(['comunidad_cif'=>'H-12815601']);
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,
-        'un CIF con guion en el PDF debe reconocer al mismo titular que el maestro sin guion: '.json_encode($result));
-    $assert($result['evidence']['field']==='holder_cif' && $result['evidence']['type']==='exact','debe resolverse como coincidencia exacta de CIF titular, no por fuzzy');
+    $result=$resolveCommunity($db,['tax_id'=>'H-12815601'],static fn()=>throw new RuntimeException('un NIF único no llama a la IA'));
+    $assert((int)($result['community']['id']??0)===$communityId && $result['source']==='tax_id_exact' && $result['confidence']===1.0,'un CIF con guion en el PDF debe reconocer al mismo titular: '.json_encode($result['outcome']));
 });
-$test('CIF de proveedor con guion también debe resolver contra el maestro sin guion (global y dentro de comunidad)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('CIF de proveedor con guion también debe resolver contra el maestro sin guion (con y sin comunidad)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'50','CP CINCUENTA','PROTECCION INCENDIOS SL','EXTINTORES','A12815601');
-    $global=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'A-12.815601'],'facturas@otra.example');
-    $assert($global['supplier']!==null && (int)$global['supplier']['id']===$fixture['supplierId'],'resolveSupplier() global también debe ignorar el guion/puntos del CIF: '.json_encode($global));
-    $inCommunity=(new Salvest\Classifier($db))->resolveSupplierInCommunity($fixture['communityId'],['proveedor'=>'','proveedor_cif'=>'A-12.815601'],'facturas@otra.example');
-    $assert($inCommunity['supplier']!==null && (int)$inCommunity['supplier']['id']===$fixture['supplierId'],'resolveSupplierInCommunity() también debe ignorar el guion/puntos del CIF: '.json_encode($inCommunity));
+    $global=$resolveSupplier($db,'','A-12.815601','facturas@otra.example');
+    $assert((int)($global['supplier']['id']??0)===$fixture['supplierId'] && $global['source']==='tax_id_exact','sin comunidad también debe ignorar el guion/puntos del CIF: '.json_encode($global['outcome']));
+    $inCommunity=$resolveSupplier($db,'','A-12.815601','facturas@otra.example',['id'=>$fixture['communityId'],'official_name'=>'CP CINCUENTA']);
+    $assert((int)($inCommunity['supplier']['id']??0)===$fixture['supplierId'] && $inCommunity['linked']===true,'con comunidad también, y sabe que ya está vinculado: '.json_encode($inCommunity['outcome']));
 });
 
 // ---- ReviewTrace: the in-memory, per-attachment technical trace behind /Revisar's "Detalle técnico" ----
@@ -1195,19 +1332,19 @@ $test('ReviewTrace: un dato interno problemático (p.ej. UTF-8 inválido) nunca 
 });
 
 // ---- InvoiceRouter/Classifier: el observador $trace no cambia ninguna decisión ----
-$test('InvoiceRouter::route($trace): la señal community_service_unique_supplier se observa en el trace sin cambiar la decisión',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('Explicabilidad — decision_json guarda los candidatos de proveedor con sus señales y la elección de la IA (sustituye a la traza por niveles del antiguo router)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'82','MENENDEZ YPELAYO 10','CRISLA','LIMPIEZA',null,'H12557229');
     $invoice=['proveedor'=>'Servicios Generales de Mantenimiento Ibérica','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'limpieza'];
-    $signals=[];
-    $trace=function(string $tier,string $outcome,array $details)use(&$signals):void{$signals[]=[$tier,$outcome];};
-    $withTrace=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example','',null,$trace);
-    $withoutTrace=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@crisla.example');
-    $assert($withTrace['status']===$withoutTrace['status'] && $withTrace['status']==='classified','pasar un $trace no debe cambiar la decisión: '.json_encode($withTrace));
-    $assert((int)$withTrace['supplier']['id']===(int)$withoutTrace['supplier']['id']);
-    $assert(in_array(['supplier_community_service','match'],$signals,true),'debe observarse la señal comunidad+servicio actuando: '.json_encode($signals));
+    $result=$pipeline($db,$invoice,'facturas@crisla.example','smart',['id'=>$fixture['supplierId'],'confidence'=>0.84,'reason'=>'logotipo CRISLA en la cabecera']);
+    $supplier=$result['classification']['supplier'];
+    $assert($result['status']==='classified' && $supplier['source']==='ai_after_retrieval' && $supplier['confidence']===0.84,json_encode($supplier));
+    $assert($supplier['ai']['reason']==='logotipo CRISLA en la cabecera','el motivo de la IA queda guardado');
+    $assert($supplier['candidates'][0]['id']===$fixture['supplierId'] && $supplier['candidates'][0]['ya_trabaja_con_la_comunidad']===true,'los candidatos quedan guardados con su relación con la comunidad');
+    $json=json_decode(json_encode($result['classification']),true);
+    $assert(($json['document']['type']??null)==='invoice' && ($json['community']['source']??null)==='tax_id_exact' && ($json['service']['source']??null)==='supplier_main_service','la decisión completa se puede serializar y reconstruir');
 });
-$test('InvoiceRouter::route(): supplier_ambiguous=true cuando hay varios proveedores igualmente plausibles',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('InvoiceRouter::route(): supplier_ambiguous=true cuando hay varios proveedores igualmente plausibles',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',
         ['28','CP VEINTIOCHO',Salvest\Text::normalize('CP VEINTIOCHO'),'Z28000000','Calle 28','46028','Valencia','28 - CP VEINTIOCHO']);
@@ -1219,14 +1356,14 @@ $test('InvoiceRouter::route(): supplier_ambiguous=true cuando hay varios proveed
         $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,contract_reference) VALUES (?,?,?,NULL)',[$communityId,(int)$db->pdo()->lastInsertId(),'MANTENIMIENTO']);
     }
     $invoice=['proveedor'=>'PROVEEDOR ALFA PROVEEDOR BETA','proveedor_cif'=>null,'comunidad_cif'=>'Z28000000','tipo_servicio'=>'desconocido'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@ambiguo.example');
+    $route=$routeCompat($db)->route($invoice,'facturas@ambiguo.example');
     $assert($route['supplier_ambiguous']===true,'el nuevo campo debe reflejar la ambigüedad real: '.json_encode($route));
 });
-$test('InvoiceRouter::route(): supplier_ambiguous=false en un caso normal correctamente clasificado',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('InvoiceRouter::route(): supplier_ambiguous=false en un caso normal correctamente clasificado',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'23','PK ILLES BALEARS 23','IBERDROLA','ELECTRICIDAD');
     $invoice=['proveedor'=>'IBERDROLA CLIENTES, S.A.U.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'agua'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@iberdrola.es');
+    $route=$routeCompat($db)->route($invoice,'facturas@iberdrola.es');
     $assert($route['status']==='classified' && $route['supplier_ambiguous']===false);
 });
 
@@ -1842,11 +1979,12 @@ $test('WebApp::page(): app.css y app.js se sirven con ?v=<mtime real>, para que 
 });
 
 // ---- Fase 2 del maestro de proveedores: estructura nueva, ningún comportamiento nuevo ----
-// Corre contra el MySQL real de desarrollo/tests que ya usa config/config.php
-// (`$dbConfig['name']`, típicamente "salvest_test") — nunca contra producción, que solo se
-// toca por SFTP con scripts de solo-lectura, jamás desde este runner. El usuario configurado
-// ahí normalmente no tiene privilegio CREATE DATABASE, así que se conecta directo a esa base
-// (no se crea ninguna nueva): Schema::migrate() es aditivo e idempotente por diseño, así que
+// Corre contra un MySQL de tests indicado EXPLÍCITAMENTE en la variable de entorno
+// SALVEST_TEST_MYSQL ("host=127.0.0.1;port=3307;dbname=salvest_test;user=root;password=") y
+// cuyo nombre de base contenga "test". Antes leía config/config.php, que en una copia del
+// servidor apunta a PRODUCCIÓN: si esa base hubiera sido alcanzable, estos tests habrían
+// migrado y escrito en ella. Nunca más: sin la variable, los tests se saltan. Se conecta directo
+// a esa base (no se crea ninguna nueva): Schema::migrate() es aditivo e idempotente por diseño, así que
 // dejarlo aplicado ahí entre ejecuciones es seguro y deseable (así se comporta igual que en
 // producción cuando llegue el día). Los tests que insertan filas de prueba (aliases, suppliers)
 // lo hacen dentro de una transacción con rollback en el finally, así que no dejan datos
@@ -1854,12 +1992,22 @@ $test('WebApp::page(): app.css y app.js se sirven con ?v=<mtime real>, para que 
 // tests/run.php, cada test se salta con un aviso explícito en vez de fallar: Schema::migrate()
 // es MySQL-específico (information_schema) y no tiene sentido simularlo contra SQLite, a
 // diferencia del resto de la suite.
-$mysqlSchemaTest=static function()use($assert):?array{
-    $configFile=dirname(__DIR__).'/config/config.php';
-    if(!is_file($configFile))return null;
-    $dbConfig=(require $configFile)['database'];
+/** Configuración de la base MySQL de tests, en el mismo formato que config.php['database'], o null. */
+$testMysqlConfig=static function():?array{
+    $spec=getenv('SALVEST_TEST_MYSQL');
+    if(!is_string($spec)||$spec==='')return null;
+    $raw=[];
+    foreach(explode(';',$spec) as $pair){[$key,$value]=array_pad(explode('=',$pair,2),2,'');$raw[trim($key)]=$value;}
+    if(!str_contains(strtolower($raw['dbname']??''),'test'))throw new RuntimeException('SALVEST_TEST_MYSQL debe apuntar a una base cuyo nombre contenga "test"');
+    return['host'=>$raw['host']??'127.0.0.1','port'=>(int)($raw['port']??3306),'name'=>$raw['dbname'],'user'=>$raw['user']??'root','password'=>$raw['password']??'','charset'=>'utf8mb4'];
+};
+$mysqlSchemaTest=static function()use($assert,$testMysqlConfig):?array{
+    $dbConfig=$testMysqlConfig();
+    if($dbConfig===null)return null;
     try{
-        $pdo=new PDO("mysql:host={$dbConfig['host']};port={$dbConfig['port']};dbname={$dbConfig['name']};charset={$dbConfig['charset']}",$dbConfig['user'],$dbConfig['password'],[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+        // Mismas opciones que Database::__construct(): filas asociativas, errores como excepción.
+        $pdo=new PDO("mysql:host={$dbConfig['host']};port={$dbConfig['port']};dbname={$dbConfig['name']};charset=utf8mb4",$dbConfig['user'],$dbConfig['password'],
+            [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC,PDO::ATTR_EMULATE_PREPARES=>false]);
     }catch(Throwable $error){return null;}
     $reflection=new ReflectionClass(Salvest\Database::class);
     $db=$reflection->newInstanceWithoutConstructor();
@@ -1873,7 +2021,7 @@ $mysqlSchemaCleanup=static function(array $ctx)use($assert):void{
 
 $test('Schema::migrate(): idempotente sobre MySQL real — correr 3 veces no falla ni duplica columnas/índices',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup):void{
     $ctx=$mysqlSchemaTest();
-    if($ctx===null){echo "SKIP (sin MySQL local disponible — ver config/config.php)\n";return;}
+    if($ctx===null){echo "SKIP (sin SALVEST_TEST_MYSQL)\n";return;}
     $db=$ctx['db'];$schemaFile=dirname(__DIR__).'/database/schema.sql';
     try{
         Salvest\Schema::migrate($db,$schemaFile);
@@ -1976,18 +2124,17 @@ $test('supplier_aliases: distintos supplier_id SÍ pueden compartir el mismo nor
         $assert(true,'no debe lanzar — supplier_id distinto, mismo normalized_value es válido');
     }finally{$pdo->rollBack();$mysqlSchemaCleanup($ctx);}
 });
-$test('compatibilidad: crear un supplier con el modelo actual (solo official_name/normalized_name/cif) sigue funcionando con name y normalized_official_name presentes pero NULL',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('compatibilidad: crear un supplier con el modelo actual (solo official_name/normalized_name/cif) sigue funcionando con name y normalized_official_name presentes pero NULL',static function()use($assert,$sqliteDb,$classifierSchema,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
-    // Exactamente el mismo INSERT que WebApp::suppliers() emite hoy — nunca toca name/normalized_official_name.
     $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,1)',
         ['GARCÍA MARÍN CONSULTORES, S.L.',Salvest\Text::normalize('GARCÍA MARÍN CONSULTORES, S.L.'),null,null]);
     $id=(int)$db->pdo()->lastInsertId();
     $row=$db->one('SELECT * FROM suppliers WHERE id=?',[$id]);
     $assert($row!==null && $row['name']===null && $row['normalized_official_name']===null,'las columnas nuevas deben existir en la fila y valer NULL, sin romper el INSERT actual');
-    $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'GARCÍA MARÍN CONSULTORES, S.L.','proveedor_cif'=>''],'facturas@example.com');
-    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id,'la resolución global debe seguir encontrando el proveedor exactamente igual que antes de Fase 2');
+    $resolved=$resolveSupplier($db,'GARCÍA MARÍN CONSULTORES, S.L.',null,'facturas@example.com');
+    $assert((int)($resolved['supplier']['id']??0)===$id && $resolved['source']==='name_exact','la resolución sigue encontrando el proveedor exactamente igual');
 });
-$test('compatibilidad: Classifier::resolveSupplierInCommunity() da el mismo resultado con las columnas nuevas presentes-pero-inactivas',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('compatibilidad: con comunidad, un proveedor vinculado se resuelve igual con las columnas nuevas presentes-pero-inactivas',static function()use($assert,$sqliteDb,$classifierSchema,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Extintores',?,1)",[Salvest\Text::normalize('Extintores')]);
     $serviceId=(int)$db->pdo()->lastInsertId();
@@ -1996,8 +2143,8 @@ $test('compatibilidad: Classifier::resolveSupplierInCommunity() da el mismo resu
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['99','CP Fase 2',Salvest\Text::normalize('CP Fase 2'),null,'Calle Test 1']);
     $communityId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$supplierId,'Extintores']);
-    $found=(new Salvest\Classifier($db))->resolveSupplierInCommunity($communityId,['proveedor'=>'PROFOC','proveedor_cif'=>''],'facturas@example.com');
-    $assert($found['supplier']!==null && (int)$found['supplier']['id']===$supplierId && $found['ambiguous']===false,'debe resolver exactamente igual que antes de Fase 2 — sin ningún tier nuevo todavía');
+    $found=$resolveSupplier($db,'PROFOC',null,'facturas@example.com',['id'=>$communityId,'official_name'=>'CP Fase 2']);
+    $assert((int)($found['supplier']['id']??0)===$supplierId && $found['source']==='name_exact' && $found['linked']===true && $found['relation']['category']==='Extintores',json_encode($found['outcome']));
 });
 
 // ---- Fase 3 del maestro de proveedores: bin/migrate-supplier-master.php, contra MySQL real ----
@@ -2091,10 +2238,16 @@ $supplierMigrationCleanup=static function(array $ctx,array $fixture)use($assert)
         $db->execute('DELETE FROM communities WHERE id=?',[$fixture[$key]]);
     }
 };
-$runMigrationScript=static function(array $extraArgs=[]):array{
+$runMigrationScript=static function(array $extraArgs=[])use($testMysqlConfig):array{
+    // El script carga su configuración con bootstrap.php: se le pasa una configuración temporal
+    // que apunta a la base de tests (SALVEST_CONFIG), nunca config/config.php.
+    $configPath=sys_get_temp_dir().'/salvest-test-config-'.bin2hex(random_bytes(4)).'.php';
+    file_put_contents($configPath,'<?php return '.var_export(['app'=>['timezone'=>'Europe/Madrid'],'database'=>$testMysqlConfig()],true).';');
     $script=dirname(__DIR__).'/bin/migrate-supplier-master.php';
+    $previous=getenv('SALVEST_CONFIG');putenv('SALVEST_CONFIG='.$configPath);
     $cmd=escapeshellarg(PHP_BINARY).' '.escapeshellarg($script).' '.implode(' ',array_map('escapeshellarg',$extraArgs)).' 2>&1';
     exec($cmd,$outputLines,$exitCode);
+    putenv($previous===false?'SALVEST_CONFIG':'SALVEST_CONFIG='.$previous);@unlink($configPath);
     return ['output'=>implode("\n",$outputLines),'exit'=>$exitCode];
 };
 
@@ -2312,109 +2465,109 @@ $sevenCases=[
     ['YOLIMPIO','RAFAEL GUIJARRO PRADES','Limpieza'],
 ];
 
-$test('compatibilidad Fase3->5: los 7 casos pedidos (FACSA/PROFOC/CRISLA/THYSSEN/INMECAS/MB/YOLIMPIO) resuelven en PRE-Fase-3 (official_name=nombre corto, name=NULL)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$sevenCases):void{
+$test('compatibilidad Fase3->5: los 7 casos pedidos (FACSA/PROFOC/CRISLA/THYSSEN/INMECAS/MB/YOLIMPIO) resuelven en PRE-Fase-3 (official_name=nombre corto, name=NULL)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$sevenCases,$routeCompat):void{
     foreach($sevenCases as $i=>[$short,$legal,$service]){
         $db=$sqliteDb($classifierSchema);
         $fixture=$makeCommunityWithSupplier($db,(string)(100+$i),'CP PRE '.$short,$short,$service);
         $invoice=['proveedor'=>$short,'proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
-        $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@proveedor.example');
+        $route=$routeCompat($db)->route($invoice,'facturas@proveedor.example');
         $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],"$short PRE-Fase-3 no resolvió: ".json_encode($route));
-        $assert($route['evidence']['supplier']['type']==='supplier_official_name_exact',"$short PRE-Fase-3 debe resolver por exact_name sobre official_name, no fuzzy: ".json_encode($route['evidence']['supplier']));
+        $assert($route['evidence']['supplier']['source']==='name_exact',"$short PRE-Fase-3 debe resolver por exact_name sobre official_name, no fuzzy: ".json_encode($route['evidence']['supplier']));
     }
 });
-$test('compatibilidad Fase3->5: los mismos 7 casos resuelven EXACTO (no fuzzy) en POST-Fase-3 (name=nombre corto, official_name=razón social)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$sevenCases):void{
+$test('compatibilidad Fase3->5: los mismos 7 casos resuelven EXACTO (no fuzzy) en POST-Fase-3 (name=nombre corto, official_name=razón social)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$sevenCases,$routeCompat):void{
     foreach($sevenCases as $i=>[$short,$legal,$service]){
         $db=$sqliteDb($classifierSchema);
         $fixture=$makePostFase3Supplier($db,(string)(200+$i),'CP POST '.$short,$short,$legal,$service);
         $invoice=['proveedor'=>$short,'proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'];
-        $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route($invoice,'facturas@proveedor.example');
+        $route=$routeCompat($db)->route($invoice,'facturas@proveedor.example');
         $assert($route['status']==='classified' && (int)$route['supplier']['id']===$fixture['supplierId'],"$short POST-Fase-3 no resolvió: ".json_encode($route));
-        $assert($route['evidence']['supplier']['type']==='supplier_name_exact',"$short POST-Fase-3 debe resolver por exact_name sobre name (determinista), no por fuzzy: ".json_encode($route['evidence']['supplier']));
+        $assert($route['evidence']['supplier']['source']==='name_exact',"$short POST-Fase-3 debe resolver por exact_name sobre name (determinista), no por fuzzy: ".json_encode($route['evidence']['supplier']));
     }
 });
-$test('compatibilidad Fase3->5: "FACSA, Suministro de Agua" resuelve por contención tanto PRE como POST-Fase-3 (regresión demostrada en la auditoría, ahora corregida)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: "FACSA, Suministro de Agua" resuelve por contención tanto PRE como POST-Fase-3 (regresión demostrada en la auditoría, ahora corregida)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$makePostFase3Supplier,$routeCompat):void{
     $dbPre=$sqliteDb($classifierSchema);
     $fixturePre=$makeCommunityWithSupplier($dbPre,'301','CP PRE FACSA RUIDO','FACSA','Agua');
-    $routePre=(new Salvest\InvoiceRouter(new Salvest\Classifier($dbPre)))->route(['proveedor'=>'FACSA, Suministro de Agua','proveedor_cif'=>null,'comunidad_cif'=>$fixturePre['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $routePre=$routeCompat($dbPre)->route(['proveedor'=>'FACSA, Suministro de Agua','proveedor_cif'=>null,'comunidad_cif'=>$fixturePre['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
     $assert($routePre['status']==='classified' && (int)$routePre['supplier']['id']===$fixturePre['supplierId'],'PRE-Fase-3 debe seguir resolviendo por contención: '.json_encode($routePre));
-    $assert($routePre['evidence']['supplier']['type']==='name_containment');
+    $assert($routePre['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('containment',$routePre['evidence']['supplier']['candidates'][0]['senales']??[],true));
 
     $dbPost=$sqliteDb($classifierSchema);
     $fixturePost=$makePostFase3Supplier($dbPost,'302','CP POST FACSA RUIDO','FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua');
-    $routePost=(new Salvest\InvoiceRouter(new Salvest\Classifier($dbPost)))->route(['proveedor'=>'FACSA, Suministro de Agua','proveedor_cif'=>null,'comunidad_cif'=>$fixturePost['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $routePost=$routeCompat($dbPost)->route(['proveedor'=>'FACSA, Suministro de Agua','proveedor_cif'=>null,'comunidad_cif'=>$fixturePost['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
     $assert($routePost['status']==='classified' && (int)$routePost['supplier']['id']===$fixturePost['supplierId'],'POST-Fase-3: la regresión demostrada en la auditoría debe quedar corregida: '.json_encode($routePost));
-    $assert($routePost['evidence']['supplier']['type']==='name_containment','debe seguir resolviendo por contención (ahora contra suppliers.name, no official_name): '.json_encode($routePost['evidence']['supplier']));
+    $assert($routePost['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('containment',$routePost['evidence']['supplier']['candidates'][0]['senales']??[],true),'debe seguir resolviendo por contención (ahora contra suppliers.name, no official_name): '.json_encode($routePost['evidence']['supplier']));
 });
-$test('compatibilidad Fase3->5: exact por name (POST-Fase-3, texto = razón social no coincide, solo name)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: exact por name (POST-Fase-3, texto = razón social no coincide, solo name)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makePostFase3Supplier($db,'303','CP EXACT NAME','PROFOC','GARCÍA MARÍN CONSULTORES, S.L.','Extintores');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'PROFOC','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@profoc.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='supplier_name_exact',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'PROFOC','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@profoc.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='name_exact',json_encode($route));
 });
-$test('compatibilidad Fase3->5: exact por official_name (POST-Fase-3, texto = razón social completa)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: exact por official_name (POST-Fase-3, texto = razón social completa)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makePostFase3Supplier($db,'304','CP EXACT OFFICIAL','PROFOC','GARCÍA MARÍN CONSULTORES, S.L.','Extintores');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES, S.L.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@profoc.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='supplier_official_name_exact',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES, S.L.','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@profoc.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='name_exact',json_encode($route));
 });
-$test('compatibilidad Fase3->5: containment por name (texto trae el name dentro de una frase más larga)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: containment por name (texto trae el name dentro de una frase más larga)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makePostFase3Supplier($db,'305','CP CONT NAME','INMECAS','H2O PLUS, S.L.','Descalcificador');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'Factura de INMECAS','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@inmecas.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='name_containment',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'Factura de INMECAS','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@inmecas.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('containment',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),json_encode($route));
 });
-$test('compatibilidad Fase3->5: containment por official_name (texto trae la razón social dentro de una frase más larga)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: containment por official_name (texto trae la razón social dentro de una frase más larga)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makePostFase3Supplier($db,'306','CP CONT OFFICIAL','INMECAS','H2O PLUS, S.L.','Descalcificador');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'Recibo de H2O PLUS, S.L. correspondiente a este mes','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@inmecas.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='name_containment',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'Recibo de H2O PLUS, S.L. correspondiente a este mes','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@inmecas.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('containment',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),json_encode($route));
 });
-$test('compatibilidad Fase3->5: token matching por name (mismas palabras del name, orden distinto)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: token matching por name (mismas palabras del name, orden distinto)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makePostFase3Supplier($db,'307','CP TOKEN NAME','LA BRUJA','LIMPIEZAS Y CRISTALIZADOS LA BRUJA, S.L.','Limpieza');
     // "LA BRUJA" tal cual ya sería exact_name; se fuerza token forzando un orden que ni el exacto
     // ni la contención (que exige orden contiguo) resolverían: "BRUJA LA".
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'BRUJA LA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@labruja.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='token_match',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'BRUJA LA','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@labruja.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('tokens',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),json_encode($route));
 });
-$test('compatibilidad Fase3->5: token matching por official_name (mismas palabras de la razón social, orden distinto)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: token matching por official_name (mismas palabras de la razón social, orden distinto)',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makePostFase3Supplier($db,'308','CP TOKEN OFFICIAL','MB','MANTENIMIENTOS MANUEL BASTIDA S.L.U.','Descalcificador');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'BASTIDA MANUEL MANTENIMIENTOS','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@mb.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='token_match',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'BASTIDA MANUEL MANTENIMIENTOS','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@mb.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('tokens',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),json_encode($route));
 });
-$test('compatibilidad Fase3->5: el tier fuzzy no penaliza a un supplier por tener dos representaciones muy distintas (name corto vs official_name largo) — resuelve por la que de verdad se parece al texto ruidoso',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier):void{
+$test('compatibilidad Fase3->5: el tier fuzzy no penaliza a un supplier por tener dos representaciones muy distintas (name corto vs official_name largo) — resuelve por la que de verdad se parece al texto ruidoso',static function()use($assert,$sqliteDb,$classifierSchema,$makePostFase3Supplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     // name="FACSA" (muy distinto del texto) y official_name con un typo respecto a la extracción
     // (92.24 de similitud, por encima del umbral) — ni containment ni token pueden resolverlo
     // (el texto no contiene "facsa" como palabra ni todas las palabras de ningún candidato), así
     // que solo el fuzzy puede, y debe ganar por official_name sin que el name corto le reste puntos.
     $fixture=$makePostFase3Supplier($db,'309','CP FUZZY NAME','FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','Agua');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'SOCIEDAD DE FOMENTO AGRICOLA CASTELLONENSSE','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='fuzzy',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'SOCIEDAD DE FOMENTO AGRICOLA CASTELLONENSSE','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('similarity',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),json_encode($route));
 });
 $test('compatibilidad Fase3->5: fuzzy contra official_name sigue funcionando cuando no hay name (proveedor global, sin comunidad)',static function()use($assert,$sqliteDb,$classifierSchema):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO suppliers(official_name,normalized_name,cif,active) VALUES (?,?,NULL,1)',['SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.',Salvest\Text::normalize('SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.')]);
     $id=(int)$db->pdo()->lastInsertId();
-    $resolved=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'SOCIEDAD DE FOMENTO AGRICOLA CASTELLONENSSE','proveedor_cif'=>''],'facturas@facsa.example');
-    $assert($resolved['supplier']!==null && (int)$resolved['supplier']['id']===$id && $resolved['evidence']['type']==='fuzzy','fuzzy global contra official_name (sin name) debe seguir funcionando: '.json_encode($resolved));
+    $candidates=(new Salvest\SupplierCandidateRetriever($db))->candidates(['name'=>'SOCIEDAD DE FOMENTO AGRICOLA CASTELLONENSSE','tax_id'=>null],'facturas@facsa.example',null);
+    $assert(count($candidates)===1 && (int)$candidates[0]['supplier']['id']===$id && in_array('similarity',$candidates[0]['signals'],true),'la similitud contra official_name (sin name) sigue proponiendo el candidato: '.json_encode($candidates));
 });
-$test('compatibilidad Fase3->5: name=NULL no rompe ningún tier (estado PRE-Fase-3 puro, los 4 tiers siguen dando el mismo resultado que antes)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('compatibilidad Fase3->5: name=NULL no rompe ningún tier (estado PRE-Fase-3 puro, los 4 tiers siguen dando el mismo resultado que antes)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'310','CP NAME NULL','ASCENSORES DEL SUR','Ascensor');
     $row=$db->one('SELECT name FROM suppliers WHERE id=?',[$fixture['supplierId']]);
     $assert($row['name']===null,'precondición: name debe seguir NULL en este fixture');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'ASCENSORES DEL SUR','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@sur.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='supplier_official_name_exact',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'ASCENSORES DEL SUR','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@sur.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='name_exact',json_encode($route));
 });
-$test('compatibilidad Fase3->5: normalized_official_name=NULL no rompe el tier fuzzy (candidateNames() ignora candidatos vacíos/NULL sin lanzar)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier):void{
+$test('compatibilidad Fase3->5: normalized_official_name=NULL no rompe el tier fuzzy (candidateNames() ignora candidatos vacíos/NULL sin lanzar)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $fixture=$makeCommunityWithSupplier($db,'311','CP NOFF NULL','MANTENIMIENTOS RAPIDOS INTEGRALES DEL LEVANTE','Mantenimiento');
     $row=$db->one('SELECT normalized_official_name FROM suppliers WHERE id=?',[$fixture['supplierId']]);
     $assert($row['normalized_official_name']===null,'precondición: normalized_official_name debe seguir NULL en este fixture');
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'MANTENIMIENTOS RAPIDOS INTEGRALES DEL LEVANTES','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@rapidos.example');
-    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['type']==='fuzzy','no debe lanzar ni fallar por normalized_official_name=NULL: '.json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'MANTENIMIENTOS RAPIDOS INTEGRALES DEL LEVANTES','proveedor_cif'=>null,'comunidad_cif'=>$fixture['communityCif'],'tipo_servicio'=>'desconocido'],'facturas@rapidos.example');
+    $assert((int)$route['supplier']['id']===$fixture['supplierId'] && $route['evidence']['supplier']['source']==='ai_after_retrieval'&&in_array('similarity',$route['evidence']['supplier']['candidates'][0]['senales']??[],true),'no debe lanzar ni fallar por normalized_official_name=NULL: '.json_encode($route));
 });
 
 // ---- Última mini-fase antes de Fase 3: /Proveedores, compatibilidad legacy, importador ----
@@ -2800,8 +2953,8 @@ $test('Fase 14 — Worker: un PDF cifrado recibe exactamente el mismo tratamient
     $assert($validatePos!==false&&$catchEncryptedPos!==false&&$processAttachmentCallPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
     $assert($validatePos<$catchEncryptedPos&&$catchEncryptedPos<$processAttachmentCallPos,'el catch de EncryptedPdfException debe estar entre la validación y processAttachment(), igual que NotPdfException');
 });
-$test('Fase 14 — la carpeta base del correo es "facturgerman", ya no "Facturas" — guarda de regresión sobre Worker.php e InvoiceRouter.php (los 2 sitios reales, no la cadena suelta de un fixture de test)',static function()use($assert):void{
-    foreach(['src/Worker.php','src/InvoiceRouter.php'] as $file){
+$test('Fase 14 — la carpeta base del correo es "facturgerman", ya no "Facturas" — guarda de regresión sobre los sitios reales que mueven correo (Worker.php e ImapMoveRetry.php)',static function()use($assert):void{
+    foreach(['src/Worker.php','src/ImapMoveRetry.php'] as $file){
         $source=file_get_contents(__DIR__.'/../'.$file);
         $assert(!str_contains($source,"'Facturas/"),"$file no debe contener ninguna referencia a la carpeta antigua 'Facturas/'");
         $assert(str_contains($source,"facturgerman/"),"$file debe usar la carpeta nueva 'facturgerman/'");
@@ -2870,7 +3023,7 @@ $insertAlias=static function(Salvest\Database $db,int $supplierId,string $value)
 };
 
 // -- 13. Tests contra el maestro real (datos reproducidos tal como quedaron en producción) --
-$test('Fase 5 — CIF real: FACSA/PROFOC/CRISLA/ADRIAN TURCU/YOLIMPIO/SERGIO RAUL resuelven por supplier_cif exacto',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — CIF real: FACSA/PROFOC/CRISLA/ADRIAN TURCU/YOLIMPIO/SERGIO RAUL resuelven por CIF exacto, confianza 1, sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $real=[
         ['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','A12000022'],
@@ -2881,32 +3034,22 @@ $test('Fase 5 — CIF real: FACSA/PROFOC/CRISLA/ADRIAN TURCU/YOLIMPIO/SERGIO RAU
         ['SERGIO RAUL','SERGIO RAUL MARIN RUIZ','53376935F'],
     ];
     $ids=[];foreach($real as[$name,$official,$cif])$ids[$name]=$insertSupplier($db,$name,$official,$cif);
-    $classifier=new Salvest\Classifier($db);
     foreach($real as[$name,,$cif]){
-        $result=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$cif],'facturas@proveedor.example');
-        $assert($result['supplier']!==null && (int)$result['supplier']['id']===$ids[$name] && $result['evidence']['type']==='exact' && $result['ambiguous']===false,"$name no resolvió por CIF exacto: ".json_encode($result));
+        $result=$resolveSupplier($db,'',$cif,'facturas@proveedor.example',null,static fn()=>throw new RuntimeException('no debe llamarse a la IA'));
+        $assert($result['supplier']!==null && (int)$result['supplier']['id']===$ids[$name] && $result['source']==='tax_id_exact' && $result['confidence']===1.0,"$name no resolvió por CIF exacto: ".json_encode($result['outcome']));
     }
 });
-$test('Fase 5 — CIF: variantes de formato normalizan igual (mayúsculas/guiones/puntos)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — CIF: variantes de formato normalizan igual (mayúsculas/guiones/puntos)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $facsaId=$insertSupplier($db,'FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.','A12000022');
     $yolimpioId=$insertSupplier($db,'YOLIMPIO','RAFAEL GUIJARRO PRADES','18965195Q');
     $adrianId=$insertSupplier($db,'ADRIAN TURCU','ADRIAN TURCU','X4153497L');
-    $classifier=new Salvest\Classifier($db);
-    foreach(['A-12000022','A12000022','a12000022'] as $variant){
-        $r=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$variant],'facturas@x.example');
-        $assert((int)($r['supplier']['id']??0)===$facsaId,"variante $variant debe resolver FACSA: ".json_encode($r));
-    }
-    foreach(['18.965.195-Q','18965195Q'] as $variant){
-        $r=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$variant],'facturas@x.example');
-        $assert((int)($r['supplier']['id']??0)===$yolimpioId,"variante $variant debe resolver YOLIMPIO: ".json_encode($r));
-    }
-    foreach(['X-4153497-L','X4153497L'] as $variant){
-        $r=$classifier->resolveSupplier(['proveedor'=>'','proveedor_cif'=>$variant],'facturas@x.example');
-        $assert((int)($r['supplier']['id']??0)===$adrianId,"variante $variant debe resolver ADRIAN TURCU: ".json_encode($r));
+    foreach([['A-12000022',$facsaId],['A12000022',$facsaId],['a12000022',$facsaId],['18.965.195-Q',$yolimpioId],['18965195Q',$yolimpioId],['X-4153497-L',$adrianId],['X4153497L',$adrianId]] as[$variant,$expected]){
+        $r=$resolveSupplier($db,'',$variant);
+        $assert((int)($r['supplier']['id']??0)===$expected && $r['source']==='tax_id_exact',"variante $variant: ".json_encode($r['outcome']));
     }
 });
-$test('Fase 5 — aliases reales: PRO FOC/ZARDOYA OTIS/TK ELEVADORES/EXTNCAS/LIMPIEZAS ADRIÁN/MANTENIMIENTOS MB/YO LIMPIO resuelven por alias exacto',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias):void{
+$test('Fase 5 — aliases reales: PRO FOC/ZARDOYA OTIS/TK ELEVADORES/EXTNCAS/LIMPIEZAS ADRIÁN/MANTENIMIENTOS MB/YO LIMPIO resuelven por alias exacto, sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $profoc=$insertSupplier($db,'PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',null);$insertAlias($db,$profoc,'PRO FOC');
     $otis=$insertSupplier($db,'OTIS','OTIS MOBILITY, S.A.',null);$insertAlias($db,$otis,'ZARDOYA OTIS');
@@ -2915,124 +3058,112 @@ $test('Fase 5 — aliases reales: PRO FOC/ZARDOYA OTIS/TK ELEVADORES/EXTNCAS/LIM
     $adrian=$insertSupplier($db,'ADRIAN TURCU','ADRIAN TURCU',null);$insertAlias($db,$adrian,'LIMPIEZAS ADRIÁN');
     $mb=$insertSupplier($db,'MB','MANTENIMIENTOS MANUEL BASTIDA S.L.U.',null);$insertAlias($db,$mb,'MANTENIMIENTOS MB');
     $yolimpio=$insertSupplier($db,'YOLIMPIO','RAFAEL GUIJARRO PRADES',null);$insertAlias($db,$yolimpio,'YO LIMPIO');
-    $classifier=new Salvest\Classifier($db);
     foreach([['PRO FOC',$profoc],['ZARDOYA OTIS',$otis],['TK ELEVADORES',$thyssen],['EXTNCAS',$extincas],['LIMPIEZAS ADRIÁN',$adrian],['MANTENIMIENTOS MB',$mb],['YO LIMPIO',$yolimpio]] as[$alias,$expectedId]){
-        $r=$classifier->resolveSupplier(['proveedor'=>$alias,'proveedor_cif'=>''],'facturas@x.example');
-        $assert((int)($r['supplier']['id']??0)===$expectedId && $r['evidence']['type']==='alias' && $r['ambiguous']===false,"\"$alias\" debe resolver por alias exacto: ".json_encode($r));
+        $r=$resolveSupplier($db,$alias,null);
+        $assert((int)($r['supplier']['id']??0)===$expectedId && $r['source']==='alias_exact',"$alias debe resolver por alias exacto: ".json_encode([$r['outcome'],$r['candidates']]));
     }
 });
-$test('Fase 5 — nombres reales: FACSA/GARCÍA MARÍN CONSULTORES S.L./H2O PLUS S.L./TK ELEVADORES ESPAÑA S.L.U. resuelven por name u official_name exacto',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — nombres reales: FACSA/GARCÍA MARÍN CONSULTORES S.L./H2O PLUS S.L./TK ELEVADORES ESPAÑA S.L.U. resuelven por name u official_name exacto, sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $facsa=$insertSupplier($db,'FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.',null);
     $profoc=$insertSupplier($db,'PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',null);
     $inmecas=$insertSupplier($db,'INMECAS','H2O PLUS, S.L.',null);
     $thyssen=$insertSupplier($db,'THYSSEN','TK ELEVADORES ESPAÑA, S.L.U.',null);
-    $classifier=new Salvest\Classifier($db);
-    $r1=$classifier->resolveSupplier(['proveedor'=>'FACSA','proveedor_cif'=>''],'facturas@x.example');
-    $assert((int)($r1['supplier']['id']??0)===$facsa && $r1['evidence']['type']==='supplier_name_exact',json_encode($r1));
-    $r2=$classifier->resolveSupplier(['proveedor'=>'GARCÍA MARÍN CONSULTORES S.L.','proveedor_cif'=>''],'facturas@x.example');
-    $assert((int)($r2['supplier']['id']??0)===$profoc && $r2['evidence']['type']==='supplier_official_name_exact',json_encode($r2));
-    $r3=$classifier->resolveSupplier(['proveedor'=>'H2O PLUS S.L.','proveedor_cif'=>''],'facturas@x.example');
-    $assert((int)($r3['supplier']['id']??0)===$inmecas && $r3['evidence']['type']==='supplier_official_name_exact',json_encode($r3));
-    $r4=$classifier->resolveSupplier(['proveedor'=>'TK ELEVADORES ESPAÑA S.L.U.','proveedor_cif'=>''],'facturas@x.example');
-    $assert((int)($r4['supplier']['id']??0)===$thyssen && $r4['evidence']['type']==='supplier_official_name_exact',json_encode($r4));
+    foreach([['FACSA',$facsa],['GARCÍA MARÍN CONSULTORES S.L.',$profoc],['H2O PLUS S.L.',$inmecas],['TK ELEVADORES ESPAÑA S.L.U.',$thyssen]] as[$text,$expected]){
+        $r=$resolveSupplier($db,$text,null);
+        $assert((int)($r['supplier']['id']??0)===$expected && $r['source']==='name_exact',"$text: ".json_encode($r['outcome']));
+    }
 });
 
 // -- 14. Ambigüedad sintética obligatoria --
-$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo CIF normalizado -> ambiguous, supplier=null (resolveSupplier global)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo CIF normalizado -> nunca se adivina; la IA elige entre exactamente esos dos (caso real INMECAS / H2O PLUS)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
-    $insertSupplier($db,'PROV A','PROVEEDOR A, S.L.','B12345678');
-    $insertSupplier($db,'PROV B','PROVEEDOR B, S.L.','B-12345678'); // mismo CIF normalizado, formato distinto
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'B12345678'],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===true,'un maestro corrupto con CIF duplicado no debe adivinar: '.json_encode($r));
+    $a=$insertSupplier($db,'PROV A','PROVEEDOR A, S.L.','B12345678');
+    $insertSupplier($db,'PROV B','PROVEEDOR B, S.L.','B-12345678');
+    $r=$resolveSupplier($db,'','B12345678');
+    $assert($r['supplier']===null && $r['outcome']==='ai_skipped' && count($r['candidates'])===2,'sin IA, un CIF duplicado no decide: '.json_encode($r['outcome']));
+    $seen=null;
+    $chosen=$resolveSupplier($db,'','B12345678','facturas@x.example',null,function(array $c)use(&$seen,$a){$seen=array_column($c,'id');return['id'=>$a,'confidence'=>0.9,'reason'=>'logo','valid'=>true,'rejected_id'=>null];});
+    sort($seen);
+    $assert(count($seen)===2 && (int)$chosen['supplier']['id']===$a && $chosen['source']==='ai_after_shared_tax_id','la IA recibe solo los dos que comparten CIF: '.json_encode($seen));
 });
-$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo alias normalizado -> ambiguous',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias):void{
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo alias normalizado -> no decide sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $a=$insertSupplier($db,'PROV A','PROVEEDOR A, S.L.',null);$insertAlias($db,$a,'MARCA COMPARTIDA');
     $b=$insertSupplier($db,'PROV B','PROVEEDOR B, S.L.',null);$insertAlias($db,$b,'MARCA COMPARTIDA');
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'MARCA COMPARTIDA','proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===true,json_encode($r));
+    $r=$resolveSupplier($db,'MARCA COMPARTIDA',null);
+    $assert($r['supplier']===null && $r['outcome']==='ai_skipped' && count($r['candidates'])===2,json_encode($r['outcome']));
 });
-$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo name normalizado -> ambiguous, no se intenta desempatar con fuzzy',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo name normalizado -> no decide sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $insertSupplier($db,'DUPLICADO','RAZÓN SOCIAL UNO, S.L.',null);
     $insertSupplier($db,'DUPLICADO','RAZÓN SOCIAL DOS, S.L.',null);
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'DUPLICADO','proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===true,json_encode($r));
+    $r=$resolveSupplier($db,'DUPLICADO',null);
+    $assert($r['supplier']===null && $r['outcome']==='ai_skipped' && count($r['candidates'])===2,json_encode($r['outcome']));
 });
-$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo official_name normalizado -> ambiguous',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — ambigüedad: dos suppliers activos comparten el mismo official_name normalizado -> no decide sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $insertSupplier($db,'NOMBRE UNO','RAZÓN SOCIAL COMPARTIDA, S.L.',null);
     $insertSupplier($db,'NOMBRE DOS','RAZÓN SOCIAL COMPARTIDA, S.L.',null);
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'RAZÓN SOCIAL COMPARTIDA, S.L.','proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===true,json_encode($r));
+    $r=$resolveSupplier($db,'RAZÓN SOCIAL COMPARTIDA, S.L.',null);
+    $assert($r['supplier']===null && $r['outcome']==='ai_skipped' && count($r['candidates'])===2,json_encode($r['outcome']));
 });
-$test('Fase 5 — ambigüedad: dos suppliers empatan en el mejor score fuzzy (>=92) -> ambiguous',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — similitud: dos suppliers igual de parecidos son candidatos los dos; la similitud nunca decide sola',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
-    // Ninguna de las dos razones sociales coincide por exact/containment/token con la consulta —
-    // solo el tier fuzzy puede alcanzarlas, y ambas empatan exactamente en 92.89.
     $insertSupplier($db,'LARA','SOCIEDAD LARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
     $insertSupplier($db,'MARA','SOCIEDAD MARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
-    $query='SOCIEDAD SARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.';
-    $scoreLara=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD LARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
-    $scoreMara=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD MARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
-    $assert($scoreLara===$scoreMara && $scoreLara>=92,"precondición del test: empate exacto por encima del umbral (LARA=$scoreLara MARA=$scoreMara)");
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>$query,'proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===true,'empate exacto en el mejor score fuzzy debe ser ambiguo, nunca elegir el primero: '.json_encode($r).' scores='.$scoreLara.'/'.$scoreMara);
+    $r=$resolveSupplier($db,'SOCIEDAD SARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
+    $assert($r['supplier']===null && $r['outcome']==='ai_skipped' && count($r['candidates'])===2,'empate de similitud: dos candidatos para la IA: '.json_encode($r['candidates']));
 });
-$test('Fase 5 — NO ambigüedad: un candidato con score claramente mayor gana sin ambigüedad',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Reconstrucción — el candidato más parecido va primero en la lista, pero la similitud ya no decide sin IA (antes: fuzzy >= 92 clasificaba solo)',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $winnerId=$insertSupplier($db,'SARAA','SOCIEDAD SARAA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
     $insertSupplier($db,'GAMA','SOCIEDAD GAMA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
-    $query='SOCIEDAD SARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.';
-    $scoreWinner=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD SARAA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
-    $scoreLoser=Salvest\Text::similarity(Salvest\Text::normalizeCompanyName($query),Salvest\Text::normalizeCompanyName('SOCIEDAD GAMA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.'));
-    $assert($scoreWinner>$scoreLoser && $scoreWinner>=92,"precondición del test: scores deben diferir y superar 92 (winner=$scoreWinner loser=$scoreLoser)");
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>$query,'proveedor_cif'=>''],'facturas@x.example');
-    $assert((int)($r['supplier']['id']??0)===$winnerId && $r['ambiguous']===false,'debe ganar el score claramente mayor, sin ambigüedad: '.json_encode($r));
+    $r=$resolveSupplier($db,'SOCIEDAD SARA DISTRIBUCIONES INTEGRALES DEL LEVANTE, S.L.',null);
+    $assert($r['supplier']===null && $r['outcome']==='ai_skipped','sin IA no se decide por similitud: '.json_encode($r['outcome']));
+    $assert(($r['candidates'][0]['id']??null)===$winnerId,'el más parecido encabeza los candidatos: '.json_encode($r['candidates']));
 });
-$test('Fase 5 — ambigüedad: 0 candidatos válidos -> supplier=null, ambiguous=false (no confundir "no encontrado" con "ambiguo")',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — 0 candidatos válidos -> supplier=null, outcome no_candidates (no confundir "no encontrado" con "ambiguo") y sin IA',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $insertSupplier($db,'ALGUIEN','ALGUIEN, S.L.',null);
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'NADIE QUE COINCIDA CON NADA','proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===false,json_encode($r));
+    $r=$resolveSupplier($db,'NADIE QUE COINCIDA CON NADA',null,'facturas@x.example',null,static fn()=>throw new RuntimeException('sin candidatos no se llama a la IA'));
+    $assert($r['supplier']===null && $r['outcome']==='no_candidates',json_encode($r['outcome']));
 });
 
 // -- 15. Suppliers inactivos nunca resuelven (fusiones EXTNCAS/ENERVIA) --
-$test('Fase 5 — inactivos: un supplier active=0 nunca resuelve por CIF, aunque el CIF sea único en la tabla',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — inactivos: un supplier active=0 nunca resuelve por CIF, aunque el CIF sea único en la tabla',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $insertSupplier($db,'FANTASMA','FANTASMA, S.L.','B99999999',0);
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'','proveedor_cif'=>'B99999999'],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===false,'un supplier inactivo no debe resolver nunca, ni siquiera de forma no-ambigua: '.json_encode($r));
+    $r=$resolveSupplier($db,'','B99999999');
+    $assert($r['supplier']===null && $r['outcome']==='no_candidates','un supplier inactivo no debe resolver nunca: '.json_encode($r['outcome']));
 });
-$test('Fase 5 — inactivos: alias EXTNCAS resuelve al target activo EXTINCAS, nunca al id inactivo, ni siquiera si el inactivo tuviera un alias residual con el mismo valor',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias):void{
+$test('Fase 5 — inactivos: alias EXTNCAS resuelve al target activo EXTINCAS, nunca al id inactivo, ni siquiera si el inactivo tuviera un alias residual con el mismo valor',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$insertAlias,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $extincasActivo=$insertSupplier($db,'EXTINCAS','EXTINTORES CASTELLÓN, S.L.','B12433314',1);
     $insertAlias($db,$extincasActivo,'EXTNCAS');
-    $extncasInactivo=$insertSupplier($db,'EXTNCAS','EXTNCAS',null,0); // simula el source ya fusionado, active=0
-    $insertAlias($db,$extncasInactivo,'ALIAS RESIDUAL'); // alias residual que no debería ni poder colisionar
-    $classifier=new Salvest\Classifier($db);
-    $r=$classifier->resolveSupplier(['proveedor'=>'EXTNCAS','proveedor_cif'=>''],'facturas@x.example');
-    $assert((int)($r['supplier']['id']??0)===$extincasActivo && $r['ambiguous']===false,'debe resolver al target activo por alias, nunca al inactivo: '.json_encode($r));
+    $extncasInactivo=$insertSupplier($db,'EXTNCAS','EXTNCAS',null,0);
+    $insertAlias($db,$extncasInactivo,'ALIAS RESIDUAL');
+    $r=$resolveSupplier($db,'EXTNCAS',null);
+    $assert((int)($r['supplier']['id']??0)===$extincasActivo && $r['source']==='alias_exact','debe resolver al target activo por alias, nunca al inactivo: '.json_encode($r['outcome']));
 });
-$test('Fase 5 — inactivos: name/official_name de un supplier active=0 nunca resuelve',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — inactivos: name/official_name de un supplier active=0 nunca resuelve',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
-    $insertSupplier($db,'ENERVIA','ENERVIA',null,0); // simula el id 48 antiguo ya fusionado
-    $r=(new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'ENERVIA','proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null,'un supplier inactivo nunca debe resolver por name/official_name: '.json_encode($r));
+    $insertSupplier($db,'ENERVIA','ENERVIA',null,0);
+    $r=$resolveSupplier($db,'ENERVIA',null);
+    $assert($r['supplier']===null && $r['candidates']===[],'un supplier inactivo nunca debe resolver ni ser candidato: '.json_encode($r['candidates']));
 });
-$test('Fase 5 — inactivos: resolveSupplierInCommunity() tampoco ofrece un supplier active=0 como candidato de esa comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — inactivos: un supplier active=0 vinculado a la comunidad tampoco se ofrece como candidato',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES ('F5','CP Fase 5','cp fase 5','x',1)");
     $communityId=(int)$db->pdo()->lastInsertId();
     $inactiveId=$insertSupplier($db,'EXTNCAS','EXTNCAS',null,0);
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$inactiveId,'Extintores']);
-    $r=(new Salvest\Classifier($db))->resolveSupplierInCommunity($communityId,['proveedor'=>'EXTNCAS','proveedor_cif'=>''],'facturas@x.example');
-    $assert($r['supplier']===null && $r['ambiguous']===false,'un supplier inactivo enlazado a la comunidad no debe ofrecerse como candidato: '.json_encode($r));
+    $r=$resolveSupplier($db,'EXTNCAS',null,'facturas@x.example',['id'=>$communityId,'official_name'=>'CP Fase 5']);
+    $assert($r['supplier']===null && $r['candidates']===[],'un supplier inactivo enlazado a la comunidad no debe ofrecerse como candidato: '.json_encode($r['candidates']));
 });
 
 // -- 16. Segunda llamada restringida: candidatos ya excluyen inactivos --
-$test('Fase 5 — suppliersForCommunity() (candidatos de la segunda llamada restringida) ya excluye suppliers inactivos — comportamiento preexistente, confirmado con test',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — los candidatos vinculados a la comunidad que ve la IA excluyen suppliers inactivos',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES ('F5B','CP Fase 5 B','cp fase 5 b','x',1)");
     $communityId=(int)$db->pdo()->lastInsertId();
@@ -3040,26 +3171,22 @@ $test('Fase 5 — suppliersForCommunity() (candidatos de la segunda llamada rest
     $inactiveId=$insertSupplier($db,'INACTIVO','INACTIVO, S.L.',null,0);
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$activeId,'Limpieza']);
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$inactiveId,'Limpieza']);
-    $candidates=(new Salvest\Classifier($db))->suppliersForCommunity($communityId);
-    $ids=array_column($candidates,'id');
-    $assert(in_array($activeId,$ids,true) && !in_array($inactiveId,$ids,true),'los candidatos de la llamada restringida no deben incluir suppliers inactivos: '.json_encode($candidates));
+    $ids=array_map(static fn(array $c):int=>(int)$c['supplier']['id'],(new Salvest\SupplierCandidateRetriever($db))->candidates(['name'=>'OTRO','tax_id'=>null],'facturas@x.example',$communityId));
+    $assert(in_array($activeId,$ids,true) && !in_array($inactiveId,$ids,true),'los candidatos no deben incluir suppliers inactivos: '.json_encode($ids));
 });
 
 // -- Trace: comportamiento ambiguo debe quedar explicable en la traza --
-$test('Fase 5 — trace: cuando resolveSupplier() global es ambiguo, la traza registra el tier y el resultado ambiguous, sin infraestructura nueva',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier):void{
+$test('Fase 5 — explicabilidad: cuando dos suppliers coinciden exactamente, los candidatos guardados dicen qué señal tuvo cada uno',static function()use($assert,$sqliteDb,$classifierSchema,$insertSupplier,$resolveSupplier):void{
     $db=$sqliteDb($classifierSchema);
     $insertSupplier($db,'DOBLE','RAZÓN UNO, S.L.',null);
     $insertSupplier($db,'DOBLE','RAZÓN DOS, S.L.',null);
-    $trace=[];
-    (new Salvest\Classifier($db))->resolveSupplier(['proveedor'=>'DOBLE','proveedor_cif'=>''],'facturas@x.example',
-        function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
-    $ambiguousStep=null;foreach($trace as $step)if($step[0]==='supplier_exact_name'&&$step[1]==='ambiguous')$ambiguousStep=$step;
-    $assert($ambiguousStep!==null,'la traza debe mostrar explícitamente qué tier detectó la ambigüedad: '.json_encode($trace));
+    $r=$resolveSupplier($db,'DOBLE',null);
+    $assert(count($r['candidates'])===2 && in_array('exact_name',$r['candidates'][0]['senales'],true) && in_array('exact_name',$r['candidates'][1]['senales'],true),'cada candidato lleva su señal: '.json_encode($r['candidates']));
 });
 
 // ---- Fase 6: InvoiceRouter acepta el fallback global cuando la comunidad es real pero el
 // proveedor todavía no está en community_suppliers, sin crear ninguna relación nueva ----
-$test('Fase 6 — FACSA: comunidad conocida, FACSA no está en community_suppliers, resuelve globalmente por CIF, clasifica, 0 relaciones nuevas',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — FACSA: comunidad conocida, FACSA no está en community_suppliers, resuelve globalmente por CIF, clasifica, 0 relaciones nuevas',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6A','CP FACSA','cp facsa','H11111111','x',1)");
     $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Agua','agua',1)");
@@ -3067,23 +3194,23 @@ $test('Fase 6 — FACSA: comunidad conocida, FACSA no está en community_supplie
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
         ['FACSA','SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.',Salvest\Text::normalizeCompanyName('FACSA'),Salvest\Text::normalizeCompanyName('SOCIEDAD DE FOMENTO AGRÍCOLA CASTELLONENSE, S.A.U.'),'A12000022',$serviceId]);
     $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'FACSA','proveedor_cif'=>'A12000022','comunidad_cif'=>'H11111111','tipo_servicio'=>'desconocido'],'facturas@facsa.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'FACSA','proveedor_cif'=>'A12000022','comunidad_cif'=>'H11111111','tipo_servicio'=>'desconocido'],'facturas@facsa.example');
     $assert($route['status']==='classified' && $route['supplier']['cif']==='A12000022' && $route['service']==='Agua',json_encode($route));
-    $assert($route['evidence']['supplier']['source']==='global');
+    $assert($route['result']['classification']['supplier']['linked']===false);
     $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $assert($before===0 && $after===0,'0 relaciones nuevas: antes='.$before.' después='.$after);
 });
-$test('Fase 6 — PROFOC: proveedor extraído como la razón social completa, resuelve globalmente por official_name exacto',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — PROFOC: proveedor extraído como la razón social completa, resuelve globalmente por official_name exacto',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6B','CP PROFOC','cp profoc','H22222222','x',1)");
     $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Extintores','extintores',1)");
     $serviceId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',
         ['PROFOC','GARCÍA MARÍN CONSULTORES, S.L.',Salvest\Text::normalizeCompanyName('PROFOC'),Salvest\Text::normalizeCompanyName('GARCÍA MARÍN CONSULTORES, S.L.'),'B12802971',$serviceId]);
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES S.L.','proveedor_cif'=>'B12802971','comunidad_cif'=>'H22222222','tipo_servicio'=>'desconocido'],'facturas@profoc.example');
-    $assert($route['status']==='classified' && $route['supplier']['name']==='PROFOC' && $route['evidence']['supplier']['source']==='global',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES S.L.','proveedor_cif'=>'B12802971','comunidad_cif'=>'H22222222','tipo_servicio'=>'desconocido'],'facturas@profoc.example');
+    $assert($route['status']==='classified' && $route['supplier']['name']==='PROFOC' && $route['result']['classification']['supplier']['linked']===false,json_encode($route));
 });
-$test('Fase 6 — EXTNCAS: alias global resuelve al target activo EXTINCAS, nunca al source inactivo, y clasifica',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — EXTNCAS: alias global resuelve al target activo EXTINCAS, nunca al source inactivo, y clasifica',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6C','CP EXTINCAS','cp extincas','H33333333','x',1)");
     $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Extintores','extintores',1)");
@@ -3094,21 +3221,21 @@ $test('Fase 6 — EXTNCAS: alias global resuelve al target activo EXTINCAS, nunc
     $activeId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$activeId,'name','EXTNCAS',Salvest\Text::normalizeCompanyName('EXTNCAS')]);
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,0)',['EXTNCAS','EXTNCAS',Salvest\Text::normalizeCompanyName('EXTNCAS'),null]); // source fusionado
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'EXTNCAS','proveedor_cif'=>'','comunidad_cif'=>'H33333333','tipo_servicio'=>'desconocido'],'facturas@extincas.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'EXTNCAS','proveedor_cif'=>'','comunidad_cif'=>'H33333333','tipo_servicio'=>'desconocido'],'facturas@extincas.example');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$activeId,'debe resolver al target activo, nunca al inactivo: '.json_encode($route));
 });
-$test('Fase 6 — ADRIAN TURCU: resuelve globalmente por CIF real (NIE X4153497L)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — ADRIAN TURCU: resuelve globalmente por CIF real (NIE X4153497L)',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6D','CP ADRIAN','cp adrian','H44444444','x',1)");
     $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Limpieza','limpieza',1)");
     $serviceId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,1)',
         ['ADRIAN TURCU','ADRIAN TURCU',Salvest\Text::normalizeCompanyName('ADRIAN TURCU'),'X4153497L',$serviceId]);
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'X-4153497-L','comunidad_cif'=>'H44444444','tipo_servicio'=>'desconocido'],'facturas@adrian.example');
-    $assert($route['status']==='classified' && $route['supplier']['name']==='ADRIAN TURCU' && $route['evidence']['supplier']['type']==='exact',json_encode($route));
+    $route=$routeCompat($db)->route(['proveedor'=>'','proveedor_cif'=>'X-4153497-L','comunidad_cif'=>'H44444444','tipo_servicio'=>'desconocido'],'facturas@adrian.example');
+    $assert($route['status']==='classified' && $route['supplier']['name']==='ADRIAN TURCU' && $route['evidence']['supplier']['source']==='tax_id_exact',json_encode($route));
 });
 
-$test('Fase 6 — prioridad: si resolveSupplierInCommunity() ya resolvió, el fallback global ni se necesita (un duplicado global ambiguo no afecta al resultado)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — prioridad: si resolveSupplierInCommunity() ya resolvió, el fallback global ni se necesita (un duplicado global ambiguo no afecta al resultado)',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6E','CP PRIORIDAD','cp prioridad','H55555555','x',1)");
     $db->execute("INSERT INTO service_types(name,normalized_name,active) VALUES ('Limpieza','limpieza',1)");
@@ -3121,68 +3248,67 @@ $test('Fase 6 — prioridad: si resolveSupplierInCommunity() ya resolvió, el fa
     $inCommunityId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$inCommunityId,'Limpieza']);
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,main_service_type_id,active) VALUES (?,?,?,?,1)',['DUPLICADO','DUPLICADO EN OTRO SITIO, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO'),$serviceId]);
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'DUPLICADO','proveedor_cif'=>'','comunidad_cif'=>'H55555555','tipo_servicio'=>'desconocido'],'facturas@dup.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'DUPLICADO','proveedor_cif'=>'','comunidad_cif'=>'H55555555','tipo_servicio'=>'desconocido'],'facturas@dup.example');
     $assert($route['status']==='classified' && (int)$route['supplier']['id']===$inCommunityId,'debe ganar el resultado de resolveSupplierInCommunity(), sin llegar nunca al fallback global: '.json_encode($route));
-    $assert(!isset($route['evidence']['supplier']['source']),'la evidencia no debe llevar source=global cuando resolvió en comunidad: '.json_encode($route['evidence']['supplier']));
+    $assert($route['evidence']['supplier']['source']==='name_exact' && $route['result']['classification']['supplier']['linked']===true && $route['ai_tasks']===['comprender_documento'],'el vínculo con la comunidad desempata dos nombres exactos sin IA: '.json_encode($route['evidence']['supplier']['source']));
 });
 
-$test('Fase 6 — ambigüedad global: comunidad conocida, sin match en comunidad, global ambiguo -> needs_review, 0 relaciones, traza explica el tier',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — ambigüedad global: comunidad conocida, sin match en comunidad, global ambiguo -> needs_review, 0 relaciones, traza explica el tier',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6F','CP AMBIGUO','cp ambiguo','H66666666','x',1)");
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['DUPLICADO GLOBAL','RAZÓN UNO, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO GLOBAL')]);
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['DUPLICADO GLOBAL','RAZÓN DOS, S.L.',Salvest\Text::normalizeCompanyName('DUPLICADO GLOBAL')]);
     $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $trace=[];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'DUPLICADO GLOBAL','proveedor_cif'=>'','comunidad_cif'=>'H66666666','tipo_servicio'=>'desconocido'],'facturas@dup.example',
+    $route=$routeCompat($db)->route(['proveedor'=>'DUPLICADO GLOBAL','proveedor_cif'=>'','comunidad_cif'=>'H66666666','tipo_servicio'=>'desconocido'],'facturas@dup.example',
         '',null,function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
     $assert($route['status']==='needs_review' && $route['supplier']===null && $route['supplier_ambiguous']===true,json_encode($route));
     $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $assert($before===$after && $after===0,'ambigüedad global no debe crear ninguna relación');
-    $globalFallbackStep=null;foreach($trace as $step)if($step[0]==='supplier_global_fallback'&&$step[1]==='ambiguous')$globalFallbackStep=$step;
-    $assert($globalFallbackStep!==null,'la traza debe mostrar el tier real (anidado) que detectó la ambigüedad global: '.json_encode($trace));
-    $assert($globalFallbackStep[2]['tier']==='supplier_exact_name','el detalle debe indicar qué tier concreto fue ambiguo dentro del fallback global: '.json_encode($globalFallbackStep));
+    $candidates=$route['evidence']['supplier']['candidates'];
+    $assert(count($candidates)===2 && in_array('exact_name',$candidates[0]['senales'],true) && in_array('exact_name',$candidates[1]['senales'],true),'la explicación guarda los dos candidatos y la señal que tuvo cada uno: '.json_encode($candidates));
 });
 
-$test('Fase 6 — global unresolved: proveedor completamente desconocido -> needs_review, sin crear supplier ni relación',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — global unresolved: proveedor completamente desconocido -> needs_review, sin crear supplier ni relación',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6G','CP DESCONOCIDO','cp desconocido','H77777777','x',1)");
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,active) VALUES (?,?,?,1)',['OTRO','OTRO PROVEEDOR, S.L.',Salvest\Text::normalizeCompanyName('OTRO')]);
     $suppliersBefore=(int)$db->one('SELECT COUNT(*) n FROM suppliers')['n'];
     $relationsBefore=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'PROVEEDOR TOTALMENTE DESCONOCIDO XYZ','proveedor_cif'=>'','comunidad_cif'=>'H77777777','tipo_servicio'=>'desconocido'],'facturas@x.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'PROVEEDOR TOTALMENTE DESCONOCIDO XYZ','proveedor_cif'=>'','comunidad_cif'=>'H77777777','tipo_servicio'=>'desconocido'],'facturas@x.example');
     $assert($route['status']==='needs_review' && $route['supplier']===null,json_encode($route));
     $assert((int)$db->one('SELECT COUNT(*) n FROM suppliers')['n']===$suppliersBefore,'resolveSupplier() nunca debe crear un supplier, ni siquiera con un CIF/nombre claro');
     $assert((int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n']===$relationsBefore,'tampoco debe crear ninguna relación');
 });
 
-$test('Fase 6 — Caso A: supplier global sin main_service_type_id pero CON hint de OpenAI -> sigue clasificando con ese hint',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — Caso A: supplier global sin main_service_type_id pero CON hint de OpenAI -> sigue clasificando con ese hint',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6H','CP SIN SERVICIO','cp sin servicio','H88888888','x',1)");
     // Supplier sin main_service_type_id (NULL) — caso sintético, hoy los 39 activos reales SÍ lo tienen.
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,NULL,1)',
         ['SIN SERVICIO','SIN SERVICIO CONFIGURADO, S.L.',Salvest\Text::normalizeCompanyName('SIN SERVICIO'),'B00000000']);
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B00000000','comunidad_cif'=>'H88888888','tipo_servicio'=>'jardineria'],'facturas@x.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'','proveedor_cif'=>'B00000000','comunidad_cif'=>'H88888888','tipo_servicio'=>'jardineria'],'facturas@x.example');
     // Comportamiento actual documentado (sin cambios en esta fase): sin main_service_type_id y
     // sin relation, resolveService() cae al hint de OpenAI si existe — la factura SIGUE
     // clasificando, con el servicio que OpenAI propuso, nunca "Otros" inventado.
     $assert($route['status']==='classified','documentando el comportamiento actual: sigue clasificando aunque no haya servicio configurado — ver riesgos en el informe');
-    $assert($route['service']==='jardineria' && $route['evidence']['service']['type']==='openai_suggestion','sin main_service_type_id ni relation, debe reutilizar el hint de OpenAI ya aprobado, nunca inventar una categoría');
+    $assert($route['service']==='jardineria' && $route['service_folder']==='JARDINERIA' && $route['evidence']['service']['source']==='ai_semantic_category','sin main_service_type_id ni relation, se usa la categoría de la IA, traducida a una carpeta canónica: '.json_encode([$route['service'],$route['evidence']['service']]));
 });
-$test('Fase 6 — Caso B: supplier global sin main_service_type_id NI hint de OpenAI -> needs_review, supplier sigue siendo el global resuelto, 0 relaciones nuevas, reason explica la falta de servicio',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — Caso B: supplier global sin main_service_type_id NI hint de OpenAI -> needs_review, supplier sigue siendo el global resuelto, 0 relaciones nuevas, reason explica la falta de servicio',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6I','CP SIN SERVICIO NI HINT','cp sin servicio ni hint','H99999998','x',1)");
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,NULL,1)',
         ['SIN NADA','SIN NADA CONFIGURADO, S.L.',Salvest\Text::normalizeCompanyName('SIN NADA'),'B00000001']);
     $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B00000001','comunidad_cif'=>'H99999998','tipo_servicio'=>''],'facturas@x.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'','proveedor_cif'=>'B00000001','comunidad_cif'=>'H99999998','tipo_servicio'=>''],'facturas@x.example');
     $assert($route['status']==='needs_review','sin servicio seguro, el fallback global NO debe clasificar automáticamente: '.json_encode($route));
     $assert($route['supplier']!==null && $route['supplier']['cif']==='B00000001','el supplier debe seguir reconocido — solo el servicio bloquea, no la identidad del proveedor');
-    $assert($route['evidence']['supplier']['source']==='global','la evidencia del supplier debe seguir mostrando que vino del fallback global');
-    $assert($route['reason']==='Proveedor reconocido globalmente, pero no se pudo determinar un servicio seguro.','el motivo debe explicar exactamente qué falta');
+    $assert($route['result']['classification']['supplier']['linked']===false,'la evidencia del supplier debe seguir mostrando que vino del fallback global');
+    $assert($route['result']['reason_code']==='service_unknown' && str_contains((string)$route['reason'],'servicio'),'el motivo debe explicar exactamente qué falta: '.$route['reason']);
     $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $assert($before===0 && $after===0,'needs_review por falta de servicio no debe crear ninguna relación');
 });
-$test('Fase 6 — Caso C: el comportamiento legacy de resolveService() con supplier resuelto EN COMUNIDAD (no por fallback global) no cambia — sigue clasificando con service="desconocido" si así lo determinaba antes',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Reconstrucción — proveedor de la comunidad sin servicio principal, sin categoría y sin pista de la IA: va a revisión (antes se archivaba como "desconocido" en MANTENIMIENTO sin avisar)',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6L','CP LEGACY','cp legacy','H13131313','x',1)");
     $communityId=(int)$db->one("SELECT id FROM communities WHERE external_code='F6L'")['id'];
@@ -3190,20 +3316,20 @@ $test('Fase 6 — Caso C: el comportamiento legacy de resolveService() con suppl
     $supplierId=(int)$db->pdo()->lastInsertId();
     // category vacía a propósito: ni main_service_type_id ni relation.category dan un servicio.
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category) VALUES (?,?,?)',[$communityId,$supplierId,'']);
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'LEGACY','proveedor_cif'=>'','comunidad_cif'=>'H13131313','tipo_servicio'=>''],'facturas@legacy.example');
+    $route=$routeCompat($db)->route(['proveedor'=>'LEGACY','proveedor_cif'=>'','comunidad_cif'=>'H13131313','tipo_servicio'=>''],'facturas@legacy.example');
     // Este guard es EXCLUSIVO del fallback global (rama "source=global") — un supplier resuelto
     // dentro de la comunidad nunca pasa por él, así que el comportamiento clásico de siempre
     // (clasificar con "desconocido" si no hay ninguna otra señal) permanece intacto.
-    $assert($route['status']==='classified' && $route['service']==='desconocido','el guard de Fase 6 es específico del fallback global; el camino clásico de comunidad no debe verse afectado: '.json_encode($route));
-    $assert(!isset($route['evidence']['supplier']['source']),'un supplier resuelto en comunidad nunca lleva source=global');
+    $assert($route['status']==='needs_review' && $route['result']['reason_code']==='service_unknown' && $route['service_folder']===null,'sin ningún servicio válido no se archiva por descarte: '.json_encode([$route['status'],$route['result']['reason_code']]));
+    $assert($route['evidence']['supplier']['source']==='name_exact' && $route['result']['classification']['supplier']['linked']===true,'el proveedor sí se reconoce: solo el servicio bloquea');
 });
 
-$test('Fase 6 — 0 escrituras en community_suppliers: recuento idéntico antes/después en varios escenarios de fallback global consecutivos',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6 — 0 escrituras en community_suppliers: recuento idéntico antes/después en varios escenarios de fallback global consecutivos',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6J','CP MULTI','cp multi','H10101010','x',1)");
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['MULTI A','MULTI A, S.L.',Salvest\Text::normalizeCompanyName('MULTI A'),'B10101011']);
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['MULTI B','MULTI B, S.L.',Salvest\Text::normalizeCompanyName('MULTI B'),'B10101012']);
-    $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db));
+    $router=$routeCompat($db);
     $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
     $router->route(['proveedor'=>'','proveedor_cif'=>'B10101011','comunidad_cif'=>'H10101010','tipo_servicio'=>''],'facturas@x.example');
     $router->route(['proveedor'=>'','proveedor_cif'=>'B10101012','comunidad_cif'=>'H10101010','tipo_servicio'=>''],'facturas@x.example');
@@ -3212,13 +3338,13 @@ $test('Fase 6 — 0 escrituras en community_suppliers: recuento idéntico antes/
     $assert($before===0 && $after===0,'ningún escenario de fallback global (resuelto, resuelto, no resuelto) debe escribir community_suppliers: antes='.$before.' después='.$after);
 });
 
-$test('Fase 6/7 — decision_json: la evidencia del supplier lleva source=global y auto_link explícito (false, sin autoLinker conectado) cuando vino del fallback, ausentes cuando vino de la comunidad',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 6/7 — decision_json: la evidencia del supplier lleva source=global y auto_link explícito (false, sin autoLinker conectado) cuando vino del fallback, ausentes cuando vino de la comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$routeCompat):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute("INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES ('F6K','CP DECISION','cp decision','H12121212','x',1)");
     $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,active) VALUES (?,?,?,?,1)',['GLOBAL','GLOBAL SUPPLIER, S.L.',Salvest\Text::normalizeCompanyName('GLOBAL'),'B12121213']);
-    $route=(new Salvest\InvoiceRouter(new Salvest\Classifier($db)))->route(['proveedor'=>'','proveedor_cif'=>'B12121213','comunidad_cif'=>'H12121212','tipo_servicio'=>''],'facturas@x.example');
-    $assert($route['evidence']['supplier']['source']==='global');
-    $assert(isset($route['evidence']['supplier']['auto_link']) && $route['evidence']['supplier']['auto_link']===false,'auto_link debe quedar explícito (false) cuando el source es global, nunca ausente: '.json_encode($route['evidence']['supplier']));
+    $route=$routeCompat($db)->route(['proveedor'=>'','proveedor_cif'=>'B12121213','comunidad_cif'=>'H12121212','tipo_servicio'=>''],'facturas@x.example');
+    $assert($route['result']['classification']['supplier']['linked']===false);
+    $assert(($route['autolink']['attempted']??null)===false && is_string($route['autolink']['reason']??null),'el autolink queda explícito en la decisión, con su motivo, también cuando no se intenta: '.json_encode($route['autolink']));
 });
 
 // ---- Fase 7: autolink de community_suppliers — contra MySQL real (INSERT ... ON DUPLICATE KEY
@@ -3237,12 +3363,15 @@ $f7Cleanup=static function(Salvest\Database $db,array $communityIds,array $suppl
     foreach($supplierIds as $id)$db->execute('DELETE FROM suppliers WHERE id=?',[$id]); // cascada: aliases + community_suppliers
     foreach($communityIds as $id)$db->execute('DELETE FROM communities WHERE id=?',[$id]);
 };
+// El servicio maestro tiene que ser uno del catálogo (ServiceCatalog): un nombre inventado no tiene
+// carpeta y la política lo manda a revisión. Se reutiliza el service_type canónico si ya existe.
 $f7Service=static function(Salvest\Database $db,string $name):int{
-    $db->execute('INSERT IGNORE INTO service_types(name,normalized_name) VALUES (?,?)',[$name.' Fase7',Salvest\Text::normalize($name.' Fase7')]);
-    return (int)$db->one('SELECT id FROM service_types WHERE normalized_name=?',[Salvest\Text::normalize($name.' Fase7')])['id'];
+    $canonical=['Agua'=>'Agua','Extintores'=>'Extintores','Extintores2'=>'Extintores','Limpieza2'=>'Limpieza'][$name]??'Mantenimiento';
+    $db->execute('INSERT IGNORE INTO service_types(name,normalized_name) VALUES (?,?)',[$canonical,Salvest\Text::normalize($canonical)]);
+    return (int)$db->one('SELECT id FROM service_types WHERE normalized_name=?',[Salvest\Text::normalize($canonical)])['id'];
 };
 
-$test('Fase 7 — FACSA: fallback global + autolink -> INSERT community_suppliers(category=Agua), auto_link=true; segunda ejecución NO duplica',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — FACSA: fallback global + autolink -> INSERT community_suppliers(category=Agua), auto_link=true; segunda ejecución NO duplica',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3251,21 +3380,21 @@ $test('Fase 7 — FACSA: fallback global + autolink -> INSERT community_supplier
     $communityId=$f7InsertCommunity($db,'F7FACSA','H70000001');
     $supplierId=$f7InsertSupplier($db,'FACSA TEST F7','SOCIEDAD FACSA TEST F7, S.A.U.',$serviceId,'A70000001');
     try{
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'FACSA TEST F7','proveedor_cif'=>'A70000001','comunidad_cif'=>'H70000001','tipo_servicio'=>''],'facturas@facsa.example');
-        $assert($route['status']==='classified' && $route['evidence']['supplier']['source']==='global' && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $assert($route['status']==='classified' && $route['result']['classification']['supplier']['linked']===false && ($route['autolink']['inserted']??null)===true,json_encode($route));
         $rows=$db->all('SELECT * FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
-        $assert(count($rows)===1 && $rows[0]['category']==='AGUA FASE7' && $rows[0]['contract_reference']===null && $rows[0]['source_column']==='auto_global_resolution' && $rows[0]['raw_provider_name']==='FACSA TEST F7',json_encode($rows));
+        $assert(count($rows)===1 && $rows[0]['category']==='AGUA' && $rows[0]['contract_reference']===null && $rows[0]['source_column']==='auto_global_resolution' && $rows[0]['raw_provider_name']==='FACSA TEST F7',json_encode($rows));
         // Segunda ejecución de la misma factura/ruta: 0 relaciones nuevas.
         $route2=$router->route(['proveedor'=>'FACSA TEST F7','proveedor_cif'=>'A70000001','comunidad_cif'=>'H70000001','tipo_servicio'=>''],'facturas@facsa.example');
         $assert($route2['status']==='classified','la segunda vez debe resolver EN COMUNIDAD (ya enlazado), no por fallback global');
-        $assert(!isset($route2['evidence']['supplier']['source']),'ya no debe venir de "global" — la relación ya existe: '.json_encode($route2['evidence']['supplier']));
+        $assert($route2['result']['classification']['supplier']['linked']===true && $route2['autolink']['reason']==='relation_already_exists','la segunda vez el proveedor ya está vinculado a la comunidad: '.json_encode([$route2['evidence']['supplier'],$route2['autolink']]));
         $rowsAfter=$db->all('SELECT * FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
         $assert(count($rowsAfter)===1,'no debe duplicarse: '.count($rowsAfter));
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — PROFOC: razón social completa -> global -> autolink con category=Extintores',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — PROFOC: razón social completa -> global -> autolink con category=Extintores',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3274,15 +3403,15 @@ $test('Fase 7 — PROFOC: razón social completa -> global -> autolink con categ
     $communityId=$f7InsertCommunity($db,'F7PROFOC','H70000002');
     $supplierId=$f7InsertSupplier($db,'PROFOC TEST F7','GARCÍA MARÍN CONSULTORES TEST F7, S.L.',$serviceId,'B70000002');
     try{
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'GARCÍA MARÍN CONSULTORES TEST F7 S.L.','proveedor_cif'=>'B70000002','comunidad_cif'=>'H70000002','tipo_servicio'=>''],'facturas@profoc.example');
-        $assert($route['status']==='classified' && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $assert($route['status']==='classified' && ($route['autolink']['inserted']??null)===true,json_encode($route));
         $rows=$db->all('SELECT category FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
-        $assert(count($rows)===1 && $rows[0]['category']==='EXTINTORES FASE7',json_encode($rows));
+        $assert(count($rows)===1 && $rows[0]['category']==='EXTINTORES',json_encode($rows));
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — EXTNCAS: alias global resuelve al target activo, autolink SIEMPRE al target, nunca al source inactivo',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — EXTNCAS: alias global resuelve al target activo, autolink SIEMPRE al target, nunca al source inactivo',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3293,16 +3422,16 @@ $test('Fase 7 — EXTNCAS: alias global resuelve al target activo, autolink SIEM
     $db->execute('INSERT INTO supplier_aliases(supplier_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$activeId,'name','EXTNCAS TEST F7',Salvest\Text::normalizeCompanyName('EXTNCAS TEST F7')]);
     $inactiveId=$f7InsertSupplier($db,'EXTNCAS TEST F7',null,null,null,0);
     try{
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'EXTNCAS TEST F7','proveedor_cif'=>'','comunidad_cif'=>'H70000003','tipo_servicio'=>''],'facturas@extincas.example');
-        $assert($route['status']==='classified' && (int)$route['supplier']['id']===$activeId && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $assert($route['status']==='classified' && (int)$route['supplier']['id']===$activeId && ($route['autolink']['inserted']??null)===true,json_encode($route));
         $linkedToActive=$db->one('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$activeId]);
         $linkedToInactive=$db->one('SELECT id FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$inactiveId]);
         $assert($linkedToActive!==null && $linkedToInactive===null,'la relación debe crearse con el target activo, jamás con el inactivo');
     }finally{$f7Cleanup($db,[$communityId],[$activeId,$inactiveId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — ADRIAN TURCU: CIF global -> autolink con category=Limpieza',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — ADRIAN TURCU: CIF global -> autolink con category=Limpieza',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3311,15 +3440,15 @@ $test('Fase 7 — ADRIAN TURCU: CIF global -> autolink con category=Limpieza',st
     $communityId=$f7InsertCommunity($db,'F7ADRIAN','H70000004');
     $supplierId=$f7InsertSupplier($db,'ADRIAN TURCU TEST F7',null,$serviceId,'X4153498M');
     try{
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'','proveedor_cif'=>'X4153498M','comunidad_cif'=>'H70000004','tipo_servicio'=>''],'facturas@adrian.example');
-        $assert($route['status']==='classified' && $route['evidence']['supplier']['auto_link']===true,json_encode($route));
+        $assert($route['status']==='classified' && ($route['autolink']['inserted']??null)===true,json_encode($route));
         $rows=$db->all('SELECT category FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
-        $assert(count($rows)===1 && $rows[0]['category']==='LIMPIEZA2 FASE7',json_encode($rows));
+        $assert(count($rows)===1 && $rows[0]['category']==='LIMPIEZA',json_encode($rows));
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — ambigüedad global: 0 INSERT, auto_link=false, needs_review',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — ambigüedad global: 0 INSERT, auto_link=false, needs_review',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3330,7 +3459,7 @@ $test('Fase 7 — ambigüedad global: 0 INSERT, auto_link=false, needs_review',s
     $s2=$f7InsertSupplier($db,'DUP F7',null,$serviceId,null);
     try{
         $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'DUP F7','proveedor_cif'=>'','comunidad_cif'=>'H70000005','tipo_servicio'=>''],'facturas@dup.example');
         $assert($route['status']==='needs_review' && $route['supplier']===null && $route['supplier_ambiguous']===true,json_encode($route));
         $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
@@ -3338,7 +3467,7 @@ $test('Fase 7 — ambigüedad global: 0 INSERT, auto_link=false, needs_review',s
     }finally{$f7Cleanup($db,[$communityId],[$s1,$s2]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — sin servicio maestro: 0 INSERT aunque un hint de OpenAI permita clasificar; auto_link=false',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup):void{
+$test('Fase 7 — sin servicio maestro: 0 INSERT aunque un hint de OpenAI permita clasificar; auto_link=false',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3347,16 +3476,16 @@ $test('Fase 7 — sin servicio maestro: 0 INSERT aunque un hint de OpenAI permit
     $supplierId=$f7InsertSupplier($db,'SIN SERVICIO F7',null,null,'B70000006'); // main_service_type_id NULL
     try{
         $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'','proveedor_cif'=>'B70000006','comunidad_cif'=>'H70000006','tipo_servicio'=>'jardineria'],'facturas@x.example');
         $assert($route['status']==='classified','con hint de OpenAI, Fase 6 sigue permitiendo clasificar');
-        $assert($route['evidence']['supplier']['auto_link']===false,'sin main_service_type_id, NUNCA debe autolinkear, aunque clasifique por el hint puntual: '.json_encode($route['evidence']['supplier']));
+        $assert(($route['autolink']['attempted']??null)===false,'sin main_service_type_id, NUNCA debe autolinkear: '.json_encode($route['autolink']));
         $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n'];
         $assert($before===$after,'0 relaciones nuevas sin servicio maestro');
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — prioridad: relación ya existente -> el fallback global ni se ejecuta, 0 INSERT nuevo',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — prioridad: relación ya existente -> el fallback global ni se ejecuta, 0 INSERT nuevo',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3367,9 +3496,9 @@ $test('Fase 7 — prioridad: relación ya existente -> el fallback global ni se 
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityId,$supplierId,'Ya Existe Fase7','manual','YA ENLAZADO F7']);
     try{
         $before=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'YA ENLAZADO F7','proveedor_cif'=>'B70000007','comunidad_cif'=>'H70000007','tipo_servicio'=>''],'facturas@x.example');
-        $assert($route['status']==='classified' && !isset($route['evidence']['supplier']['source']),'debe resolver por resolveSupplierInCommunity(), el fallback global ni se ejecuta: '.json_encode($route));
+        $assert($route['status']==='classified' && $route['result']['classification']['supplier']['linked']===true && $route['autolink']['attempted']===false,'resuelve con la relación existente y no intenta autolink: '.json_encode([$route['evidence']['supplier'],$route['autolink']]));
         $after=(int)$db->one('SELECT COUNT(*) n FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId])['n'];
         $assert($before===1 && $after===1,'no debe crear una segunda relación');
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
@@ -3427,7 +3556,7 @@ $test('Fase 7 — fallo real de DB (violación de FK): rollback completo, insert
     $mysqlSchemaCleanup($ctx);
 });
 
-$test('Fase 7 — traza community_supplier_auto_link: incluida cuando se inserta, con community_id/supplier_id/category/inserted/reason',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — el autolink queda en la explicación de la decisión (classification.autolink) con inserted/reason/category, y la relación en la base',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3436,17 +3565,16 @@ $test('Fase 7 — traza community_supplier_auto_link: incluida cuando se inserta
     $communityId=$f7InsertCommunity($db,'F7TRACE','H70000010');
     $supplierId=$f7InsertSupplier($db,'TRACE F7',null,$serviceId,'B70000010');
     try{
-        $trace=[];
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
-        $router->route(['proveedor'=>'TRACE F7','proveedor_cif'=>'B70000010','comunidad_cif'=>'H70000010','tipo_servicio'=>''],'facturas@x.example','',null,
-            function(string $tier,string $outcome,array $details)use(&$trace){$trace[]=[$tier,$outcome,$details];});
-        $step=null;foreach($trace as $s)if($s[0]==='community_supplier_auto_link')$step=$s;
-        $assert($step!==null,'debe existir el evento de traza community_supplier_auto_link: '.json_encode($trace));
-        $assert($step[1]==='inserted' && $step[2]['community_id']===$communityId && $step[2]['supplier_id']===$supplierId && $step[2]['inserted']===true && $step[2]['reason']==='missing_relation',json_encode($step));
+        $router=$routeCompat($db,true);
+        $route=$router->route(['proveedor'=>'TRACE F7','proveedor_cif'=>'B70000010','comunidad_cif'=>'H70000010','tipo_servicio'=>''],'facturas@x.example','',null);
+        $link=$route['result']['classification']['autolink'];
+        $assert($link['attempted']===true && $link['inserted']===true && $link['reason']==='missing_relation' && $link['category']==='MANTENIMIENTO',json_encode($link));
+        $rows=$db->all('SELECT category,source_column FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityId,$supplierId]);
+        $assert(count($rows)===1 && $rows[0]['category']==='MANTENIMIENTO',json_encode($rows));
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — no autolink desde el camino comunitario: si resolveSupplierInCommunity() resuelve directamente, auto_link no aparece en absoluto en la evidencia',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — no autolink desde el camino comunitario: si resolveSupplierInCommunity() resuelve directamente, auto_link no aparece en absoluto en la evidencia',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3456,13 +3584,13 @@ $test('Fase 7 — no autolink desde el camino comunitario: si resolveSupplierInC
     $supplierId=$f7InsertSupplier($db,'YA EN COMUNIDAD F7',null,$serviceId,null);
     $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column,raw_provider_name) VALUES (?,?,?,?,?)',[$communityId,$supplierId,'X','manual','x']);
     try{
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $route=$router->route(['proveedor'=>'YA EN COMUNIDAD F7','proveedor_cif'=>'','comunidad_cif'=>'H70000011','tipo_servicio'=>''],'facturas@x.example');
-        $assert(!isset($route['evidence']['supplier']['auto_link']),'auto_link solo debe aparecer en la rama global — un supplier resuelto en comunidad no debe llevarlo: '.json_encode($route['evidence']['supplier']));
+        $assert(($route['autolink']['attempted']??null)===false && $route['autolink']['reason']==='relation_already_exists','un proveedor ya vinculado a la comunidad no intenta autolink: '.json_encode($route['autolink']));
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — no crea suppliers ni communities: recuentos idénticos antes/después de todo el flujo de autolink',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — no crea suppliers ni communities: recuentos idénticos antes/después de todo el flujo de autolink',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$routeCompat):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3473,14 +3601,14 @@ $test('Fase 7 — no crea suppliers ni communities: recuentos idénticos antes/d
     try{
         $suppliersBefore=(int)$db->one('SELECT COUNT(*) n FROM suppliers')['n'];
         $communitiesBefore=(int)$db->one('SELECT COUNT(*) n FROM communities')['n'];
-        $router=new Salvest\InvoiceRouter(new Salvest\Classifier($db),new Salvest\CommunitySupplierAutoLinker($db));
+        $router=$routeCompat($db,true);
         $router->route(['proveedor'=>'NO CREA F7','proveedor_cif'=>'B70000012','comunidad_cif'=>'H70000012','tipo_servicio'=>''],'facturas@x.example');
         $assert((int)$db->one('SELECT COUNT(*) n FROM suppliers')['n']===$suppliersBefore,'autolink nunca debe crear suppliers');
         $assert((int)$db->one('SELECT COUNT(*) n FROM communities')['n']===$communitiesBefore,'autolink nunca debe crear communities');
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — concurrencia REAL (dos procesos PHP con conexiones MySQL independientes, no dos llamadas secuenciales): estado inicial 0, dos intentos concurrentes con categorías DISTINTAS -> exactamente 1 relación final',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service):void{
+$test('Fase 7 — concurrencia REAL (dos procesos PHP con conexiones MySQL independientes, no dos llamadas secuenciales): estado inicial 0, dos intentos concurrentes con categorías DISTINTAS -> exactamente 1 relación final',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$f7InsertCommunity,$f7InsertSupplier,$f7Cleanup,$f7Service,$testMysqlConfig):void{
     $ctx=$mysqlSchemaTest();
     if($ctx===null){echo "SKIP (sin MySQL local disponible)\n";return;}
     $db=$ctx['db'];
@@ -3499,8 +3627,9 @@ $test('Fase 7 — concurrencia REAL (dos procesos PHP con conexiones MySQL indep
         file_put_contents($racerPath,'<?php
 declare(strict_types=1);
 require "'.dirname(__DIR__).'/src/Database.php";
+require "'.dirname(__DIR__).'/src/Text.php";
 require "'.dirname(__DIR__).'/src/CommunitySupplierAutoLinker.php";
-$db=new Salvest\Database(["host"=>"127.0.0.1","port"=>33306,"name"=>"salvest_test","user"=>"salvest","password"=>"test-password","charset"=>"utf8mb4"]);
+$db=new Salvest\Database('.var_export($testMysqlConfig(),true).');
 $linker=new Salvest\CommunitySupplierAutoLinker($db);
 $result=$linker->linkIfMissing((int)$argv[1],(int)$argv[2],$argv[3],"CONC TEST");
 echo json_encode($result);
@@ -3529,15 +3658,10 @@ echo json_encode($result);
     }finally{$f7Cleanup($db,[$communityId],[$supplierId]);$mysqlSchemaCleanup($ctx);}
 });
 
-$test('Fase 7 — el error SQL completo de un fallo de autolink nunca llega a la traza/decision_json (guarda de regresión de código): InvoiceRouter.php no referencia linkResult[\'error\'] en ningún punto',static function()use($assert):void{
-    $source=file_get_contents(__DIR__.'/../src/InvoiceRouter.php');
-    $assert(substr_count($source,"\$trace('community_supplier_auto_link'")===2,'deben existir las 2 llamadas de traza esperadas (insertado/omitido y sin servicio maestro)');
-    // $linkResult es el único lugar de todo el fichero donde el resultado de
-    // CommunitySupplierAutoLinker (que sí guarda el mensaje SQL completo, pero solo para
-    // error_log()) está disponible. Si alguna vez alguien reenvía linkResult[\'error\'] hacia el
-    // trace/decision_json, este test debe fallar.
-    $assert(!str_contains($source,"linkResult['error']") && !str_contains($source,'linkResult["error"]'),'InvoiceRouter no debe leer/reenviar linkResult[\'error\'] en ningún punto — el detalle técnico de BD se queda en error_log()');
-    $assert(str_contains($source,"\$linkResult['reason']"),'sí debe reenviar la razón (segura, sin detalle de BD)');
+$test('Fase 7 — el error SQL completo de un fallo de autolink nunca llega a decision_json: InvoiceProcessor solo reenvía el motivo seguro (guarda de regresión de código)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/InvoiceProcessor.php');
+    $assert(!str_contains($source,"['error']"),'InvoiceProcessor no debe leer/reenviar el campo error del autolinker — el detalle técnico de BD se queda en error_log()');
+    $assert(str_contains($source,'\'reason\'=>$result[\'reason\']'),'sí debe reenviar la razón (segura, sin detalle de BD)');
 });
 
 // ============================================================================================
@@ -3546,102 +3670,71 @@ $test('Fase 7 — el error SQL completo de un fallo de autolink nunca llega a la
 
 /** Stub mínimo de ExtractorProvider para probar FallbackExtractor sin red real — igual de
  * inyectable que OpenAIExtractor/ClaudeExtractor porque implementa el mismo contrato. */
-$stubExtractor=static function(?string $throwMessage,array $extractReturn=[],?int $resolveReturn=null,int $inTokens=10,int $outTokens=5,string $version='stub-v1'):Salvest\ExtractorProvider{
-    return new class($throwMessage,$extractReturn,$resolveReturn,$inTokens,$outTokens,$version) implements Salvest\ExtractorProvider{
-        public int $inputTokens=0;public int $outputTokens=0;public int $extractCalls=0;public int $resolveCalls=0;
-        public function __construct(private ?string $throwMessage,private array $extractReturn,private ?int $resolveReturn,private int $inTokens,private int $outTokens,private string $ver){}
-        public function version():string{return $this->ver;}
-        public function extract(string $path,string $mimeType,string $context,string $reasoningEffort='low'):array{
-            $this->extractCalls++;
+/** AiClient de prueba: lanza $throwMessage o devuelve $data con los tokens indicados, y cuenta las llamadas. */
+$stubAi=static function(?string $throwMessage,array $data=[],int $inTokens=10,int $outTokens=5,string $provider='stub'):Salvest\AiClient{
+    return new class($throwMessage,$data,$inTokens,$outTokens,$provider) implements Salvest\AiClient{
+        public int $calls=0;
+        public function __construct(private ?string $throwMessage,private array $data,private int $inTokens,private int $outTokens,private string $provider){}
+        public function structured(string $task,string $instructions,array $schema,?string $pdfPath,string $userText,array $options=[]):Salvest\AiResponse{
+            $this->calls++;
             if($this->throwMessage!==null)throw new \RuntimeException($this->throwMessage);
-            $this->inputTokens+=$this->inTokens;$this->outputTokens+=$this->outTokens;
-            return $this->extractReturn;
-        }
-        public function resolveSupplierAmongCandidates(string $path,string $mimeType,string $context,string $communityName,array $candidates):?int{
-            $this->resolveCalls++;
-            if($this->throwMessage!==null)throw new \RuntimeException($this->throwMessage);
-            $this->inputTokens+=$this->inTokens;$this->outputTokens+=$this->outTokens;
-            return $this->resolveReturn;
+            return new Salvest\AiResponse($this->data,$this->provider,$this->provider.'-model',$this->inTokens,$this->outTokens,1);
         }
     };
 };
 
-$test('Fase 8 — FallbackExtractor: primario (Claude) responde bien -> nunca se llama al fallback (OpenAI), version() refleja el primario',static function()use($assert,$stubExtractor):void{
-    $primary=$stubExtractor(null,['proveedor'=>'FACSA'],null,100,50,'claude-sonnet-5-v1');
-    $fallback=$stubExtractor('nunca debería llamarse');
-    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
-    $invoice=$extractor->extract('/tmp/x.pdf','application/pdf','ctx');
-    $assert($invoice==['proveedor'=>'FACSA'],'debe devolver exactamente lo que devolvió el primario');
-    $assert($extractor->version()==='claude-sonnet-5-v1','version() debe ser la del primario tras un éxito');
-    $assert($extractor->inputTokens===100&&$extractor->outputTokens===50,'los tokens deben ser los del primario únicamente');
+$test('Fase 8 — FallbackAiClient: el principal (Claude) responde bien -> nunca se llama al respaldo (OpenAI) y la respuesta dice quién la sirvió',static function()use($assert,$stubAi):void{
+    $primary=$stubAi(null,['ok'=>1],100,50,'claude');$fallback=$stubAi('nunca debería llamarse');
+    $response=(new Salvest\FallbackAiClient($primary,$fallback))->structured('t','i',[],null,'x');
+    $assert($response->data===['ok'=>1] && $response->provider==='claude' && $response->inputTokens===100 && $response->outputTokens===50 && $fallback->calls===0);
 });
 
-$test('Fase 8 — FallbackExtractor: el primario (Claude) falla -> cae automáticamente al fallback (OpenAI), version() refleja el fallback, y no se propaga la excepción del primario',static function()use($assert,$stubExtractor):void{
-    $primary=$stubExtractor('Claude respondió HTTP 529: overloaded');
-    $fallback=$stubExtractor(null,['proveedor'=>'PROFOC'],null,20,10,'openai-php-v1');
-    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
-    $invoice=$extractor->extract('/tmp/x.pdf','application/pdf','ctx');
-    $assert($invoice==['proveedor'=>'PROFOC'],'debe devolver lo que devolvió el fallback, no el error del primario');
-    $assert($extractor->version()==='openai-php-v1','version() debe reflejar el proveedor que realmente sirvió la llamada (el fallback)');
+$test('Fase 8 — FallbackAiClient: el principal falla -> cae automáticamente al respaldo, que sirve la llamada; la excepción del principal no se propaga',static function()use($assert,$stubAi):void{
+    $primary=$stubAi('Claude respondió HTTP 529: overloaded');$fallback=$stubAi(null,['ok'=>2],20,10,'openai');
+    $response=(new Salvest\FallbackAiClient($primary,$fallback))->structured('t','i',[],null,'x');
+    $assert($response->data===['ok'=>2] && $response->provider==='openai' && $primary->calls===1 && $fallback->calls===1);
 });
 
-$test('Fase 8 — FallbackExtractor: tokens = suma de ambos proveedores tras varias llamadas con caída intermitente del primario',static function()use($assert,$stubExtractor):void{
-    // Primario falla siempre en este test -> cada llamada consume tokens SOLO del fallback (el
-    // primario nunca llega a gastar tokens porque lanza antes de acumular ninguno).
-    $primary=$stubExtractor('caído');
-    $fallback=$stubExtractor(null,['proveedor'=>'X'],null,7,3,'openai-php-v1');
-    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
-    $extractor->extract('/a.pdf','application/pdf','ctx');
-    $extractor->extract('/b.pdf','application/pdf','ctx');
-    $assert($extractor->inputTokens===14&&$extractor->outputTokens===6,'debe acumular los tokens reales del fallback en cada llamada (2x7 in, 2x3 out)');
+$test('Fase 8 — DocumentIntelligence registra los tokens reales de cada llamada, venga del principal o del respaldo',static function()use($assert,$stubAi):void{
+    $ai=new Salvest\DocumentIntelligence(new Salvest\FallbackAiClient($stubAi('caído'),$stubAi(null,['document_type'=>'invoice','should_process_as_invoice'=>true,'document_confidence'=>0.95,'document_reason'=>'x','issuer'=>['name'=>'FACSA','tax_id'=>null],'customer'=>['name'=>null,'tax_id'=>null,'address'=>null,'postal_code'=>null],'invoice'=>['number'=>null,'date'=>null,'total_amount'=>null,'currency'=>null,'billing_period'=>null],'service'=>['raw'=>null,'semantic_category'=>null],'supply_identifiers'=>['cups'=>null,'contract_number'=>null,'customer_reference'=>null]],7,3,'openai')));
+    $ai->understand('a.pdf','ctx');$ai->understand('b.pdf','ctx');
+    $assert(array_sum(array_column($ai->calls,'input_tokens'))===14 && array_sum(array_column($ai->calls,'output_tokens'))===6 && $ai->calls[0]['provider']==='openai','2x7 in, 2x3 out, servidos por el respaldo');
 });
 
-$test('Fase 8 — FallbackExtractor: si AMBOS proveedores fallan, propaga la excepción del fallback (mismo modo de fallo que Worker ya maneja hoy)',static function()use($assert,$stubExtractor):void{
-    $primary=$stubExtractor('claude caído');
-    $fallback=$stubExtractor('openai también caído');
-    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
+$test('Fase 8 — FallbackAiClient: si fallan los dos, propaga la excepción del respaldo (el último intento real)',static function()use($assert,$stubAi):void{
     $threw=null;
-    try{$extractor->extract('/x.pdf','application/pdf','ctx');}catch(\Throwable $e){$threw=$e->getMessage();}
-    $assert($threw==='openai también caído','debe propagar el error del fallback (el último intento real), no el del primario');
+    try{(new Salvest\FallbackAiClient($stubAi('claude caído'),$stubAi('openai también caído')))->structured('t','i',[],null,'x');}catch(\Throwable $e){$threw=$e->getMessage();}
+    $assert($threw==='openai también caído',(string)$threw);
 });
 
-$test('Fase 8 — FallbackExtractor: mismo comportamiento de caída para resolveSupplierAmongCandidates() (segunda llamada restringida)',static function()use($assert,$stubExtractor):void{
-    $primary=$stubExtractor('claude caído',[],null);
-    $fallback=$stubExtractor(null,[],42,5,2,'openai-php-v1');
-    $extractor=new Salvest\FallbackExtractor($primary,$fallback);
-    $chosen=$extractor->resolveSupplierAmongCandidates('/x.pdf','application/pdf','ctx','Comunidad X',[['id'=>42,'official_name'=>'Y']]);
-    $assert($chosen===42,'debe devolver el id elegido por el fallback');
-    $assert($extractor->version()==='openai-php-v1','version() también debe actualizarse para la llamada restringida');
+$test('Fase 8 — el respaldo también cubre las elecciones de la IA: si Claude cae al elegir proveedor, OpenAI elige y el id se valida igual',static function()use($assert,$stubAi):void{
+    $ai=new Salvest\DocumentIntelligence(new Salvest\FallbackAiClient($stubAi('claude caído'),$stubAi(null,['supplier_id'=>42,'confidence'=>0.9,'reason'=>'logo'],5,2,'openai')));
+    $choice=$ai->chooseSupplier('x.pdf',['issuer'=>[],'customer'=>[],'service'=>[]],'Comunidad X',[['id'=>42,'razon_social'=>'Y']]);
+    $assert($choice['id']===42 && $choice['valid'] && $ai->calls[0]['provider']==='openai',json_encode($choice));
 });
 
-$test('Fase 8 — ClaudeExtractor/OpenAIExtractor: ambos implementan ExtractorProvider y version() devuelve su propia constante VERSION',static function()use($assert):void{
-    $claude=new Salvest\ClaudeExtractor(['api_key'=>'test','model'=>'claude-sonnet-5','timeout_seconds'=>5]);
-    $openai=new Salvest\OpenAIExtractor(['api_key'=>'test','model'=>'gpt-test','timeout_seconds'=>5]);
-    $assert($claude instanceof Salvest\ExtractorProvider,'ClaudeExtractor debe implementar ExtractorProvider');
-    $assert($openai instanceof Salvest\ExtractorProvider,'OpenAIExtractor debe implementar ExtractorProvider');
-    $assert($claude->version()===Salvest\ClaudeExtractor::VERSION,'version() de Claude debe ser su propia constante');
-    $assert($openai->version()===Salvest\OpenAIExtractor::VERSION,'version() de OpenAI debe ser su propia constante (comportamiento preexistente, sin cambios)');
+$test('Fase 8 — ClaudeClient y OpenAIClient implementan el mismo contrato AiClient',static function()use($assert):void{
+    $assert(new Salvest\ClaudeClient(['api_key'=>'test','model'=>'claude-test','timeout_seconds'=>5]) instanceof Salvest\AiClient);
+    $assert(new Salvest\OpenAIClient(['api_key'=>'test','model'=>'gpt-test','timeout_seconds'=>5]) instanceof Salvest\AiClient);
 });
 
-$test('Fase 8 — ClaudeExtractor: llama al endpoint/modelo/esquema correctos de Anthropic (inspección de código, mismo estilo que OpenAIExtractor nunca se prueba contra red real)',static function()use($assert):void{
-    $source=file_get_contents(__DIR__.'/../src/ClaudeExtractor.php');
-    $assert(str_contains($source,'https://api.anthropic.com/v1/messages'),'debe apuntar al endpoint real de Anthropic Messages API');
-    $assert(str_contains($source,"'x-api-key: '"),'debe autenticar con el header x-api-key, no Bearer (formato distinto de OpenAI)');
-    $assert(str_contains($source,'anthropic-version'),'debe fijar la cabecera anthropic-version requerida por la API');
-    $assert(str_contains($source,"'tool_choice'"),'debe forzar tool-use (Claude no tiene json_schema strict como OpenAI)');
-    $assert(str_contains($source,"'model' => \$this->config['model']"),'el modelo debe venir de config, nunca hardcodeado');
+$test('Fase 8 — ClaudeClient: endpoint, autenticación, cabecera de versión, herramienta forzada y modelo desde config (inspección de código, sin red)',static function()use($assert):void{
+    $source=file_get_contents(__DIR__.'/../src/ClaudeClient.php');
+    $assert(str_contains($source,'https://api.anthropic.com/v1/messages'));
+    $assert(str_contains($source,"'x-api-key: '"),'Anthropic autentica con x-api-key, no Bearer');
+    $assert(str_contains($source,'anthropic-version'));
+    $assert(str_contains($source,"'tool_choice'"),'salida estructurada mediante herramienta forzada');
+    $assert(str_contains($source,'(string)$this->config[\'model\']'),'el modelo viene de config, nunca fijo');
 });
 
-$test('Fase 8 — Worker::create() conecta Claude como primario y OpenAI como fallback -> el extractor real es un FallbackExtractor (inspección por reflexión, sin red)',static function()use($assert,$sqliteDbWithLock,$workerConfig):void{
-    $db=$sqliteDbWithLock();
-    $worker=Salvest\Worker::create($db,$workerConfig());
-    $reflection=new ReflectionProperty(Salvest\Worker::class,'extractor');$reflection->setAccessible(true);
-    $extractor=$reflection->getValue($worker);
-    $assert($extractor instanceof Salvest\FallbackExtractor,'Worker::create() debe construir un FallbackExtractor, no un extractor suelto');
-    $primaryReflection=new ReflectionProperty(Salvest\FallbackExtractor::class,'primary');$primaryReflection->setAccessible(true);
-    $fallbackReflection=new ReflectionProperty(Salvest\FallbackExtractor::class,'fallback');$fallbackReflection->setAccessible(true);
-    $assert($primaryReflection->getValue($extractor) instanceof Salvest\ClaudeExtractor,'el primario debe ser Claude');
-    $assert($fallbackReflection->getValue($extractor) instanceof Salvest\OpenAIExtractor,'el fallback debe ser OpenAI');
+$test('Fase 8 — Worker::create() conecta Claude como principal y OpenAI como respaldo detrás de DocumentIntelligence (inspección por reflexión, sin red)',static function()use($assert,$sqliteDbWithLock,$workerConfig):void{
+    $worker=Salvest\Worker::create($sqliteDbWithLock(),$workerConfig());
+    $get=static function(object $object,string $class,string $property):mixed{$r=new ReflectionProperty($class,$property);$r->setAccessible(true);return $r->getValue($object);};
+    $processor=$get($worker,Salvest\Worker::class,'processor');
+    $intelligence=$get($processor,Salvest\InvoiceProcessor::class,'ai');
+    $client=$get($intelligence,Salvest\DocumentIntelligence::class,'ai');
+    $assert($client instanceof Salvest\FallbackAiClient,'el cliente de IA es el de respaldo');
+    $assert($get($client,Salvest\FallbackAiClient::class,'primary') instanceof Salvest\ClaudeClient && $get($client,Salvest\FallbackAiClient::class,'fallback') instanceof Salvest\OpenAIClient);
 });
 
 $test('Fase 8 — cron.php y bin/worker.php usan Worker::create() (fuente única de verdad de qué extractor se usa), no construyen OpenAIExtractor a mano (guarda de regresión de código)',static function()use($assert):void{
@@ -3652,10 +3745,10 @@ $test('Fase 8 — cron.php y bin/worker.php usan Worker::create() (fuente única
     }
 });
 
-$test('Fase 8 — processed_attachments.extractor_version refleja el proveedor real que sirvió cada factura, no un valor fijo (inspección de código): Worker.php ya no hardcodea OpenAIExtractor::VERSION en el INSERT',static function()use($assert):void{
+$test('Fase 8 — processed_attachments.extractor_version guarda el proveedor y el modelo que de verdad sirvieron la comprensión (inspección de código)',static function()use($assert):void{
     $source=file_get_contents(__DIR__.'/../src/Worker.php');
-    $assert(str_contains($source,"\$data['extractor_version']??OpenAIExtractor::VERSION"),'debe usar el extractor_version real de la llamada, con la constante de OpenAI solo como valor por defecto antes de la extracción');
-    $assert(str_contains($source,'$extractorVersion=$this->extractor->version()'),'debe capturar version() justo después de la llamada real a extract()');
+    $assert(str_contains($source,'\'extractor_version\'=>isset($understandingCall[\'provider\']) ? $understandingCall[\'provider\'].\':\'.$understandingCall[\'model\'] : null'),'proveedor:modelo de la llamada real');
+    $assert(!str_contains($source,'OpenAIExtractor::VERSION'),'ya no hay ninguna versión fija de respaldo');
 });
 
 // ============================================================================================
@@ -3663,66 +3756,49 @@ $test('Fase 8 — processed_attachments.extractor_version refleja el proveedor r
 // principio que resolveSupplier() ya usa para proveedores).
 // ============================================================================================
 
-$test('Fase 9 — LLOMBAI 11: nombre_comunidad extraído "LLOMBAI 11 ESCALERA" contiene el official_name "LLOMBAI 11" -> match por contención, nunca llega a probar el fuzzy (caso real de producción)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 9 — LLOMBAI 11: "LLOMBAI 11 ESCALERA" contiene el nombre "LLOMBAI 11": candidata con señal de contención en primer lugar, y la IA la confirma',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
         ['55','LLOMBAI 11',Salvest\Text::normalize('LLOMBAI 11'),'H12460788','AVDA. LLOMBAI 11']);
     $communityId=(int)$db->pdo()->lastInsertId();
-    $trace=[];
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'LLOMBAI 11 ESCALERA','direccion'=>'C/Llombai 11, BURRIANA'],'',function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome,'details'=>$details];});
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver a LLOMBAI 11: '.json_encode($result));
-    $assert($result['confidence']===100.0,'la contención es una coincidencia exacta, no una puntuación difusa');
-    $assert($result['evidence']===['field'=>'nombre_comunidad','type'=>'name_containment'],json_encode($result['evidence']));
-    $fuzzySteps=array_filter($trace,fn($t)=>$t['tier']==='community_fuzzy');
-    $assert(count($fuzzySteps)===0,'la contención debe resolverlo ANTES de llegar siquiera a probar el tier fuzzy');
-    $containmentSteps=array_values(array_filter($trace,fn($t)=>$t['tier']==='community_containment'));
-    $assert(count($containmentSteps)===1 && $containmentSteps[0]['outcome']==='match','debe quedar constancia en la traza');
+    $result=$resolveCommunity($db,['name'=>'LLOMBAI 11 ESCALERA','address'=>'C/Llombai 11, BURRIANA']);
+    $assert((int)($result['community']['id']??0)===$communityId && $result['source']==='ai_after_retrieval',json_encode($result['outcome']));
+    $assert(in_array('containment',$result['candidates'][0]['senales'],true),'la contención queda registrada como señal: '.json_encode($result['candidates']));
 });
 
-$test('Fase 9 — ambigüedad: dos comunidades cuyo official_name aparece completo dentro del mismo nombre_comunidad extraído -> ambiguo, ninguna se elige arbitrariamente',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 9 — ambigüedad: dos comunidades cuyo nombre aparece entero en el texto -> las dos son candidatas y, si la IA no puede distinguir, ninguna se elige',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['EDIFICIO NORTE',Salvest\Text::normalize('EDIFICIO NORTE'),'Calle Norte 1']);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['EDIFICIO SUR',Salvest\Text::normalize('EDIFICIO SUR'),'Calle Sur 1']);
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'EDIFICIO NORTE EDIFICIO SUR','direccion'=>''],'');
-    $assert($result['community']===null,'ambiguo -> no debe elegir ninguna comunidad arbitrariamente: '.json_encode($result));
-    $assert($result['evidence']['type']==='ambiguous_containment',json_encode($result['evidence']));
+    $result=$resolveCommunity($db,['name'=>'EDIFICIO NORTE EDIFICIO SUR']);
+    $assert($result['community']===null && $result['outcome']==='ai_abstained' && count($result['candidates'])===2,'ambiguo -> ninguna: '.json_encode($result['outcome']));
 });
 
-$test('Fase 9 — contención también aplica vía alias de dirección (no solo official_name)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 9 / 16.2 — la contención también aplica vía alias de dirección, y la comunidad devuelta es la fila completa (external_code incluido)',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,main_address,active) VALUES (?,?,?,?,1)',['77','CP ALIAS',Salvest\Text::normalize('CP ALIAS'),'Avenida Principal 9']);
     $communityId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
         [$communityId,'address','Calle Secundaria 42',Salvest\Text::normalize('Calle Secundaria 42')]);
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'','direccion'=>'Calle Secundaria 42, bajo'],'');
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver vía el alias de dirección: '.json_encode($result));
-    $assert($result['evidence']['type']==='name_containment');
-    // Fase 16.2: bug real de producción — una comunidad resuelta vía alias llegaba a Drive sin
-    // external_code (DriveInvoiceArchiver reventaba con "La comunidad no tiene código externo"),
-    // porque el candidato de alias se construía a medias en vez de usar la fila real de
-    // `communities`. La comunidad devuelta aquí debe ser la fila COMPLETA, no un objeto parcial.
-    $assert(($result['community']['external_code']??null)==='77','la comunidad resuelta vía alias debe traer external_code (fila completa, no un objeto a medias): '.json_encode($result['community']));
+    $result=$resolveCommunity($db,['address'=>'Calle Secundaria 42, bajo']);
+    $assert((int)($result['community']['id']??0)===$communityId && in_array('containment',$result['candidates'][0]['senales'],true),'debe proponerla vía el alias: '.json_encode($result['candidates']));
+    $assert(($result['community']['external_code']??null)==='77','fila completa con external_code (bug real de la Fase 16.2): '.json_encode($result['community']));
 });
 
-$test('Fase 9 — el contexto del correo (asunto/cuerpo) NUNCA se usa para la contención, solo nombre_comunidad/direccion — a diferencia del tier fuzzy que sí lo usa',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 9 — el texto del correo nunca propone comunidades: solo lo que el documento dice del cliente',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['MENCIONADA EN CONTEXTO',Salvest\Text::normalize('MENCIONADA EN CONTEXTO'),'Calle X 1']);
-    // El nombre de la comunidad solo aparece en el contexto (cuerpo del correo), nunca en los
-    // campos extraídos nombre_comunidad/direccion -> la contención no debe dispararse.
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'','direccion'=>''],'Aviso: factura de la comunidad MENCIONADA EN CONTEXTO adjunta');
-    $assert($result['community']===null,'la contención no debe usar el contexto libre del correo: '.json_encode($result));
+    $result=$resolveCommunity($db,['name'=>null,'address'=>null],static fn()=>throw new RuntimeException('sin candidatas no se llama a la IA'));
+    $assert($result['community']===null && $result['outcome']==='no_candidates',json_encode($result['outcome']));
 });
 
-$test('Fase 9 — sin contención NI fuzzy suficiente, sigue sin resolver comunidad exactamente como antes (regresión: la contención no inventa coincidencias donde no las hay)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Reconstrucción — "EL PINAR RESIDENCIAL" frente a "RESIDENCIAL EL PINAR": las palabras compartidas proponen la candidata (antes no se proponía) y decide la IA; si se abstiene, sin comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['RESIDENCIAL EL PINAR',Salvest\Text::normalize('RESIDENCIAL EL PINAR'),'Calle Y 1']);
-    $trace=[];
-    // Mismas palabras, orden distinto: ni contención (no es una frase contigua) ni fuzzy (score
-    // real 70.75, muy por debajo del umbral 92) -> debe seguir sin resolverse, igual que siempre.
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'EL PINAR RESIDENCIAL','direccion'=>''],'',function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome];});
-    $assert($result['community']===null,'no debe inventar una coincidencia: '.json_encode($result));
-    $assert(in_array(['tier'=>'community_containment','outcome'=>'none'],$trace,true),'la contención debe haberse intentado y no encontrado nada');
-    $assert(in_array(['tier'=>'community_fuzzy','outcome'=>'none'],$trace,true),'el fuzzy también se sigue intentando después, como siempre');
+    $abstain=$resolveCommunity($db,['name'=>'EL PINAR RESIDENCIAL'],'abstain');
+    $assert($abstain['community']===null && count($abstain['candidates'])===1 && in_array('rare_word:pinar',$abstain['candidates'][0]['senales'],true),json_encode($abstain['candidates']));
+    $nothing=$resolveCommunity($db,['name'=>'URBANIZACION LOS OLIVOS']);
+    $assert($nothing['community']===null && $nothing['outcome']==='no_candidates','sin ninguna señal no se inventa una candidata');
 });
 
 // ============================================================================================
@@ -3745,54 +3821,47 @@ $test('Fase 16 — Text::stripLeadingAddressWord() quita como mucho una palabra 
     $assert(Salvest\Text::stripLeadingAddressWord('calle')==='calle','una única palabra nunca se vacía, aunque sea genérica');
 });
 
-$test('Fase 16 — CALLE ENCARNACION 35 (maestro) vs "ENCARNACION, 35, 12530 BURRIANA" (factura real de FAIN Ascensores) -> match por contención pese al prefijo "Calle" ausente',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 16 — CALLE ENCARNACION 35 (maestro) vs "ENCARNACION, 35, 12530 BURRIANA" (factura real de FAIN Ascensores) -> candidata por contención pese al prefijo "Calle" ausente',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
         ['02','ENCARNACION 35',Salvest\Text::normalize('ENCARNACION 35'),'H12798526','CALLE ENCARNACION 35']);
     $communityId=(int)$db->pdo()->lastInsertId();
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>null,'direccion'=>'ENCARNACION, 35, 12530 BURRIANA'],'');
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'debe resolver a ENCARNACION 35 pese a que la factura no escriba "Calle": '.json_encode($result));
-    $assert($result['evidence']['type']==='name_containment');
+    $result=$resolveCommunity($db,['address'=>'ENCARNACION, 35, 12530 BURRIANA']);
+    $assert((int)($result['community']['id']??0)===$communityId && in_array('containment',$result['candidates'][0]['senales'],true),json_encode($result['candidates']));
 });
 
-$test('Fase 16 — el prefijo genérico también funciona al revés: maestro sin "Avenida", factura que sí la escribe',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 16 — el prefijo genérico también funciona al revés: maestro sin "Avenida", factura que sí la escribe',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['MEDITERRANEA 12',Salvest\Text::normalize('MEDITERRANEA 12'),'MEDITERRANEA 12']);
     $communityId=(int)$db->pdo()->lastInsertId();
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>null,'direccion'=>'Avenida Mediterranea 12, Burriana'],'');
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,json_encode($result));
+    $result=$resolveCommunity($db,['address'=>'Avenida Mediterranea 12, Burriana']);
+    $assert((int)($result['community']['id']??0)===$communityId,json_encode($result['candidates']));
 });
 
-$test('Fase 16 — caso real OTIS: "AV MEDITERRANEO 12" (masculino, sin acabar en "avda") resuelve vía alias "MEDITERRANEO 12" contra la comunidad dada de alta como "AVDA. MEDITERRANEA 12" (femenino)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 16 — caso real OTIS: "AV MEDITERRANEO 12" llega vía alias "MEDITERRANEO 12" a la comunidad "AVDA. MEDITERRANEA 12", con su external_code',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',
         ['90','AVDA. MEDITERRANEA 12',Salvest\Text::normalize('AVDA. MEDITERRANEA 12'),'H12278057','AVDA MEDITERRANEA 12']);
     $communityId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',
         [$communityId,'address','MEDITERRANEO 12',Salvest\Text::normalize('MEDITERRANEO 12')]);
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>'C.P. MEDITERRANEO 12','direccion'=>'AV MEDITERRANEO 12'],'');
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,json_encode($result));
-    $assert(($result['community']['external_code']??null)==='90','debe traer external_code — si no, DriveInvoiceArchiver revienta al archivar (bug real: "La comunidad no tiene código externo"): '.json_encode($result['community']));
+    $result=$resolveCommunity($db,['name'=>'C.P. MEDITERRANEO 12','address'=>'AV MEDITERRANEO 12']);
+    $assert((int)($result['community']['id']??0)===$communityId,json_encode($result['candidates']));
+    $assert(($result['community']['external_code']??null)==='90','debe traer external_code: '.json_encode($result['community']));
 });
-$test('Fase 16.2 — un alias también trae external_code cuando resuelve por el tier FUZZY, no solo por contención (bestFuzzyMatch comparte el mismo array de candidatos que la contención — prueba directa por reflexión sobre el método privado, ya que el umbral 92 hace muy difícil forzar el tier fuzzy de punta a punta con datos de prueba cortos)',static function()use($assert):void{
-    $method=new ReflectionMethod(Salvest\Classifier::class,'bestFuzzyMatch');
-    $method->setAccessible(true);
-    // Candidato construido exactamente como Classifier::classify() construye uno vía alias
-    // ANTES del arreglo: solo id/official_name/main_address/cif, sin external_code — y uno
-    // construido como debería quedar DESPUÉS del arreglo, con la fila completa.
-    $candidatesBeforeFix=[['community'=>['id'=>64,'official_name'=>'JAIME CHICHARRO 27','main_address'=>'CALLE JAIME CHICHARRO 27','cif'=>'H12247573'],'value'=>'CHICHARRO 27','kind'=>'address']];
-    $candidatesAfterFix=[['community'=>['id'=>64,'external_code'=>'64','official_name'=>'JAIME CHICHARRO 27','main_address'=>'CALLE JAIME CHICHARRO 27','cif'=>'H12247573'],'value'=>'CHICHARRO 27','kind'=>'address']];
-    $queries=['address'=>['CHICHARRO 27'],'name'=>[]];
-    $before=$method->invoke(null,$candidatesBeforeFix,$queries,null);
-    $after=$method->invoke(null,$candidatesAfterFix,$queries,null);
-    $assert(!array_key_exists('external_code',$before['best']),'reproduce el bug real tal cual estaba: el ganador del fuzzy vía alias no traía external_code');
-    $assert(($after['best']['external_code']??null)==='64','con la fila completa como candidato, el ganador del fuzzy sí trae external_code — así es como Classifier::classify() debe construir los candidatos de alias ahora');
+$test('Fase 16.2 — el recuperador devuelve siempre la fila completa de la comunidad, también cuando la propone por un alias o por similitud',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['64','JAIME CHICHARRO 27',Salvest\Text::normalize('JAIME CHICHARRO 27'),'H12247573','CALLE JAIME CHICHARRO 27']);
+    $id=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO community_aliases(community_id,alias_type,value,normalized_value,active) VALUES (?,?,?,?,1)',[$id,'address','CHICHARRO 27',Salvest\Text::normalize('CHICHARRO 27')]);
+    $candidates=(new Salvest\CommunityCandidateRetriever($db))->candidates(['name'=>null,'address'=>'CHICHARO 27']);
+    $assert(count($candidates)===1 && ($candidates[0]['community']['external_code']??null)==='64' && ($candidates[0]['community']['cif']??null)==='H12247573','fila completa: '.json_encode($candidates));
 });
-$test('Fase 16 — quitar el prefijo genérico no inventa coincidencias entre calles distintas (regresión: solo se perdona la palabra de tipo de vía, el resto de la dirección se sigue exigiendo exacto)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 16 — quitar el prefijo genérico no inventa candidatas entre calles distintas ("Mayor 1" frente a "Menor 5")',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['CALLE MAYOR 1',Salvest\Text::normalize('CALLE MAYOR 1'),'CALLE MAYOR 1']);
-    $result=(new Salvest\Classifier($db))->classify(['nombre_comunidad'=>null,'direccion'=>'Avenida Menor 5, Burriana'],'');
-    $assert($result['community']===null,'"Mayor 1" y "Menor 5" son calles distintas — quitar el prefijo de tipo de vía nunca debe igualarlas: '.json_encode($result));
+    $result=$resolveCommunity($db,['address'=>'Avenida Menor 5, Burriana']);
+    $assert($result['community']===null && $result['candidates']===[],'calles distintas: ni siquiera candidata: '.json_encode($result['candidates']));
 });
 
 // ============================================================================================
@@ -3803,49 +3872,29 @@ $test('Fase 16 — quitar el prefijo genérico no inventa coincidencias entre ca
 // campos de la propia factura en la misma pasada.
 // ============================================================================================
 
-$test('Fase 9.1 — LA FACTURA GANA: el contexto del correo menciona una comunidad distinta con score más alto (100) que el propio nombre_comunidad de la factura (93.3) -> debe ganar la factura, nunca el contexto (regresión del bug real reportado)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Fase 9.1 — LA FACTURA GANA: una comunidad mencionada solo en el correo nunca es candidata; la del documento sí, aunque tenga una errata',static function()use($assert,$sqliteDb,$classifierSchema,$resolveCommunity):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',
         ['RESIDENCIAL LOS PINOS ALTOS DEL NORTE',Salvest\Text::normalize('RESIDENCIAL LOS PINOS ALTOS DEL NORTE'),'Calle Pinos 1']);
     $correctId=(int)$db->pdo()->lastInsertId();
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['TORRE DEL PUERTO',Salvest\Text::normalize('TORRE DEL PUERTO'),'Calle Puerto 1']);
-    // nombre_comunidad de la factura: 93.3 de similitud con la comunidad correcta (typo real,
-    // sin contención exacta) -> supera el umbral 92 por sí solo.
-    // contexto del correo: coincide EXACTO (100) con una comunidad totalmente distinta.
-    // Antes de este fix, el contexto (100 > 93.3) ganaba la comparación global. Ahora, los campos
-    // de la propia factura se prueban en su propia pasada, con prioridad, antes de mirar el
-    // contexto siquiera.
-    $trace=[];
-    $result=(new Salvest\Classifier($db))->classify(
-        ['nombre_comunidad'=>'RESIDENCIAL LOS PINOS ALTOS DEL NORTES','direccion'=>''],
-        'TORRE DEL PUERTO',
-        function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome];}
-    );
-    $assert($result['community']!==null && (int)$result['community']['id']===$correctId,'debe ganar la comunidad de la propia factura, no la mencionada en el correo: '.json_encode($result));
-    $assert(!in_array('community_fuzzy_context',array_column($trace,'tier'),true),'ni siquiera debe llegar a probar el contexto: los campos de la factura ya resolvieron');
+    $result=$resolveCommunity($db,['name'=>'RESIDENCIAL LOS PINOS ALTOS DEL NORTES']);
+    $assert((int)($result['community']['id']??0)===$correctId,json_encode($result['candidates']));
+    $assert(!in_array('TORRE DEL PUERTO',array_column($result['candidates'],'nombre'),true),'la comunidad del correo no es candidata');
 });
 
-$test('Fase 9.1 — el contexto SIGUE funcionando como último recurso cuando la propia factura no aporta nada usable (regresión: no se ha eliminado la capacidad, solo se ha reordenado la prioridad)',static function()use($assert,$sqliteDb,$classifierSchema):void{
+$test('Reconstrucción — el texto del correo ya no resuelve comunidades como último recurso (la auditoría lo vio prácticamente inalcanzable): sin datos del cliente en el documento, revisión',static function()use($assert,$sqliteDb,$classifierSchema,$pipeline):void{
     $db=$sqliteDb($classifierSchema);
     $db->execute('INSERT INTO communities(official_name,normalized_name,main_address,active) VALUES (?,?,?,1)',['TORRE DEL PUERTO',Salvest\Text::normalize('TORRE DEL PUERTO'),'Calle Puerto 1']);
-    $communityId=(int)$db->pdo()->lastInsertId();
-    $trace=[];
-    $result=(new Salvest\Classifier($db))->classify(
-        ['nombre_comunidad'=>'','direccion'=>''],
-        'TORRE DEL PUERTO',
-        function(string $tier,string $outcome,array $details)use(&$trace):void{$trace[]=['tier'=>$tier,'outcome'=>$outcome];}
-    );
-    $assert($result['community']!==null && (int)$result['community']['id']===$communityId,'sin nada en la propia factura, el contexto debe seguir pudiendo resolverlo: '.json_encode($result));
-    $assert($result['evidence']['field']==='context',json_encode($result['evidence']));
-    $assert(in_array(['tier'=>'community_fuzzy_context','outcome'=>'match'],$trace,true),'debe quedar constancia de que se resolvió por el contexto, en su propio paso de traza');
+    $result=$pipeline($db,['proveedor'=>'ALGUIEN','nombre_comunidad'=>null,'direccion'=>null],'TORRE DEL PUERTO <facturas@torre.example>');
+    $assert($result['status']==='unclassified' && $result['reason_code']==='community_no_candidates',json_encode([$result['status'],$result['reason_code']]));
 });
 
-$test('Fase 9.1 — los prompts de extracción (Claude y OpenAI) instruyen explícitamente a leer los campos de comunidad SOLO del documento, nunca del contexto del correo (guarda de regresión de código)',static function()use($assert):void{
-    foreach(['src/ClaudeExtractor.php','src/OpenAIExtractor.php'] as $file){
-        $source=file_get_contents(__DIR__.'/../'.$file);
-        $assert(str_contains($source,'nunca del contexto del correo'),"$file debe instruir explícitamente a no tomar los datos de comunidad del contexto del correo");
-        $assert(str_contains($source,'nombre_comunidad, direccion, comunidad_cif, codigo_comunidad, codigo_postal'),"$file debe enumerar explícitamente los campos de comunidad afectados");
-    }
+$test('Fase 9.1 — el contrato de la IA (uno solo para Claude y OpenAI) instruye a leer los datos del cliente SOLO del documento, nunca del correo',static function()use($assert):void{
+    $instructions=Salvest\AiContracts::understandingInstructions();
+    $assert(str_contains($instructions,'ÚNICAMENTE de lo impreso en el documento, nunca del asunto ni del cuerpo del correo'),'regla de la Fase 9.1 presente');
+    $assert(str_contains($instructions,'DATOS TITULAR'),'regla de la Fase 23 presente (NIF del titular es del cliente)');
+    foreach(['src/ClaudeClient.php','src/OpenAIClient.php'] as $file)$assert(!str_contains(file_get_contents(__DIR__.'/../'.$file),'Extrae los datos'),"$file no debe llevar su propio prompt: el contrato vive en AiContracts");
 });
 
 // ============================================================================================
@@ -3892,23 +3941,21 @@ $test('Fase 12.1 — el enlace "Ayuda" existe en la barra lateral, y la página 
     $assert(substr_count($html,'class="disclosure"')===6,'las 6 secciones deben venir en el mismo acordeón plegable que ya usa el resto del panel, no en markup nuevo');
 });
 
-$test('Fase 15 — Worker: una fecha de factura no reconocible degrada a needs_review ANTES de llamar a Archiver::archive(), nunca lo deja lanzar (guarda de regresión de código: caso real, "Estado de Cuenta" con comunidad y proveedor ya resueltos pero sin fecha válida — antes perdía PDF, extraction_json y detalle técnico por completo)',static function()use($assert):void{
-    $source=file_get_contents(__DIR__.'/../src/Worker.php');
-    $routePos=strpos($source,'$route=$this->router->route(');
-    $invalidDatePos=strpos($source,'$invalidDate=');
-    $archiverCallPos=strpos($source,'$target = $this->archiver->archive(');
-    $assert($routePos!==false&&$invalidDatePos!==false&&$archiverCallPos!==false,'no se encontraron todos los puntos de referencia esperados en Worker.php');
-    $assert($routePos<$invalidDatePos&&$invalidDatePos<$archiverCallPos,'la comprobación de fecha inválida debe calcularse después de router->route() y antes de archiver->archive(), para poder degradar $status a tiempo');
-    $assert(str_contains($source,"'invalid_date'"),'blockingFactor debe distinguir explícitamente el caso de fecha inválida, no confundirlo con supplier_unresolved/community_unresolved');
-    // Misma forma de regex que Archiver.php usa realmente para decidir si archiva — la
-    // comprobación previa de Worker.php debe ser al menos tan estricta (o más), nunca más laxa,
-    // o dejaría pasar a archiver->archive() justo el caso que se supone que evita.
-    $archiverSource=file_get_contents(__DIR__.'/../src/Archiver.php');
-    $assert(str_contains($archiverSource,"preg_match('/^(\\d{4})-(\\d{2})/'"),'Archiver.php debe seguir exigiendo el mismo formato AAAA-MM al inicio de fecha_factura (si cambia ahí, la comprobación de Worker.php debe revisarse a la vez)');
+$test('Fase 15 — fecha ausente, no reconocible, sin día o futura: la factura va a revisión con motivo propio, nunca a error (antes solo se miraba AAAA-MM y Drive fallaba con AAAA-MM o años futuros)',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'98','CAMI DEL GRAO 4','OTIS','ASCENSOR','A28011153','H12402327');
+    foreach([null,'02/09/2026','2026-09','2026-02-30',(new DateTimeImmutable('+1 year'))->format('Y-m-d')] as $date){
+        $r=$pipeline($db,['proveedor'=>'OTIS','proveedor_cif'=>'A28011153','comunidad_cif'=>'H12402327','fecha_factura'=>$date]);
+        $assert($r['status']==='needs_review' && $r['reason_code']==='invalid_date' && $r['legacy']['fecha_factura']===null,"fecha ".var_export($date,true).': '.$r['status'].' '.$r['reason_code']);
+    }
+    $ok=$pipeline($db,['proveedor'=>'OTIS','proveedor_cif'=>'A28011153','comunidad_cif'=>'H12402327','fecha_factura'=>'2026-09-02']);
+    $assert($ok['status']==='classified' && $ok['legacy']['fecha_factura']==='2026-09-02');
 });
-$test('Fase 15 — Worker: fecha_factura inválida en un documento needs_review (no classified) nunca degrada nada — el guard solo actúa quando el estado ya era classified (regresión: no debe tocar el needs_review/unclassified normal)',static function()use($assert):void{
-    $source=file_get_contents(__DIR__.'/../src/Worker.php');
-    $assert(str_contains($source,"\$invalidDate=\$status==='classified'&&!preg_match"),'el guard de fecha inválida debe estar condicionado a status==="classified" — needs_review/unclassified no deben pasar por aquí, ya iban a la carpeta de no clasificados de todos modos');
+$test('Fase 15 — una fecha inválida nunca tapa el motivo real de revisión: si ya falta el proveedor, el motivo sigue siendo el proveedor',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'98','CAMI DEL GRAO 4','OTIS','ASCENSOR','A28011153','H12402327');
+    $r=$pipeline($db,['proveedor'=>'PROVEEDOR DESCONOCIDO','proveedor_cif'=>'B99999999','comunidad_cif'=>'H12402327','fecha_factura'=>'basura'],'x@desconocido.example','smart','abstain');
+    $assert($r['status']==='needs_review' && $r['reason_code']==='supplier_ai_abstained',$r['reason_code']);
 });
 
 // ---- Fase 24: correos archivados que se quedaban en la bandeja de entrada ----
@@ -4002,6 +4049,297 @@ $test('Fase 24 — Worker: el barrido se hace en cada pasada (salvo dry-run) ant
     $assert(str_contains($source,"\$this->moveWithReconnect(\$client,\$uid,\$destination,true);"),'lo clasificado se mueve con reintento y marcado como leído');
     $assert(str_contains($source,"\$this->moveWithReconnect(\$client,\$uid,\$destination,false);"),'lo de revisión también se mueve con reintento, sin marcar como leído');
     $assert(substr_count($source,'$client->close(); $client->connect();')===1,'el segundo intento reconecta antes de volver a mover');
+});
+
+// ─── Reconstrucción del pipeline inteligente: suite del comportamiento nuevo ───────────────────
+// Puerta de documento, comunidad (casos A–F), proveedor, autolink, servicio y extremo a extremo.
+
+$gateFor=static fn(string $type,float $confidence,?bool $process=null,string $filename='documento.pdf'):array
+    =>(new Salvest\ClassificationPolicy())->documentGate(['document_type'=>$type,'should_process_as_invoice'=>$process??in_array($type,Salvest\AiContracts::INVOICE_TYPES,true),'document_confidence'=>$confidence],$filename);
+
+$test('Pipeline — puerta de documento: facturas (también rectificativas) siguen; informes, presupuestos, certificados, contratos y tablas con importes se descartan solo con certeza',static function()use($assert,$gateFor):void{
+    $cases=[
+        ['invoice',0.97,'continue',null,'factura normal'],
+        ['credit_note',0.95,'continue',null,'factura rectificativa / abono'],
+        ['invoice',0.75,'continue',null,'factura poco habitual, con pocos campos: evidencia fuerte basta'],
+        ['budget',0.96,'ignored_not_invoice','not_invoice','presupuesto'],
+        ['technical_report',0.95,'ignored_not_invoice','not_invoice','parte o informe técnico (Extinplan INFORME, Detalle_Visita)'],
+        ['report',0.93,'ignored_not_invoice','not_invoice','informe económico / extracto (EstadoDeCuenta)'],
+        ['certificate',0.91,'ignored_not_invoice','not_invoice','certificado'],
+        ['contract',0.94,'ignored_not_invoice','not_invoice','contrato'],
+        ['receipt',0.95,'ignored_not_invoice','not_invoice','justificante de pago'],
+        ['other',0.92,'ignored_not_invoice','not_invoice','tabla con importes que no es factura'],
+        ['report',0.80,'needs_review','document_type_uncertain','ambiguo: parece informe pero sin certeza'],
+    ];
+    foreach($cases as [$type,$confidence,$decision,$code,$label]){
+        $gate=$gateFor($type,$confidence);
+        $assert($gate['decision']===$decision && $gate['reason_code']===$code,$label.': '.json_encode($gate));
+    }
+});
+$test('Pipeline — puerta de documento: bordes exactos de los umbrales (0.90 para descartar, 0.70 para aceptar) y tipo incoherente con la decisión de la IA',static function()use($assert,$gateFor):void{
+    $assert($gateFor('technical_report',0.90)['decision']==='ignored_not_invoice','0.90 es el borde inferior del tramo explícito: se descarta');
+    $assert($gateFor('technical_report',0.8999)['decision']==='needs_review','por debajo de 0.90 no se descarta nunca en silencio');
+    $assert($gateFor('invoice',0.70)['decision']==='continue','0.70 basta para tratarlo como factura');
+    $assert($gateFor('invoice',0.6999)['reason_code']==='document_type_uncertain','por debajo de 0.70 la factura va a revisión');
+    $assert($gateFor('budget',0.99,true)['reason_code']==='document_type_inconsistent','"presupuesto" pero "procésalo como factura": la IA se contradice, revisión');
+    $assert($gateFor('invoice',0.99,false)['reason_code']==='document_type_inconsistent','"factura" pero "no la proceses": revisión');
+    $assert($gateFor('invoice',0.99,null,'PRE 266.pdf')['reason_code']==='quote_filename','una factura con nombre de presupuesto va a revisión');
+    $assert(Salvest\ClassificationPolicy::NOT_INVOICE_MIN_CONFIDENCE===0.90 && Salvest\ClassificationPolicy::INVOICE_MIN_CONFIDENCE===0.70 && Salvest\ClassificationPolicy::AI_CHOICE_MIN_CONFIDENCE===0.70,'los umbrales son los bordes de la rúbrica');
+});
+$test('Pipeline — un parte técnico con comunidad y proveedor reconocibles se descarta igual: sin resolver, sin más IA, sin autolink',static function()use($assert,$sqliteDb,$classifierSchema,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',['31','CP TREINTA Y UNO','cp treinta y uno','H31000001','Calle 31']);
+    $db->execute('INSERT INTO service_types(name,normalized_name) VALUES (?,?)',['Extintores','extintores']);
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,1)',['EXTINPLAN','EXTINPLAN S.L.','extinplan','B31000001',(int)$db->pdo()->lastInsertId()]);
+    $result=$pipeline($db,['document_type'=>'technical_report','document_confidence'=>0.95,'proveedor'=>'EXTINPLAN','proveedor_cif'=>'B31000001','comunidad_cif'=>'H31000001'],'informes@extinplan.example','smart','smart','INFORME CERTIFICADO 2270.pdf');
+    $assert($result['status']==='ignored_not_invoice' && $result['community']===null && $result['supplier']===null,json_encode([$result['status'],$result['reason']]));
+    $assert($result['ai']->tasks()===['comprender_documento'] && $result['classification']['autolink']['attempted']===false,'nada más que la comprensión');
+    $assert((int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n']===0,'un documento descartado nunca crea relaciones');
+    $assert(str_contains((string)$result['reason'],'parte o informe técnico'),'el motivo dice qué tipo de documento era: '.$result['reason']);
+});
+$test('Pipeline — documento dudoso: revisión, pero con la comunidad y el proveedor deterministas ya sugeridos y sin gastar IA en elecciones',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'32','CP TREINTA Y DOS','LIMPIEZAS DOS','Limpieza','B32000001','H32000001');
+    $result=$pipeline($db,['document_type'=>'invoice','document_confidence'=>0.55,'proveedor'=>'LIMPIEZAS DOS','proveedor_cif'=>'B32000001','comunidad_cif'=>'H32000001']);
+    $assert($result['status']==='needs_review' && $result['reason_code']==='document_type_uncertain',json_encode([$result['status'],$result['reason_code']]));
+    $assert((int)$result['community']['id']===$fixture['communityId'] && (int)$result['supplier']['id']===$fixture['supplierId'],'/Revisar recibe las sugerencias deterministas');
+    $assert($result['ai']->tasks()===['comprender_documento'],'con la puerta en revisión no se pregunta a la IA por comunidad ni proveedor');
+});
+$test('Pipeline — factura rectificativa y factura con pocos campos se clasifican como cualquier factura',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $fixture=$makeCommunityWithSupplier($db,'33','CP TREINTA Y TRES','AGUAS TRES','Agua','B33000001','H33000001');
+    $credit=$pipeline($db,['document_type'=>'credit_note','document_confidence'=>0.93,'proveedor'=>'AGUAS TRES','proveedor_cif'=>'B33000001','comunidad_cif'=>'H33000001','importe'=>-12.5]);
+    $assert($credit['status']==='classified' && $credit['service']['folder']==='AGUA',json_encode([$credit['status'],$credit['reason_code']]));
+    $sparse=$pipeline($db,['document_confidence'=>0.74,'proveedor'=>null,'proveedor_cif'=>'B33000001','comunidad_cif'=>'H33000001']);
+    $assert($sparse['status']==='classified' && (int)$sparse['supplier']['id']===$fixture['supplierId'],'sin nombre de emisor, el CIF basta: '.json_encode([$sparse['status'],$sparse['reason_code']]));
+});
+
+// ── Comunidad: casos A–F (B, C y F con NIF compartido están arriba, en el caso real GERMANIES) ──
+$seedCommunities=static function(Salvest\Database $db):array{
+    $rows=[['41','CP MIRADOR DEL MAR','H41000001','CALLE MAYOR 10','12001'],['42','CP JARDINES DEL SUR','H42000002','AVENIDA DEL SUR 5','12002'],['43','CP TORRE ALTA','H43000003','CALLE ALTA 3','12003']];
+    $ids=[];
+    foreach($rows as [$code,$name,$cif,$address,$cp]){
+        $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,postal_code,city,imap_folder_name,active) VALUES (?,?,?,?,?,?,?,?,1)',[$code,$name,Salvest\Text::normalize($name),$cif,$address,$cp,'Castelló',$code.' - '.$name]);
+        $ids[$code]=(int)$db->pdo()->lastInsertId();
+    }
+    return$ids;
+};
+$test('Comunidad caso A — NIF único decide definitivamente: ni el nombre ni la dirección contradictorios lo cambian, y la IA no se consulta',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedCommunities($db);
+    $result=$resolveCommunity($db,['tax_id'=>'h-42000002','name'=>'CP MIRADOR DEL MAR','address'=>'CALLE MAYOR 10'],static fn()=>throw new RuntimeException('no debe llamarse a la IA'));
+    $assert((int)$result['community']['id']===$ids['42'] && $result['source']==='tax_id_exact' && $result['tax_id']['matches']===1,json_encode($result['outcome']));
+});
+$test('Comunidad caso D — sin NIF: el recuperador propone candidatas por nombre/dirección y la IA elige entre ellas',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedCommunities($db);
+    $seen=null;
+    $result=$resolveCommunity($db,['name'=>'COMUNIDAD DE PROPIETARIOS JARDINES DEL SUR','address'=>'Av. del Sur, 5','postal_code'=>'12002'],
+        function(array $candidates)use(&$seen,$ids){$seen=$candidates;return['id'=>$ids['42'],'confidence'=>0.93,'reason'=>'nombre y dirección']; });
+    $assert((int)$result['community']['id']===$ids['42'] && $result['source']==='ai_after_retrieval',json_encode($result['outcome']));
+    $assert(in_array($ids['42'],array_column($seen,'id'),true) && count($seen)<=8,'la candidata correcta está en la lista cerrada que ve la IA');
+    $mine=array_values(array_filter($seen,static fn(array $c):bool=>$c['id']===$ids['42']))[0];
+    $assert($mine['senales']!==[] && isset($mine['direccion'],$mine['codigo_postal']),'cada candidata lleva sus señales y sus datos: '.json_encode($mine));
+});
+$test('Comunidad caso E — NIF que no está en el maestro: no bloquea, se busca por nombre y la IA confirma; la explicación registra 0 coincidencias de NIF',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedCommunities($db);
+    $result=$resolveCommunity($db,['tax_id'=>'H99999999','name'=>'C.P. TORRE ALTA'],'smart');
+    $assert((int)($result['community']['id']??0)===$ids['43'] && $result['source']==='ai_after_retrieval' && $result['tax_id']['matches']===0,json_encode([$result['outcome'],$result['tax_id']]));
+});
+$test('Comunidad — sin ninguna candidata no se llama a la IA; la IA a la baja (0.69) o abstenida deja la factura sin comunidad',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$resolveCommunity):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedCommunities($db);
+    $none=$resolveCommunity($db,['name'=>'XYZZY QWERTY'],static fn()=>throw new RuntimeException('sin candidatas no hay IA'));
+    $assert($none['community']===null && $none['outcome']==='no_candidates',json_encode($none['outcome']));
+    $low=$resolveCommunity($db,['name'=>'JARDINES DEL SUR'],['id'=>$ids['42'],'confidence'=>0.69,'reason'=>'quizá']);
+    $assert($low['community']===null && $low['outcome']==='ai_low_confidence',json_encode($low['outcome']));
+    $abstain=$resolveCommunity($db,['name'=>'JARDINES DEL SUR'],'abstain');
+    $assert($abstain['community']===null && $abstain['outcome']==='ai_abstained',json_encode($abstain['outcome']));
+});
+$test('Comunidad — en el pipeline, sin comunidad la factura queda unclassified con el motivo de la política; si la IA cae al elegir, es un error técnico (no una clasificación inventada)',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);$seedCommunities($db);
+    $result=$pipeline($db,['proveedor'=>'ALGUIEN','nombre_comunidad'=>'JARDINES DEL SUR'],'x@x.example','abstain');
+    $assert($result['status']==='unclassified' && $result['reason_code']==='community_ai_abstained' && $result['reason']!=='',json_encode([$result['status'],$result['reason_code']]));
+    $threw=false;
+    try{$pipeline($db,['proveedor'=>'ALGUIEN','nombre_comunidad'=>'JARDINES DEL SUR'],'x@x.example','fail');}catch(RuntimeException){$threw=true;}
+    $assert($threw,'el Worker registra la excepción como error del adjunto y mueve el correo a Errores');
+});
+
+// ── Proveedor ──
+$seedSuppliers=static function(Salvest\Database $db):array{
+    $db->execute('INSERT INTO service_types(name,normalized_name) VALUES (?,?)',['Ascensores','ascensores']);$lift=(int)$db->pdo()->lastInsertId();
+    $db->execute('INSERT INTO service_types(name,normalized_name) VALUES (?,?)',['Descalcificador','descalcificador']);$soft=(int)$db->pdo()->lastInsertId();
+    $ids=[];
+    foreach([['ORONA','ORONA S.COOP.','F20025318',$lift],['INMECAS','H2O PLUS, S.L.','B12891099',$soft],['H2O PLUS','H2O PLUS SLU','B12891099',$soft]] as [$name,$official,$cif,$service]){
+        $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',[$name,$official,Salvest\Text::normalizeCompanyName($name),Salvest\Text::normalizeCompanyName($official),$cif,$service]);
+        $ids[$name]=(int)$db->pdo()->lastInsertId();
+    }
+    return$ids;
+};
+$supplierChoice=static fn(mixed $raw):Closure=>static function(array $candidates)use($raw):array{
+    $raw=is_callable($raw)?$raw($candidates):$raw;
+    return Salvest\DocumentIntelligence::validateChoice(['supplier_id'=>$raw['id'],'confidence'=>$raw['confidence'],'reason'=>$raw['reason']??''],'supplier_id',array_column($candidates,'id'));
+};
+$test('Proveedor — CIF único en todo el maestro decide sin IA, aunque el nombre del documento no se parezca',static function()use($assert,$sqliteDb,$classifierSchema,$seedSuppliers,$resolveSupplier):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedSuppliers($db);
+    $result=$resolveSupplier($db,'ELEVADORES DEL NORTE','F-20025318','x@x.example',null,static fn()=>throw new RuntimeException('no debe llamarse a la IA'));
+    $assert((int)$result['supplier']['id']===$ids['ORONA'] && $result['source']==='tax_id_exact' && $result['confidence']===1.0,json_encode($result['outcome']));
+});
+$test('Proveedor — CIF compartido (INMECAS / H2O PLUS, caso real B12891099): el nombre exacto de uno solo decide sin IA; si no, la IA recibe exactamente esos dos y elige; si se abstiene, sin proveedor',static function()use($assert,$sqliteDb,$classifierSchema,$seedSuppliers,$resolveSupplier,$supplierChoice):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedSuppliers($db);
+    // Evaluación con documentos reales (datos del maestro real): "H2O PLUS SLU" con el CIF
+    // compartido. Las dos razones sociales normalizan a "h2o plus" y la IA se abstuvo; el nombre
+    // comercial exacto de uno solo basta.
+    $byName=$resolveSupplier($db,'H2O PLUS SLU','B12891099','x@x.example',null,static fn()=>throw new RuntimeException('no debe llamarse a la IA'));
+    $assert((int)$byName['supplier']['id']===$ids['H2O PLUS'] && $byName['source']==='name_exact' && count($byName['candidates'])===2,json_encode([$byName['outcome'],$byName['source']]));
+    $seen=null;
+    $chosen=$resolveSupplier($db,'GRUPO H2O PLUS CASTELLON','B12891099','x@x.example',null,$supplierChoice(function(array $c)use(&$seen,$ids){$seen=$c;return['id'=>$ids['H2O PLUS'],'confidence'=>0.92,'reason'=>'marca H2O PLUS en el logotipo'];}));
+    $assert((int)$chosen['supplier']['id']===$ids['H2O PLUS'] && $chosen['source']==='ai_after_shared_tax_id',json_encode($chosen['outcome']));
+    $seenIds=array_column($seen,'id');sort($seenIds);
+    $assert($seenIds===[$ids['INMECAS'],$ids['H2O PLUS']],'solo los dos que comparten CIF: '.json_encode($seenIds));
+    $abstain=$resolveSupplier($db,'INSTALACIONES MECANICAS','B12891099','x@x.example',null,$supplierChoice(['id'=>null,'confidence'=>0.4]));
+    $assert($abstain['supplier']===null && $abstain['outcome']==='ai_abstained',json_encode($abstain['outcome']));
+});
+$test('Proveedor — la IA no puede elegir un proveedor cuyo CIF contradice el del documento, ni uno fuera de la lista',static function()use($assert,$sqliteDb,$classifierSchema,$seedSuppliers,$resolveSupplier,$supplierChoice):void{
+    $db=$sqliteDb($classifierSchema);$ids=$seedSuppliers($db);
+    $contradiction=$resolveSupplier($db,'ORONA ASCENSORES','B00000000','x@x.example',null,$supplierChoice(['id'=>$ids['ORONA'],'confidence'=>0.95]));
+    $assert($contradiction['supplier']===null && $contradiction['outcome']==='tax_id_contradiction',json_encode($contradiction['outcome']));
+    $invented=$resolveSupplier($db,'ORONA ASCENSORES',null,'x@x.example',null,$supplierChoice(['id'=>987654,'confidence'=>0.99]));
+    $assert($invented['supplier']===null && $invented['outcome']==='ai_invalid_candidate',json_encode($invented['outcome']));
+});
+$test('Proveedor — en el pipeline: emisor desconocido -> revisión supplier_no_candidates; elección de la IA aceptada -> clasificada pero sin autolink',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$seedSuppliers,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);$communities=$seedCommunities($db);$ids=$seedSuppliers($db);
+    $unknown=$pipeline($db,['proveedor'=>'XYZZY QWERTY SL','comunidad_cif'=>'H41000001']);
+    $assert($unknown['status']==='needs_review' && $unknown['reason_code']==='supplier_no_candidates',json_encode([$unknown['status'],$unknown['reason_code']]));
+    $ai=$pipeline($db,['proveedor'=>'ORONA ASCENSORES Y ELEVADORES','comunidad_cif'=>'H41000001'],'x@x.example','smart',['id'=>$ids['ORONA'],'confidence'=>0.9,'reason'=>'ORONA']);
+    $assert($ai['status']==='classified' && $ai['classification']['supplier']['source']!=='tax_id_exact',json_encode([$ai['status'],$ai['reason_code'],$ai['classification']['supplier']['source']]));
+    $assert($ai['classification']['autolink']===['attempted'=>false,'reason'=>'non_deterministic_source'],'una elección de la IA nunca se convierte en relación: '.json_encode($ai['classification']['autolink']));
+    $assert((int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n']===0);
+});
+
+// ── Autolink ──
+// La inserción real (ON DUPLICATE KEY, solo MySQL) la cubren los tests "Fase 7" y el extremo a extremo.
+$test('Autolink — proveedor global por CIF: se intenta con la carpeta canónica del servicio maestro; con la relación ya existente, no se intenta',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$seedSuppliers,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);$communities=$seedCommunities($db);$ids=$seedSuppliers($db);
+    $first=$pipeline($db,['proveedor'=>'ORONA','proveedor_cif'=>'F20025318','comunidad_cif'=>'H41000001']);
+    $assert($first['status']==='classified' && $first['classification']['autolink']['attempted']===true && $first['classification']['autolink']['category']==='ASCENSOR',json_encode($first['classification']['autolink']));
+    $db->execute('INSERT INTO community_suppliers(community_id,supplier_id,category,source_column) VALUES (?,?,?,?)',[$communities['41'],$ids['ORONA'],'ASCENSOR','auto_global_resolution']);
+    $second=$pipeline($db,['proveedor'=>'ORONA','proveedor_cif'=>'F20025318','comunidad_cif'=>'H41000001']);
+    $assert($second['classification']['supplier']['linked']===true && $second['classification']['autolink']['reason']==='relation_already_exists' && (int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n']===1,json_encode($second['classification']['autolink']));
+});
+$test('Autolink — nunca con proveedor ambiguo, inexistente, sin comunidad o con el autolink desactivado',static function()use($assert,$sqliteDb,$classifierSchema,$seedCommunities,$seedSuppliers,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);$seedCommunities($db);$seedSuppliers($db);
+    $ambiguous=$pipeline($db,['proveedor'=>'INSTALACIONES MECANICAS','proveedor_cif'=>'B12891099','comunidad_cif'=>'H41000001'],'x@x.example','smart','abstain');
+    $assert($ambiguous['status']==='needs_review' && $ambiguous['classification']['autolink']['attempted']===false,json_encode($ambiguous['classification']['autolink']));
+    $missing=$pipeline($db,['proveedor'=>'NO EXISTE SL','proveedor_cif'=>'B55555555','comunidad_cif'=>'H41000001']);
+    $assert($missing['classification']['autolink']['attempted']===false,json_encode($missing['classification']['autolink']));
+    $noCommunity=$pipeline($db,['proveedor'=>'ORONA','proveedor_cif'=>'F20025318','nombre_comunidad'=>'XYZZY'],'x@x.example','abstain');
+    $assert($noCommunity['status']==='unclassified' && $noCommunity['classification']['autolink']['attempted']===false,json_encode($noCommunity['classification']['autolink']));
+    $disabled=$pipeline($db,['proveedor'=>'ORONA','proveedor_cif'=>'F20025318','comunidad_cif'=>'H41000001'],'x@x.example','smart','smart','factura.pdf',false);
+    $assert($disabled['status']==='classified' && $disabled['classification']['autolink']['reason']==='autolink_disabled',json_encode($disabled['classification']['autolink']));
+    $assert((int)$db->one('SELECT COUNT(*) n FROM community_suppliers')['n']===0,'ninguno de estos casos crea relaciones');
+});
+
+// ── Servicio ──
+$test('Servicio — ServiceCatalog: Ascensor/Ascensores, Luz/Electricidad y variantes van a su carpeta canónica; lo desconocido no tiene carpeta',static function()use($assert):void{
+    foreach(['Ascensor'=>'ASCENSOR','Ascensores'=>'ASCENSOR','ASCENSORES'=>'ASCENSOR','elevadores'=>'ASCENSOR','Luz'=>'ELECTRICIDAD','Electricidad'=>'ELECTRICIDAD','Energía eléctrica'=>'ELECTRICIDAD',
+        'Agua'=>'AGUA','EXTINCAS'=>'EXTINTORES','Protección contra incendios'=>'EXTINTORES','Jardín'=>'JARDINERIA','Piscinas'=>'PISCINA','Mantenimiento'=>'MANTENIMIENTO'] as $value=>$folder){
+        $assert(Salvest\ServiceCatalog::folderFor($value)===$folder,$value.' -> '.var_export(Salvest\ServiceCatalog::folderFor($value),true));
+    }
+    foreach(['Seguros','Gas','Telecomunicaciones','Otros','',null] as $value)$assert(Salvest\ServiceCatalog::folderFor($value)===null,var_export($value,true).' no tiene carpeta propia');
+});
+$test('Servicio — ServiceResolver: el servicio principal del proveedor gana; si no se traduce, la categoría de la relación; luego la IA; y queda constancia de lo probado',static function()use($assert):void{
+    $resolver=new Salvest\ServiceResolver();
+    $ai=['service'=>['raw'=>'mantenimiento de ascensores','semantic_category'=>'ascensor']];
+    $main=$resolver->resolve(['service_type_name'=>'Luz'],['category'=>'Agua'],$ai);
+    $assert($main['folder']==='ELECTRICIDAD' && $main['source']==='supplier_main_service',json_encode($main));
+    $relation=$resolver->resolve(['service_type_name'=>'Seguros'],['category'=>'Ascensores'],$ai);
+    $assert($relation['folder']==='ASCENSOR' && $relation['source']==='community_supplier_category' && $relation['tried'][0]===['source'=>'supplier_main_service','value'=>'Seguros','folder'=>null],json_encode($relation));
+    $fromAi=$resolver->resolve(null,null,$ai);
+    $assert($fromAi['folder']==='ASCENSOR' && $fromAi['source']==='ai_semantic_category',json_encode($fromAi));
+    $none=$resolver->resolve(['service_type_name'=>'Gas'],null,['service'=>['raw'=>'suministro de gas','semantic_category'=>null]]);
+    $assert($none['folder']===null && count($none['tried'])===2,json_encode($none));
+    $assert(Salvest\DriveInvoiceArchiver::class!=='' && str_contains((string)file_get_contents(dirname(__DIR__).'/src/DriveInvoiceArchiver.php'),'ServiceCatalog::folderFor('),'Drive usa la misma traducción (guarda de código)');
+});
+$test('Servicio — en el pipeline, un proveedor cuyo único servicio no tiene carpeta va a revisión con service_unknown',static function()use($assert,$sqliteDb,$classifierSchema,$makeCommunityWithSupplier,$pipeline):void{
+    $db=$sqliteDb($classifierSchema);
+    $makeCommunityWithSupplier($db,'44','CP CUARENTA Y CUATRO','GAS DEL ESTE','Gas','B44000001','H44000001');
+    $result=$pipeline($db,['proveedor'=>'GAS DEL ESTE','proveedor_cif'=>'B44000001','comunidad_cif'=>'H44000001','tipo_servicio'=>'gas natural']);
+    $assert($result['status']==='needs_review' && $result['reason_code']==='service_unknown' && $result['supplier']!==null,json_encode([$result['status'],$result['reason_code']]));
+});
+
+// ── Extremo a extremo: Worker con MySQL de tests real, IA falsa, IMAP sin red y sin Drive ──
+$e2eWorker=static function(Salvest\Database $db,array &$counts)use($fakeAi,$workerConfig,$fakeImapClient):Closure{
+    $config=$workerConfig();$config['processing']['storage_root']=sys_get_temp_dir().'/salvest-e2e-'.bin2hex(random_bytes(3));$config['processing']['incoming_root']=$config['processing']['storage_root'].'/incoming';
+    $db->execute('INSERT INTO mailboxes(descriptive_name,email,imap_host,imap_port,use_ssl,username,encrypted_password,input_folder,active) VALUES (?,?,?,?,?,?,?,?,0)',['E2E','e2e@example.test','imap.example.test',993,1,'e2e@example.test','x','INBOX']);
+    $mailbox=$db->one('SELECT * FROM mailboxes WHERE id=?',[(int)$db->pdo()->lastInsertId()]);
+    $client=$fakeImapClient('E2E'.random_int(1000,9999));
+    $method=new ReflectionMethod(Salvest\Worker::class,'processAttachment');$method->setAccessible(true);
+    return static function(string $uid,array $understanding,mixed $community='smart',mixed $supplier='smart',string $payload='')use($db,$config,$mailbox,$client,$method,$fakeAi,&$counts):array{
+        $fake=$fakeAi($understanding,$community,$supplier);
+        $worker=new Salvest\Worker($db,new Salvest\Crypto($config['app']['encryption_key']),Salvest\Worker::processor($db,new Salvest\DocumentIntelligence($fake)),$config,null);
+        $payload=$payload!==''?$payload:"%PDF-1.4\n% e2e ".$uid."\n";
+        $attachment=['original_filename'=>'factura-'.$uid.'.pdf','safe_filename'=>'factura-'.$uid.'.pdf','sha256'=>hash('sha256',$payload),'payload'=>$payload,'mime_type'=>'application/pdf','size'=>strlen($payload)];
+        $message=['sender'=>'facturas@proveedor.example','subject'=>'Factura','body'=>'','message_id'=>'<'.$uid.'@e2e>','date'=>date('Y-m-d H:i:s')];
+        $outcome=$method->invokeArgs($worker,[$mailbox,$client,$uid,$message,$attachment,&$counts]);
+        $row=$db->one('SELECT * FROM processed_attachments WHERE mailbox_id=? AND message_uid=? AND attachment_sha256=?',[$mailbox['id'],$uid,$attachment['sha256']]);
+        return['outcome'=>$outcome,'row'=>$row,'ai'=>$fake,'mailbox_id'=>(int)$mailbox['id'],'storage'=>$config['processing']['storage_root']];
+    };
+};
+$test('Extremo a extremo (MySQL) — factura, parte técnico, NIF compartido resuelto por la IA, comunidad ambigua, proveedor nuevo con autolink y duplicados',static function()use($assert,$mysqlSchemaTest,$mysqlSchemaCleanup,$e2eWorker,$understandingFromLegacy):void{
+    $ctx=$mysqlSchemaTest();
+    if($ctx===null){echo "SKIP (sin SALVEST_TEST_MYSQL)\n";return;}
+    $db=$ctx['db'];
+    Salvest\Schema::migrate($db,dirname(__DIR__).'/database/schema.sql');
+    $db->execute('INSERT IGNORE INTO service_types(name,normalized_name) VALUES (?,?)',['Extintores','extintores']);
+    $serviceId=(int)$db->one('SELECT id FROM service_types WHERE normalized_name=?',['extintores'])['id'];
+    $communityIds=[];
+    foreach([['E2E1','EDIFICI E2E PLAÇA','H79990001'],['E2E2','PARKING E2E PLAÇA','H79990001'],['E2E3','CP E2E ÚNICA','H79990003']] as [$code,$name,$cif]){
+        $db->execute('INSERT INTO communities(external_code,official_name,normalized_name,cif,main_address,active) VALUES (?,?,?,?,?,1)',[$code,$name,Salvest\Text::normalize($name),$cif,'CALLE E2E 1']);
+        $communityIds[$code]=(int)$db->pdo()->lastInsertId();
+    }
+    $db->execute('INSERT INTO suppliers(name,official_name,normalized_name,normalized_official_name,cif,main_service_type_id,active) VALUES (?,?,?,?,?,?,1)',['EXTINTORES E2E','EXTINTORES E2E S.L.','extintores e2e','extintores e2e','B79990009',$serviceId]);
+    $supplierId=(int)$db->pdo()->lastInsertId();
+    $counts=['classified'=>0,'needs_review'=>0,'unclassified'=>0,'duplicate'=>0,'not_invoice'=>0];
+    $run=$e2eWorker($db,$counts);$mailboxId=null;$storage=null;
+    try{
+        $invoice=$understandingFromLegacy(['proveedor'=>'EXTINTORES E2E','proveedor_cif'=>'B79990009','comunidad_cif'=>'H79990003','nombre_comunidad'=>'CP E2E UNICA']);
+        $classified=$run('9001',$invoice);$mailboxId=$classified['mailbox_id'];$storage=$classified['storage'];
+        $row=$classified['row'];
+        $assert($row['status']==='classified' && (int)$row['community_id']===$communityIds['E2E3'] && (int)$row['supplier_id']===$supplierId && $row['document_type']==='invoice' && (float)$row['document_confidence']===0.97,json_encode($row));
+        $decision=json_decode((string)$row['decision_json'],true);
+        $assert($decision['version']===2 && $decision['community']['source']==='tax_id_exact' && $decision['supplier']['source']==='tax_id_exact' && $decision['autolink']['inserted']===true && $decision['service']['folder']==='EXTINTORES',json_encode($decision['autolink']));
+        $assert(json_decode((string)$row['extraction_json'],true)==json_decode(json_encode($invoice),true) && $row['extractor_version']==='fake:fake-model' && $row['debug_trace_json']===null && is_file((string)$row['output_path']),'respuesta cruda íntegra (MySQL reordena las claves del JSON), versión del extractor, sin traza para lo clasificado y PDF archivado: '.$row['extraction_json']);
+        $link=$db->all('SELECT category,source_column FROM community_suppliers WHERE community_id=? AND supplier_id=?',[$communityIds['E2E3'],$supplierId]);
+        $assert(count($link)===1 && $link[0]['category']==='EXTINTORES' && $link[0]['source_column']==='auto_global_resolution','proveedor nuevo en la comunidad: autolink: '.json_encode($link));
+
+        $report=$run('9002',$understandingFromLegacy(['document_type'=>'technical_report','document_confidence'=>0.96,'proveedor'=>'EXTINTORES E2E','proveedor_cif'=>'B79990009','comunidad_cif'=>'H79990001']));
+        $assert($report['outcome']['status']==='ignored_not_invoice' && $report['row']['status']==='ignored_not_invoice' && $report['row']['community_id']===null && $report['row']['document_type']==='technical_report' && $report['ai']->tasks()===['comprender_documento'],json_encode($report['row']));
+
+        $shared=$run('9003',$understandingFromLegacy(['proveedor'=>'EXTINTORES E2E','proveedor_cif'=>'B79990009','comunidad_cif'=>'H79990001','nombre_comunidad'=>'COM. PROP. GARAJE PLAÇA E2E']),['id'=>$communityIds['E2E2'],'confidence'=>0.88,'reason'=>'garaje = parking']);
+        $assert($shared['row']['status']==='classified' && (int)$shared['row']['community_id']===$communityIds['E2E2'] && abs((float)$shared['row']['confidence']-88.0)<0.001,json_encode($shared['row']));
+        $assert(json_decode((string)$shared['row']['decision_json'],true)['community']['source']==='ai_after_shared_tax_id');
+
+        $ambiguous=$run('9004',$understandingFromLegacy(['proveedor'=>'EXTINTORES E2E','proveedor_cif'=>'B79990009','comunidad_cif'=>'H79990001','nombre_comunidad'=>'COM. PROP. PLAÇA E2E']),'abstain');
+        $assert($ambiguous['row']['status']==='unclassified' && $ambiguous['row']['community_id']===null && $ambiguous['row']['debug_trace_json']!==null,'ambigua: sin comunidad y con traza para /Revisar');
+        $assert(str_contains((string)$ambiguous['row']['debug_trace_json'],'community_resolution'),'la traza incluye la resolución de comunidad');
+
+        $again=$run('9005',$invoice,'smart','smart',"%PDF-1.4\n% e2e 9001\n");
+        $assert($again['row']['status']==='duplicate' && $again['ai']->tasks()===[] && (int)$again['row']['community_id']===$communityIds['E2E3'],'el mismo PDF no vuelve a la IA: '.json_encode($again['row']['status']));
+        $againReport=$run('9006',$invoice,'smart','smart',"%PDF-1.4\n% e2e 9002\n");
+        $assert($againReport['row']['status']==='ignored_not_invoice' && $againReport['ai']->tasks()===[],'la copia de un no-factura hereda la decisión: '.json_encode($againReport['row']['status']));
+        $assert($counts===['classified'=>2,'needs_review'=>0,'unclassified'=>1,'duplicate'=>1,'not_invoice'=>2],json_encode($counts));
+    }finally{
+        if($mailboxId!==null)$db->execute('DELETE FROM processed_attachments WHERE mailbox_id=?',[$mailboxId]);
+        $db->execute("DELETE FROM mailboxes WHERE email='e2e@example.test'");
+        $db->execute('DELETE FROM suppliers WHERE id=?',[$supplierId]);
+        foreach($communityIds as $id)$db->execute('DELETE FROM communities WHERE id=?',[$id]);
+        $mysqlSchemaCleanup($ctx);
+    }
+});
+$test('Extremo a extremo — un correo cuyos PDF son todos no-factura queda ignored y en la bandeja de entrada; los no-factura no deciden la carpeta de un correo con facturas (guarda de código)',static function()use($assert):void{
+    $source=(string)file_get_contents(dirname(__DIR__).'/src/Worker.php');
+    $assert(str_contains($source,"\$invoiceOutcomes = array_values(array_filter(\$outcomes,static fn(array \$item): bool => \$item['status'] !== 'ignored_not_invoice'));"),'filtro de no-facturas');
+    $assert(str_contains($source,"\$this->saveMessage(\$mailbox,\$client,\$uid,\$message,'ignored',count(\$outcomes),null);"),'solo no-facturas: ignored, sin destino ni movimiento');
+    $retry=(string)file_get_contents(dirname(__DIR__).'/src/ImapMoveRetry.php');
+    $assert(str_contains($retry,'ignored_not_invoice'),'el reintento de movimiento tampoco cuenta los no-factura');
 });
 
 $failed=0;

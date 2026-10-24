@@ -67,11 +67,13 @@ final class ImapMoveRetry
         return $result;
     }
 
-    /** ¿Están ya archivados todos los adjuntos de este correo? Sin ninguna fila, no. */
+    /** ¿Están ya archivadas todas las facturas de este correo? Los documentos que no son factura
+     * no cuentan, pero tiene que quedar al menos una factura archivada. */
     private function allArchived(int $mailboxId, string $uidValidity, string $uid): bool
     {
         $statuses = array_column($this->db->all('SELECT status FROM processed_attachments WHERE mailbox_id=? AND uidvalidity=? AND message_uid=?',
             [$mailboxId, $uidValidity, $uid]), 'status');
-        return $statuses && !array_diff($statuses, ['classified', 'duplicate']);
+        $invoices = array_values(array_diff($statuses, ['ignored_not_invoice']));
+        return $invoices && !array_diff($invoices, ['classified', 'duplicate']);
     }
 }

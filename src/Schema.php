@@ -38,6 +38,14 @@ final class Schema
         // 3 columnas ya existente (queda redundante pero inofensivo) para minimizar el cambio.
         self::uniqueIndex($database,'community_suppliers','uq_community_supplier_pair','community_id,supplier_id');
         self::deadSchemaCleanup($database);
+        // Reconstrucción del pipeline: qué tipo de documento es (y con qué confianza), qué
+        // proveedor del maestro se resolvió (antes solo quedaba su nombre en texto) y cuántos
+        // documentos no eran facturas en cada pasada. Solo columnas nuevas y anulables.
+        self::column($database,'processed_attachments','document_type','VARCHAR(40) NULL AFTER status');
+        self::column($database,'processed_attachments','document_confidence','DECIMAL(5,4) NULL AFTER document_type');
+        self::column($database,'processed_attachments','supplier_id','BIGINT UNSIGNED NULL AFTER community_id');
+        self::index($database,'processed_attachments','idx_attachment_supplier','supplier_id');
+        self::column($database,'processing_runs','not_invoice_count','INT UNSIGNED NOT NULL DEFAULT 0 AFTER duplicate_count');
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0001_initial')");
         $database->execute("INSERT IGNORE INTO schema_migrations(version) VALUES ('0002_real_drive_structure')");
     }

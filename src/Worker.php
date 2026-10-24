@@ -3,39 +3,52 @@ declare(strict_types=1);
 
 namespace Salvest;
 
+/**
+ * Orquestador: lee los buzones, decide qué se procesa (baseline, deduplicación, PDF-only), entrega
+ * cada PDF a InvoiceProcessor y ejecuta los efectos externos con su resultado: copia local, Drive,
+ * fila en processed_attachments y movimiento IMAP del correo. Las reglas de negocio (qué es una
+ * factura, a qué comunidad y proveedor pertenece, qué estado recibe) viven en InvoiceProcessor y
+ * ClassificationPolicy, no aquí.
+ */
 final class Worker
 {
     private MimeParser $parser;
-    private Classifier $classifier;
-    private InvoiceRouter $router;
     private Archiver $archiver;
-    private ?DriveInvoiceArchiver $driveArchiver=null;
+    private int $inputTokens = 0;
+    private int $outputTokens = 0;
 
     /** @param array<string,mixed> $config */
-    public function __construct(private Database $db, private Crypto $crypto,
-        private ExtractorProvider $extractor, private array $config)
+    public function __construct(private Database $db, private Crypto $crypto, private InvoiceProcessor $processor,
+        private array $config, private ?DriveInvoiceArchiver $driveArchiver = null)
     {
         $this->parser = new MimeParser();
-        $this->classifier = new Classifier($db, (float)$config['processing']['classification_threshold']);
-        $this->router = new InvoiceRouter($this->classifier, new CommunitySupplierAutoLinker($db));
         $this->archiver = new Archiver((string)$config['processing']['storage_root']);
-        if((bool)($config['google_drive']['enabled']??false)){
-            $tokens=new GoogleUserOAuthProvider((string)$config['google_drive']['oauth_client_file'],(string)$config['google_drive']['oauth_token_file']);
-            $this->driveArchiver=new DriveInvoiceArchiver(new GoogleDriveClient($tokens),(string)$config['google_drive']['root_folder_id']);
-        }
     }
 
-    /** Builds a Worker exactly the way every entry point (cron, CLI, manual button) needs it, so
-     * none of them has to repeat the Crypto/extractor wiring by hand — and, critically, so all
-     * three stay in sync on which extractor is actually used: this is the ONLY place that wires
-     * Claude/OpenAI, so a future extractor change never risks updating some entry points and
-     * missing others. Fase 8: Claude is the primary extractor, OpenAI the automatic fallback for
-     * any call Claude's own client throws on — see FallbackExtractor's docblock. */
+    /** Único sitio que ensambla el pipeline para todos los puntos de entrada (cron, CLI, botón del
+     * panel): Claude como IA principal y OpenAI como respaldo automático llamada a llamada. */
     public static function create(Database $db, array $config): self
     {
-        $primary = new ClaudeExtractor($config['anthropic']);
-        $fallback = new OpenAIExtractor($config['openai']);
-        return new self($db, new Crypto((string)$config['app']['encryption_key']), new FallbackExtractor($primary, $fallback), $config);
+        $drive = null; $folders = null;
+        if ((bool)($config['google_drive']['enabled'] ?? false)) {
+            $tokens = new GoogleUserOAuthProvider((string)$config['google_drive']['oauth_client_file'], (string)$config['google_drive']['oauth_token_file']);
+            $client = new GoogleDriveClient($tokens);
+            $drive = new DriveInvoiceArchiver($client, (string)$config['google_drive']['root_folder_id']);
+            $directory = new DriveCommunityFolders($client, (string)$config['google_drive']['root_folder_id'], $db);
+            $folders = static fn(): array => $directory->names();
+        }
+        $ai = new DocumentIntelligence(new FallbackAiClient(new ClaudeClient($config['anthropic']), new OpenAIClient($config['openai'])));
+        return new self($db, new Crypto((string)$config['app']['encryption_key']), self::processor($db, $ai, $folders), $config, $drive);
+    }
+
+    /** @param (callable():array<string,string>)|null $folderNames */
+    public static function processor(Database $db, DocumentIntelligence $ai, ?callable $folderNames = null, bool $autoLink = true): InvoiceProcessor
+    {
+        return new InvoiceProcessor($ai,
+            new CommunityResolver($db, new CommunityCandidateRetriever($db), $folderNames),
+            new SupplierResolver($db, new SupplierCandidateRetriever($db)),
+            new ServiceResolver(), new ClassificationPolicy(),
+            $autoLink ? new CommunitySupplierAutoLinker($db) : null);
     }
 
     /**
@@ -56,7 +69,7 @@ final class Worker
         $this->db->execute("INSERT INTO processing_runs(run_uuid,trigger_type,triggered_by_user_id,started_at,status,mailboxes_count) VALUES (?,?,?,NOW(),'running',?)",
             [$runUuid,$type,$triggeredByUserId,count($mailboxes)]);
         $runId = (int)$this->db->pdo()->lastInsertId();
-        $counts = ['messages'=>0,'documents'=>0,'classified'=>0,'unclassified'=>0,'needs_review'=>0,'duplicate'=>0,'errors'=>0];
+        $counts = ['messages'=>0,'documents'=>0,'classified'=>0,'unclassified'=>0,'needs_review'=>0,'duplicate'=>0,'not_invoice'=>0,'errors'=>0];
         try {
             foreach ($mailboxes as $mailbox) {
                 try { $this->processMailbox($mailbox, $dryRun, $limit, $counts); }
@@ -67,8 +80,8 @@ final class Worker
                     error_log('mailbox_id='.$mailbox['id'].' status=failed error='.$error->getMessage());
                 }
             }
-            $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,needs_review_count=?,duplicate_count=?,error_count=?,openai_input_tokens=?,openai_output_tokens=? WHERE id=?",
-                [$counts['errors']?'partial':'completed',$counts['messages'],$counts['documents'],$counts['classified'],$counts['unclassified'],$counts['needs_review'],$counts['duplicate'],$counts['errors'],$this->extractor->inputTokens,$this->extractor->outputTokens,$runId]);
+            $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status=?,messages_reviewed=?,documents_detected=?,classified_count=?,unclassified_count=?,needs_review_count=?,duplicate_count=?,not_invoice_count=?,error_count=?,openai_input_tokens=?,openai_output_tokens=? WHERE id=?",
+                [$counts['errors']?'partial':'completed',$counts['messages'],$counts['documents'],$counts['classified'],$counts['unclassified'],$counts['needs_review'],$counts['duplicate'],$counts['not_invoice'],$counts['errors'],$this->inputTokens,$this->outputTokens,$runId]);
             return $counts;
         } catch (\Throwable $error) {
             $this->db->execute("UPDATE processing_runs SET finished_at=NOW(),status='error',error_message=? WHERE id=?", [mb_substr($error->getMessage(),0,2000),$runId]);
@@ -139,7 +152,7 @@ final class Worker
                         $counts['documents']++;
                         // Content already confirmed real PDF above — the declared MIME (possibly
                         // wrong, e.g. "image/jpeg" on a mislabeled real PDF) must never reach
-                        // OpenAIExtractor, which picks its request shape from this exact string.
+                        // the AI client, which always sends the attachment as a PDF document.
                         $attachment['mime_type'] = 'application/pdf';
                         try { $outcomes[] = $this->processAttachment($mailbox,$client,$uid,$message,$attachment,$counts); }
                         catch (\Throwable $attachmentError) {
@@ -164,7 +177,16 @@ final class Worker
                     // de nomenclatura (espacios repetidos, "TRYCREATE" de Gmail — ver Fase 17).
                     // El archivo real de cada factura (en Drive, por comunidad) no cambia en
                     // absoluto: esto solo afecta a dónde va a parar el CORREO ya procesado.
-                    $allClassified = !array_filter($outcomes,static fn(array $item): bool => !in_array($item['status'],['classified','duplicate'],true));
+                    // Un documento que la IA identifica con seguridad como no factura (informe,
+                    // presupuesto, certificado...) no cuenta para decidir la carpeta del correo. Si
+                    // ninguno de sus PDF es factura, el correo se trata como cualquier otro correo
+                    // sin factura: 'ignored', sin mover, y se queda en la bandeja de entrada.
+                    $invoiceOutcomes = array_values(array_filter($outcomes,static fn(array $item): bool => $item['status'] !== 'ignored_not_invoice'));
+                    if (!$invoiceOutcomes) {
+                        $this->saveMessage($mailbox,$client,$uid,$message,'ignored',count($outcomes),null);
+                        continue;
+                    }
+                    $allClassified = !array_filter($invoiceOutcomes,static fn(array $item): bool => !in_array($item['status'],['classified','duplicate'],true));
                     if ($allClassified) {
                         $destination = 'facturgerman/Facturas';
                         try {
@@ -174,7 +196,7 @@ final class Worker
                             $this->saveMessage($mailbox,$client,$uid,$message,'completed',count($outcomes),$destination,'failed',$imapError->getMessage());
                         }
                     } else {
-                        $allUnknown = !array_filter($outcomes,static fn(array $item): bool => $item['status'] !== 'unclassified');
+                        $allUnknown = !array_filter($invoiceOutcomes,static fn(array $item): bool => $item['status'] !== 'unclassified');
                         $destination = $allUnknown ? 'facturgerman/Sin clasificar' : 'facturgerman/Pendientes de revisión';
                         try {
                             $this->moveWithReconnect($client,$uid,$destination,false);
@@ -257,14 +279,15 @@ final class Worker
     /** @param array<string,mixed> $mailbox @param array<string,mixed> $message @param array<string,mixed> $attachment @param array<string,int> $counts @return array{status:string,community_id:?int} */
     private function processAttachment(array $mailbox, ImapClient $client, string $uid, array $message, array $attachment, array &$counts): array
     {
-        $prior = $this->db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate') ORDER BY id LIMIT 1",[$attachment['sha256']]);
+        $prior = $this->db->one("SELECT * FROM processed_attachments WHERE attachment_sha256=? AND status IN ('classified','unclassified','needs_review','duplicate','ignored_not_invoice') ORDER BY id LIMIT 1",[$attachment['sha256']]);
         if ($prior) {
-            // A 'duplicate' row never keeps a technical trace of its own, even if the original
-            // it points to was needs_review and had one — the trace is only ever meaningful for
-            // the specific attachment a human is about to open and debug.
-            $this->insertAttachment($mailbox,$client,$uid,$attachment,'duplicate',['debug_trace_json'=>null]+$prior);
-            $counts['duplicate']++;
-            return ['status'=>'duplicate','community_id'=>$prior['community_id'] ? (int)$prior['community_id'] : null];
+            // Un PDF ya visto no vuelve a la IA. Si la primera vez se identificó como no factura,
+            // la copia hereda esa decisión; en cualquier otro caso queda como 'duplicate'. La copia
+            // nunca guarda traza propia: la traza solo sirve para el documento que alguien revisa.
+            $status = $prior['status'] === 'ignored_not_invoice' ? 'ignored_not_invoice' : 'duplicate';
+            $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,['debug_trace_json'=>null]+$prior);
+            $counts[$status === 'duplicate' ? 'duplicate' : 'not_invoice']++;
+            return ['status'=>$status,'community_id'=>$prior['community_id'] ? (int)$prior['community_id'] : null];
         }
         $incoming = rtrim((string)$this->config['processing']['incoming_root'],'/').'/'.Text::slug((string)$mailbox['email']);
         if (!is_dir($incoming) && !mkdir($incoming,0770,true) && !is_dir($incoming)) throw new \RuntimeException('No se pudo crear incoming');
@@ -274,145 +297,66 @@ final class Worker
         $this->insertAttachment($mailbox,$client,$uid,$attachment,'processing',[]);
         $context = "Remitente: {$message['sender']}\nAsunto: {$message['subject']}\nAdjunto: {$attachment['original_filename']}\n{$message['body']}";
 
-        // Built in memory regardless of outcome — cheap, no I/O of its own — and only ever
-        // persisted (in insertAttachment, below) when the attachment ends up in needs_review.
-        // A failure anywhere in ReviewTrace can never throw: see its own docblock.
+        // Comprensión, resolución y política: todo lo que decide vive en InvoiceProcessor.
+        $result = $this->processor->process($path,(string)$attachment['original_filename'],$context,(string)$message['sender']);
+        foreach ($result['ai_calls'] as $call) { $this->inputTokens += (int)$call['input_tokens']; $this->outputTokens += (int)$call['output_tokens']; }
+        $status = $result['status']; $community = $result['community']; $supplier = $result['supplier']; $legacy = $result['legacy'];
+        $classification = $result['classification'];
+
+        // La traza se construye siempre, pero solo se guarda para lo que va a /Revisar (ver
+        // ReviewTrace::persistForReview()). La decisión completa se guarda siempre en decision_json.
         $trace = new ReviewTrace();
         $trace->add('document',['filename'=>$attachment['original_filename'],'mime'=>$attachment['mime_type'],'size_bytes'=>$attachment['size'],'sha256'=>$attachment['sha256']]);
+        $understandingCall = $result['ai_calls'][0] ?? [];
+        $trace->add('document_understanding',['provider'=>$understandingCall['provider'] ?? null,'model'=>$understandingCall['model'] ?? null,
+            'latency_ms'=>$understandingCall['latency_ms'] ?? null,'input_tokens'=>$understandingCall['input_tokens'] ?? null,'output_tokens'=>$understandingCall['output_tokens'] ?? null,
+            'document'=>$classification['document'],'response'=>$result['raw_understanding']]);
+        $trace->add('community_resolution',$classification['community']);
+        $trace->add('supplier_resolution',$classification['supplier']);
+        $trace->add('service_resolution',$classification['service']);
+        $trace->add('final_decision',['status'=>$status,'reason'=>$result['reason'],'reason_code'=>$result['reason_code'],'autolink'=>$classification['autolink'],
+            'ai_calls'=>count($result['ai_calls'])]);
 
-        $trace->add('openai_request',['model'=>$this->config['anthropic']['model']??null,'reasoning'=>'low']);
-        $tokensBefore=['in'=>$this->extractor->inputTokens,'out'=>$this->extractor->outputTokens];
-        $started=microtime(true);
-        $invoice = $this->extractor->extract($path,(string)$attachment['mime_type'],$context);
-        $extractorVersion=$this->extractor->version();
-        $trace->add('openai_response',['latency_ms'=>(int)round((microtime(true)-$started)*1000),
-            'input_tokens'=>$this->extractor->inputTokens-$tokensBefore['in'],'output_tokens'=>$this->extractor->outputTokens-$tokensBefore['out'],
-            'provider'=>$extractorVersion,'response'=>$invoice]);
-        $openAiServiceRaw=$invoice['tipo_servicio']??null;
-
-        // Debug-only observer for Classifier's tier-by-tier reasoning — never influences the
-        // decision, see Classifier::classify()/resolveSupplierInCommunity() docblocks. Buffers
-        // into two lists (community/supplier) so each becomes one readable trace step below,
-        // instead of a dozen tiny ones.
-        $communitySignals=[];$supplierSignals=[];
-        $resolutionTrace=function(string $tier,string $outcome,array $details)use(&$communitySignals,&$supplierSignals):void{
-            $entry=['method'=>$tier,'result'=>$outcome]+$details;
-            if(str_starts_with($tier,'supplier'))$supplierSignals[]=$entry;else $communitySignals[]=$entry;
-        };
-        // Second, restricted look at the *same* PDF — headers/logos/stamps included — only
-        // reached when the community is known but no deterministic master-data match found a
-        // supplier among that community's own suppliers. Never called otherwise, so it never
-        // adds latency/cost to the common case.
-        $restrictedCalled=false;$restrictedCandidates=[];$restrictedResponse=null;$restrictedChosen=null;
-        $restrictedResolver=function(array $candidates,array $community)use($path,$attachment,$context,&$restrictedCalled,&$restrictedCandidates,&$restrictedResponse,&$restrictedChosen):?int{
-            $restrictedCalled=true;$restrictedCandidates=$candidates;
-            try{
-                $chosen=$this->extractor->resolveSupplierAmongCandidates($path,(string)$attachment['mime_type'],$context,(string)$community['official_name'],$candidates);
-                $restrictedChosen=$chosen;$restrictedResponse=['supplier_id'=>$chosen];
-                return $chosen;
-            }catch(\Throwable$error){
-                error_log('restricted_openai_retry status=failed community_id='.$community['id'].' '.$error->getMessage());
-                $restrictedResponse=['error'=>$error->getMessage()];return null;
-            }
-        };
-        $route=$this->router->route($invoice,(string)$message['sender'],$context,$restrictedResolver,$resolutionTrace);
-        $decision=$route['decision'];$supplier=$route['supplier'];$status=$route['status'];
-
-        // Fase 15: una fecha de factura ausente o con un formato que Archiver no reconoce nunca
-        // debe destruir todo el intento — antes, Archiver::archive() lanzaba una excepción no
-        // capturada aquí, y esa excepción se comía la copia local del PDF, el JSON de extracción
-        // y el detalle técnico entero, dejando solo una fila 'error' opaca sin nada que revisar
-        // (caso real: un "Estado de Cuenta" con comunidad y proveedor ya resueltos, pero sin una
-        // fecha de factura reconocible). Se degrada a needs_review con motivo explícito — el
-        // documento sigue archivándose (a la carpeta de no clasificados) y queda descargable y
-        // con su detalle técnico, en vez de perderse.
-        $invalidDate=$status==='classified'&&!preg_match('/^\d{4}-\d{2}/',(string)($invoice['fecha_factura']??''));
-        if($invalidDate){$status='needs_review';$route['reason']='Fecha de factura no reconocible; revisa y confirma manualmente.';}
-
-        // Fase 20: un presupuesto nunca se archiva solo como si fuera una factura. Caso real: tres
-        // presupuestos de limpieza (título "Presupuesto", número y comunidad correctos) y uno de
-        // electricidad ("PRESSUPOST") se archivaron en Drive como facturas. Basta cualquiera de
-        // las dos señales: lo que la IA dice del propio documento, o que el nombre del archivo lo
-        // diga — un archivo de factura real nunca se llama "Presupuesto...". Nunca se descarta:
-        // va a revisión, donde una persona decide.
-        $isQuote=$status==='classified'&&self::looksLikeQuote($invoice,(string)$attachment['original_filename']);
-        if($isQuote){$status='needs_review';$route['reason']='Parece un presupuesto, no una factura; revisa antes de archivarlo.';}
-
-        $trace->add('community_resolution',['signals'=>$communitySignals,'community_id'=>$decision['community']['id']??null,
-            'official_name'=>$decision['community']['official_name']??null,'evidence'=>$decision['evidence']]);
-        $communityCandidates=$decision['community']?$this->classifier->suppliersForCommunity((int)$decision['community']['id']):[];
-        $trace->add('supplier_resolution',['raw_supplier_name'=>$route['raw_supplier_name'],'supplier_cif'=>$invoice['proveedor_cif']??null,
-            'raw_supplier_name_normalized'=>Text::normalizeCompanyName((string)($invoice['proveedor']??'')),
-            'supplier_cif_normalized'=>Text::normalizeIdentifier((string)($invoice['proveedor_cif']??'')),
-            'community_candidates'=>$communityCandidates,'tiers'=>$supplierSignals,
-            'supplier_id'=>$supplier['id']??null,'supplier_name'=>$supplier['official_name']??null,
-            'evidence'=>$route['evidence']['supplier'],'ambiguous'=>$route['supplier_ambiguous']]);
-        $trace->add('service_resolution',['openai_service'=>$openAiServiceRaw,'suppliers_main_service_type'=>$supplier['service_type_name']??null,
-            'community_suppliers_category'=>$supplier['category']??null,'final_service'=>$route['service'],'evidence'=>$route['evidence']['service']]);
-        if($restrictedCalled){
-            $trace->add('restricted_openai',['model'=>$this->config['anthropic']['model']??null,'reasoning'=>'medium',
-                'candidates_sent'=>$restrictedCandidates,'response'=>$restrictedResponse,'chosen_supplier_id'=>$restrictedChosen,
-                'provider'=>$this->extractor->version(),
-                'validated'=>($route['evidence']['supplier']['type']??null)==='restricted_openai_retry']);
-        }
-        $blockingFactor=$invalidDate?'invalid_date':($isQuote?'quote_document':($status==='needs_review'?($route['supplier_ambiguous']?'supplier_ambiguous':'supplier_unresolved'):($status==='unclassified'?'community_unresolved':null)));
-        $trace->add('final_decision',['status'=>$status,'reason'=>$route['reason'],'blocking_factor'=>$blockingFactor]);
-
-        // MySQL corrects OpenAI's suggestion here: $route['service'] already went through
-        // Classifier::resolveService() (supplier's configured type > community-supplier
-        // relation category > OpenAI's own tipo_servicio guess, only as a last resort). And a
-        // "proveedor" is only ever the confirmed supplier's own official name — OpenAI's raw
-        // guess is kept apart, in raw_supplier_name, never promoted to a real supplier.
-        $invoice['proveedor']=$supplier?$supplier['official_name']:$route['raw_supplier_name'];
-        $invoice['tipo_servicio']=mb_strtolower((string)$route['service']);
-        $target = $this->archiver->archive($path,(string)$attachment['original_filename'],$invoice,$decision['community'],$status);
-        $drive=null;
-        if($status==='classified'&&$this->driveArchiver)$drive=$this->driveArchiver->archive($target,$decision['community'],$supplier,(string)$route['service'],$invoice);
-        $decisionTrace=$decision+['supplier_evidence'=>$route['evidence']['supplier'],'service_evidence'=>$route['evidence']['service'],'reason'=>$route['reason']];
-        // The full technical trace is only ever worth keeping for a document a human will have to
-        // open and debug on /Revisar — see ReviewTrace::persistForReview() for exactly which
-        // statuses that covers and its never-throws guarantee.
-        $debugTraceJson=$trace->persistForReview($status);
-        $data = array_merge($invoice,['community_id'=>$decision['community']['id'] ?? null,'confidence'=>$decision['confidence'],
-            'proveedor'=>$supplier?$supplier['official_name']:null,'raw_supplier_name'=>$route['raw_supplier_name'],
-            'output_path'=>$target,'final_filename'=>basename($target),'extraction_json'=>json_encode($invoice,JSON_UNESCAPED_UNICODE),
-            'decision_json'=>json_encode($decisionTrace,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
-            'error_message'=>$route['reason'],'debug_trace_json'=>$debugTraceJson,'extractor_version'=>$extractorVersion,
-            'drive_file_id'=>$drive['id']??null,'drive_path'=>$drive['path']??null,'drive_status'=>$drive?'uploaded':null]);
+        $target = $this->archiver->archive($path,(string)$attachment['original_filename'],$legacy,$community,$status);
+        $drive = null;
+        if ($status === 'classified' && $this->driveArchiver) $drive = $this->driveArchiver->archive($target,$community,$supplier,(string)$result['service']['folder'],$legacy);
+        $data = $legacy + [
+            'community_id'=>$community['id'] ?? null,
+            'confidence'=>$community !== null ? round((float)$classification['community']['confidence'] * 100, 3) : null,
+            'supplier_id'=>$supplier['id'] ?? null,
+            'document_type'=>$result['understanding']['document_type'],
+            'document_confidence'=>$result['understanding']['document_confidence'],
+            'output_path'=>$target,'final_filename'=>basename($target),
+            'extraction_json'=>json_encode($result['raw_understanding'],JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
+            'decision_json'=>json_encode($classification,JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR),
+            'error_message'=>$result['reason'],'debug_trace_json'=>$trace->persistForReview($status),
+            'extractor_version'=>isset($understandingCall['provider']) ? $understandingCall['provider'].':'.$understandingCall['model'] : null,
+            'drive_file_id'=>$drive['id'] ?? null,'drive_path'=>$drive['path'] ?? null,'drive_status'=>$drive ? 'uploaded' : null,
+        ];
         $this->insertAttachment($mailbox,$client,$uid,$attachment,$status,$data);
-        $counts[$status === 'needs_review' ? 'needs_review' : ($status === 'classified' ? 'classified' : 'unclassified')]++;
-        return ['status'=>$status,'community_id'=>$data['community_id'] ? (int)$data['community_id'] : null];
+        $counts[match ($status) { 'classified'=>'classified','needs_review'=>'needs_review','ignored_not_invoice'=>'not_invoice',default=>'unclassified' }]++;
+        return ['status'=>$status,'community_id'=>$data['community_id'] !== null ? (int)$data['community_id'] : null];
     }
 
     private function insertAttachment(array $mailbox, ImapClient $client, string $uid, array $attachment, string $status, array $data): void
     {
         $this->db->execute("INSERT INTO processed_attachments(mailbox_id,uidvalidity,message_uid,original_filename,attachment_sha256,mime_type,size_bytes,
-            provider,raw_supplier_name,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,confidence,final_filename,output_path,status,
-            extraction_json,decision_json,debug_trace_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+            provider,raw_supplier_name,provider_cif,service_type,supply_address,amount,currency,invoice_date,invoice_number,community_id,supplier_id,confidence,document_type,document_confidence,final_filename,output_path,status,
+            extraction_json,decision_json,debug_trace_json,error_message,extractor_version,drive_file_id,drive_path,drive_status,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
             ON DUPLICATE KEY UPDATE provider=VALUES(provider),raw_supplier_name=VALUES(raw_supplier_name),provider_cif=VALUES(provider_cif),service_type=VALUES(service_type),
             supply_address=VALUES(supply_address),amount=VALUES(amount),currency=VALUES(currency),invoice_date=VALUES(invoice_date),
-            invoice_number=VALUES(invoice_number),community_id=VALUES(community_id),confidence=VALUES(confidence),final_filename=VALUES(final_filename),
+            invoice_number=VALUES(invoice_number),community_id=VALUES(community_id),supplier_id=VALUES(supplier_id),confidence=VALUES(confidence),
+            document_type=VALUES(document_type),document_confidence=VALUES(document_confidence),final_filename=VALUES(final_filename),
             output_path=VALUES(output_path),status=VALUES(status),extraction_json=VALUES(extraction_json),decision_json=VALUES(decision_json),debug_trace_json=VALUES(debug_trace_json),
             error_message=VALUES(error_message),extractor_version=VALUES(extractor_version),drive_file_id=VALUES(drive_file_id),drive_path=VALUES(drive_path),drive_status=VALUES(drive_status),processed_at=NOW()", [
             $mailbox['id'],$client->uidValidity(),$uid,$attachment['original_filename'],$attachment['sha256'],$attachment['mime_type'],$attachment['size'],
             $data['proveedor']??$data['provider']??null,$data['raw_supplier_name']??null,$data['proveedor_cif']??$data['provider_cif']??null,$data['tipo_servicio']??$data['service_type']??null,
             $data['direccion']??$data['supply_address']??null,$data['importe']??$data['amount']??null,$data['moneda']??$data['currency']??null,
             ($data['fecha_factura']??$data['invoice_date']??null) ?: null,($data['numero_factura']??$data['invoice_number']??null) ?: null,$data['community_id']??null,
-            $data['confidence']??null,$data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,$data['debug_trace_json']??null,
-            $data['error_message']??null,$data['extractor_version']??OpenAIExtractor::VERSION,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
+            $data['supplier_id']??null,$data['confidence']??null,$data['document_type']??null,$data['document_confidence']??null,
+            $data['final_filename']??null,$data['output_path']??null,$status,$data['extraction_json']??null,$data['decision_json']??null,$data['debug_trace_json']??null,
+            $data['error_message']??null,$data['extractor_version']??null,$data['drive_file_id']??null,$data['drive_path']??null,$data['drive_status']??null,
         ]);
-    }
-
-    /** Fase 20: ¿es un presupuesto y no una factura? Dos señales independientes, basta una: lo
-     * que la IA dice del propio documento (tipo_documento), o una palabra de presupuesto en el
-     * nombre del archivo como palabra completa — "Presupuesto 1-000035.pdf", "PRE 266.pdf",
-     * "Pressupost_12.pdf" sí; "Prestaciones.pdf" o "Premium.pdf" no.
-     * @param array<string,mixed> $invoice */
-    public static function looksLikeQuote(array $invoice, string $filename): bool
-    {
-        if (Text::normalize((string)($invoice['tipo_documento'] ?? '')) === 'presupuesto') return true;
-        $words = explode(' ', Text::normalize(pathinfo($filename, PATHINFO_FILENAME)));
-        return (bool)array_intersect($words, ['presupuesto','presupuestos','pressupost','pre','proforma']);
     }
 
     private function saveMessage(array $mailbox, ImapClient $client, string $uid, array $message, string $status, int $count,

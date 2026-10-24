@@ -188,7 +188,8 @@ final class WebApp
             // decía "0 pendientes" (caso real, 24/09 18:55). Y el rótulo deja claro que es lo que
             // hizo ESA pasada, no un total: lo pendiente ahora mismo ya lo dice el aviso de arriba.
             $archivadas=(int)$lastRun['classified_count'];$aRevision=(int)$lastRun['needs_review_count']+(int)$lastRun['unclassified_count'];$errores=(int)$lastRun['error_count'];
-            $resultLine='<p class="bot-status-line">Resultado de esa ejecución: <strong>'.$archivadas.' '.($archivadas===1?'archivada':'archivadas').' · '.$aRevision.' a revisión · '.$errores.' '.($errores===1?'error':'errores').'</strong></p>';
+            $noFacturas=(int)($lastRun['not_invoice_count']??0);
+            $resultLine='<p class="bot-status-line">Resultado de esa ejecución: <strong>'.$archivadas.' '.($archivadas===1?'archivada':'archivadas').' · '.$aRevision.' a revisión · '.$errores.' '.($errores===1?'error':'errores').($noFacturas?' · '.$noFacturas.' '.($noFacturas===1?'no era factura':'no eran facturas'):'').'</strong></p>';
         }
         $estimateLine='';
         if($estimate=$this->nextRunEstimate()){
@@ -244,6 +245,9 @@ final class WebApp
         header('Content-Type: application/json; charset=UTF-8');
         if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); echo json_encode(['status'=>'error','message'=>'Método no permitido']); return; }
         try {
+            // Mismo orden que cron.php: primero el esquema, después el worker. Sin esto, el primer
+            // uso del botón tras un despliegue con columnas nuevas fallaría al guardar resultados.
+            if ($this->db->pdo()->getAttribute(\PDO::ATTR_DRIVER_NAME) === 'mysql') Schema::migrate($this->db,dirname(__DIR__).'/database/schema.sql');
             $counts = Worker::create($this->db,$this->config)->run(false,(int)$this->config['imap']['max_messages_per_mailbox'],null,'manual',$this->auth->userId());
             $this->audit('run','worker','manual',$counts);
             echo json_encode(['status'=>'ok','summary'=>[
@@ -561,7 +565,7 @@ final class WebApp
             // saved at classification time — pre-select only on an unambiguous exact match.
             $providerNormalized=Text::normalizeCompanyName((string)($row['provider']??''));
             // El label visible es name ?: official_name; la preselección acepta un match exacto
-            // contra CUALQUIERA de los dos (misma filosofía que Classifier::candidateNames()) —
+            // contra CUALQUIERA de los dos (misma filosofía que SupplierCandidateRetriever::candidateNames()) —
             // si no, un supplier ya migrado (provider="FACSA", official_name=razón social larga)
             // se mostraría correctamente como "FACSA" pero sin quedar preseleccionado.
             $supplierOptions='';foreach($suppliers as $item){
@@ -697,7 +701,8 @@ final class WebApp
         if($traceJson===null||$traceJson==='')return $unavailable;
         $steps=json_decode($traceJson,true);
         if(!is_array($steps)||!$steps)return $unavailable;
-        $labels=['document'=>'Documento recibido','openai_request'=>'1ª llamada IA','openai_response'=>'Respuesta IA',
+        $labels=['document'=>'Documento recibido','document_understanding'=>'Comprensión del documento (IA)',
+            'openai_request'=>'1ª llamada IA','openai_response'=>'Respuesta IA',
             'community_resolution'=>'Resolución de comunidad','supplier_resolution'=>'Resolución de proveedor',
             'service_resolution'=>'Resolución de servicio','restricted_openai'=>'2ª llamada IA (restringida)',
             'final_decision'=>'Decisión final'];
@@ -720,13 +725,17 @@ final class WebApp
     {
         $v=fn(mixed $value):string=>$this->e($value===null||$value===''?'—':$value);
         $evidence=fn(?array $ev):string=>$ev?$this->e(($ev['field']??'').'/'.($ev['type']??'')):'—';
+        // Las trazas nuevas (desde la reconstrucción del pipeline) llevan `source`/`outcome`; las
+        // históricas, `evidence`. Se muestran las dos formas para no perder el detalle antiguo.
+        $resolved=fn(?string $name):string=>$v($name??'sin resolver').' ('.$v($data['source']??$data['outcome']??null).', confianza '.$v(isset($data['confidence'])?round((float)$data['confidence'],2):null).', '.count((array)($data['candidates']??[])).' candidatos)';
         return match($kind){
             'document'=>$v($data['filename']??null).' · '.$v($data['mime']??null).' · '.$v($data['size_bytes']??null).' bytes',
+            'document_understanding'=>$v(ClassificationPolicy::typeLabel((string)($data['document']['type']??'other'))).' · confianza '.$v($data['document']['confidence']??null).' · '.$v($data['provider']??null).' · '.$v($data['latency_ms']??null).' ms',
             'openai_request'=>'modelo='.$v($data['model']??null).', reasoning='.$v($data['reasoning']??null),
             'openai_response'=>$v($data['provider']??null).' · '.$v($data['latency_ms']??null).' ms · '.$v($data['input_tokens']??null).' in / '.$v($data['output_tokens']??null).' out tokens',
-            'community_resolution'=>$v($data['official_name']??'sin resolver').' ('.$evidence($data['evidence']??null).')',
-            'supplier_resolution'=>$v($data['supplier_name']??'sin resolver').' ('.$evidence($data['evidence']??null).'), ambiguo='.(($data['ambiguous']??false)?'sí':'no'),
-            'service_resolution'=>$v($data['final_service']??null).' ('.$evidence($data['evidence']??null).')',
+            'community_resolution'=>array_key_exists('outcome',$data)?$resolved($data['name']??null):$v($data['official_name']??'sin resolver').' ('.$evidence($data['evidence']??null).')',
+            'supplier_resolution'=>array_key_exists('outcome',$data)?$resolved($data['name']??null):$v($data['supplier_name']??'sin resolver').' ('.$evidence($data['evidence']??null).'), ambiguo='.(($data['ambiguous']??false)?'sí':'no'),
+            'service_resolution'=>array_key_exists('tried',$data)?$v($data['folder']??'sin servicio').' ('.$v($data['source']??null).')':$v($data['final_service']??null).' ('.$evidence($data['evidence']??null).')',
             'restricted_openai'=>'supplier_id devuelto='.$v($data['chosen_supplier_id']??null).', validado='.(($data['validated']??false)?'sí':'no').', proveedor='.$v($data['provider']??null),
             'final_decision'=>$v($data['status']??null).(!empty($data['reason'])?' — '.$v($data['reason']):''),
             default=>'',
@@ -813,10 +822,10 @@ final class WebApp
 
     /**
      * Deliberately NOT folded into replaceRelated() above: that generic helper is shared with
-     * community_aliases, whose matching (Classifier::classify()'s address/name fuzzy step) never
+     * community_aliases, whose matching (CommunityCandidateRetriever) never
      * strips legal forms and rightly keeps Text::normalize() — same normalization gap exists
      * there too, out of scope for this round. For SUPPLIER aliases specifically, the alias tier
-     * (Classifier::resolveSupplierInCommunity()/resolveSupplier()) compares against
+     * (SupplierCandidateRetriever) compares against
      * Text::normalizeCompanyName($invoice['proveedor']), and Fase 3's migration script
      * (bin/migrate-supplier-master.php) already inserts alias rows normalized the same way — so
      * this must match both, or a supplier edited here after Fase 3 could silently stop matching

@@ -1,8 +1,8 @@
 name: Procesar facturas
 
+# El ciclo automático lo lanza el cron del cPanel de facturas.salvest.es (bin/worker.php cada
+# 3 horas). Este workflow queda solo para lanzar un ciclo a mano desde GitHub si hiciera falta.
 on:
-  schedule:
-    - cron: "0 */3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -21,4 +21,4 @@ jobs:
           test -n "$CRON_TOKEN"
           curl --fail --silent --show-error --max-time 240 \
             --get --data-urlencode "token=$CRON_TOKEN" \
-            https://salvest.germanmallo.com/cron.php
+            https://facturas.salvest.es/cron.php
